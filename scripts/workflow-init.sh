@@ -11,7 +11,16 @@ echo "==> [Workflow Init] 开始初始化 LoopX AI-Native 研发环境..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$SCRIPT_DIR/preflight-check.sh" --fix
 
-# 2. 挂载本地技能软链接至全局 (可选)
+# 2. 安装 Git pre-commit 主干保护钩子
+if [[ -d "$SCRIPT_DIR/../.git" && -f "$SCRIPT_DIR/git-hooks/pre-commit" ]]; then
+    echo "==> [Workflow Init] 正在安装 Git pre-commit 熔断守卫..."
+    mkdir -p "$SCRIPT_DIR/../.git/hooks"
+    cp "$SCRIPT_DIR/git-hooks/pre-commit" "$SCRIPT_DIR/../.git/hooks/pre-commit"
+    chmod +x "$SCRIPT_DIR/../.git/hooks/pre-commit"
+    echo "    - 已安装: .git/hooks/pre-commit"
+fi
+
+# 3. 挂载本地技能软链接至全局 (可选)
 GLOBAL_SKILLS_DIR="$HOME/.codex/skills"
 mkdir -p "$GLOBAL_SKILLS_DIR"
 
@@ -24,7 +33,7 @@ for skill_dir in "$SCRIPT_DIR/../skills"/*; do
     fi
 done
 
-# 3. 初始 Commit (若是新仓库)
+# 4. 初始 Commit (若是新仓库)
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if [[ -z "$(git status --porcelain)" ]]; then
         echo "==> [Workflow Init] Git 工作区干净，无需提交。"
