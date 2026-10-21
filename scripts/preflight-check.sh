@@ -83,7 +83,7 @@ echo -n "[4/6] 检查四大门禁脚本 (Typecheck, Lint, Build, Test)... "
 if [[ -f "package.json" ]]; then
     MISSING_GATES=()
     for gate in "typecheck" "lint" "build" "test"; do
-        if ! grep -q ""$gate":" package.json; then
+        if ! grep -q -E "\"$gate\"[[:space:]]*:" package.json; then
             MISSING_GATES+=("$gate")
         fi
     done

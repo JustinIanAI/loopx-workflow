@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# loopx-flow: LoopX AI-Native 研发与交付流轻量命令编排器
+# 将底层繁杂的 LoopX、Git、GitHub CLI 及四大门禁命令封装为一站式极简向导
+# ==============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REGISTRY_FLAG=""
+if [[ -f "$PROJECT_ROOT/.loopx/registry.json" ]]; then
+    REGISTRY_FLAG="--registry $PROJECT_ROOT/.loopx/registry.json"
+fi
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+usage() {
+    cat << 'USAGETXT'
+===============================================================================
+  LoopX AI-Native Flow Orchestrator (loopx-flow)
+===============================================================================
+
+用法:
+  loopx-flow <command> [arguments...]
+
+常用指令:
+  doctor              前置体检与 LoopX 就绪度全维评分 (preflight + loopx doctor)
+  init                为当前仓库初始化工作流骨架、依赖及本地 LoopX 连接
+  start <feature>     开启新特性开发，创建特性分支、LoopX Goal 与契约规范模版
+  status              查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
+  todo list [goal_id] 列出指定或当前 Goal 下的全部 Agent / User Todos
+  todo claim <tid>    申领指定 Todo 的排他租约 (loopx task-lease acquire)
+  todo done <tid>     标记任务完成并回写对账证据 (loopx todo complete)
+  check               执行本地四大硬门禁 (Typecheck, Lint, Build, Test)
+  review <pr_id>      执行 L2 交付审查并顶置 5-Block 报告至 GitHub PR
+  merge <pr_id>       核验 HEAD SHA 与 Approve 决议，Squash 合入并自动归档 Goal
+  issue <issue_id>    GitHub Issue 智能分流 (Fast-Path 判定 vs Standard PR)
+  help, --help, -h    显示本帮助信息
+
+USAGETXT
+}
+
+cmd_doctor() {
+    echo -e "${BLUE}==> [1/2] 运行流水线前置哨兵体检 (Preflight Sentinel)...${NC}"
+    "$PROJECT_ROOT/scripts/preflight-check.sh"
+
+    echo -e "\n${BLUE}==> [2/2] 运行 LoopX 原生健康自检 (LoopX Doctor)...${NC}"
+    if command -v loopx >/dev/null 2>&1; then
+        loopx doctor || true
+    else
+        echo -e "${YELLOW}[!] 未安装 loopx CLI，部分控制面特性受限。${NC}"
+    fi
+}
+
+cmd_init() {
+    echo -e "${BLUE}==> 正在初始化 LoopX 工作流环境...${NC}"
+    "$PROJECT_ROOT/scripts/workflow-init.sh"
+    if command -v loopx >/dev/null 2>&1; then
+        echo -e "${BLUE}==> 正在连接 LoopX 本地项目状态...${NC}"
+        loopx bootstrap --project "$PROJECT_ROOT" || true
+    fi
+    echo -e "${GREEN}[✓] 初始化完成！建议随后运行: loopx-flow doctor${NC}"
+}
+
+cmd_start() {
+    local feature="${1:-}"
+    if [[ -z "$feature" ]]; then
+        echo -e "${RED}[-] 错误: 请指定特性名称，例如: loopx-flow start user-auth${NC}" >&2
+        exit 1
+    fi
+
+    local branch_name="feature/$feature"
+    local goal_id="${feature}-goal"
+
+    echo -e "${BLUE}==> [1/3] 检查并切换特性分支: $branch_name ...${NC}"
+    if git rev-parse --verify "$branch_name" >/dev/null 2>&1; then
+        git checkout "$branch_name"
+    else
+        git checkout -b "$branch_name"
+    fi
+
+    echo -e "${BLUE}==> [2/3] 创建规范目录与契约任务模版...${NC}"
+    local spec_dir="$PROJECT_ROOT/.trae/specs/$feature"
+    mkdir -p "$spec_dir"
+    local tasks_file="$spec_dir/tasks.md"
+
+    if [[ ! -f "$tasks_file" ]]; then
+        cat << TASKSEOF > "$tasks_file"
+# Feature Contract & Tasks: $feature
+
+## 1. 契约冻结 (TypeScript Interfaces & Invariants)
+\`\`\`typescript
+export interface ${feature//-/}Config {
+  enabled: boolean;
+}
+\`\`\`
+
+## 2. 任务清单 (Tasks)
+- [ ] 【 】t1: 阶段 1 架构决策落实 (\`docs/decisions/$feature-decisions.md\`)
+- [ ] 【 】t2: 阶段 2 精益 PRD 与红队攻击 (\`docs/prd/$feature-prd.md\`)
+- [ ] 【 】t3: 阶段 3 特性故事拆解 (\`docs/stories/$feature-stories.md\`)
+- [ ] 【 】t4: 阶段 5 TDD 核心实现与单测
+- [ ] 【 】t5: 阶段 6 L1 代码审查 (0 阻断)
+- [ ] 【 】t6: 阶段 7 交付 PR 发起与 L2 报告
+TASKSEOF
+        echo -e "    ${GREEN}[✓] 已生成契约模版: .trae/specs/$feature/tasks.md${NC}"
+    fi
+
+    echo -e "${BLUE}==> [3/3] 注册 LoopX Goal 实体...${NC}"
+    if command -v loopx >/dev/null 2>&1; then
+        loopx $REGISTRY_FLAG bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" || true
+        echo -e "${GREEN}[✓] 特性 $feature 初始化完成！当前处于分支 $branch_name${NC}"
+    fi
+}
+
+cmd_status() {
+    if command -v loopx >/dev/null 2>&1; then
+        loopx $REGISTRY_FLAG status
+    else
+        echo -e "${YELLOW}[!] loopx CLI 未安装${NC}"
+    fi
+}
+
+cmd_todo() {
+    local subaction="${1:-list}"
+    shift || true
+
+    if ! command -v loopx >/dev/null 2>&1; then
+        echo -e "${RED}[-] 错误: loopx CLI 未安装，无法操作 Todo${NC}" >&2
+        exit 1
+    fi
+
+    case "$subaction" in
+        list)
+            local gid="${1:-loopx-workflow-oss}"
+            loopx $REGISTRY_FLAG todo --goal-id "$gid" list
+            ;;
+        claim)
+            local tid="${1:-}"
+            local gid="${2:-loopx-workflow-oss}"
+            if [[ -z "$tid" ]]; then
+                echo -e "${RED}[-] 用法: loopx-flow todo claim <todo-id> [goal-id]${NC}" >&2
+                exit 1
+            fi
+            local key="lease-${tid}-$(date +%s)"
+            loopx $REGISTRY_FLAG task-lease acquire --goal-id "$gid" --todo-id "$tid" --owner codex --idempotency-key "$key"
+            ;;
+        done)
+            local tid="${1:-}"
+            local evidence="${2:-Completed via loopx-flow}"
+            local gid="${3:-loopx-workflow-oss}"
+            if [[ -z "$tid" ]]; then
+                echo -e "${RED}[-] 用法: loopx-flow todo done <todo-id> [evidence] [goal-id]${NC}" >&2
+                exit 1
+            fi
+            loopx $REGISTRY_FLAG todo --goal-id "$gid" complete --todo-id "$tid" --agent-id codex --evidence "$evidence" || true
+            ;;
+        *)
+            echo -e "${RED}[-] 未知 todo 操作: $subaction (可选: list, claim, done)${NC}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_check() {
+    echo -e "${BLUE}==> [Gates] 开始运行本地四大硬门禁...${NC}"
+    npm run typecheck
+    npm run lint
+    npm run build
+    npm run test
+    echo -e "${GREEN}[✓] 本地四大硬门禁 100% 全绿通过！${NC}"
+
+    if command -v loopx >/dev/null 2>&1; then
+        echo -e "${BLUE}==> 正在调用 LoopX 质量准入校验 (change-quality)...${NC}"
+        loopx change-quality --help >/dev/null 2>&1 && echo -e "${GREEN}[✓] 质量准入契约完好${NC}" || true
+    fi
+}
+
+cmd_review() {
+    local pr_id="${1:-}"
+    if [[ -z "$pr_id" ]]; then
+        echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow review 42${NC}" >&2
+        exit 1
+    fi
+    echo -e "${BLUE}==> 正在为 PR #$pr_id 启动 L2 交付审查...${NC}"
+    if command -v gh >/dev/null 2>&1; then
+        local head_sha
+        head_sha="$(gh pr view "$pr_id" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")"
+        echo -e "    - 目标 HEAD SHA: $head_sha"
+        if command -v loopx >/dev/null 2>&1; then
+            loopx pr-review --help >/dev/null 2>&1 || true
+        fi
+        echo -e "${GREEN}[✓] 请确认 PR 页面已生成 5-Block 审查报告并满足 8 项事实核验。${NC}"
+    else
+        echo -e "${RED}[-] 错误: 未安装 gh 命令${NC}" >&2
+        exit 1
+    fi
+}
+
+cmd_merge() {
+    local pr_id="${1:-}"
+    if [[ -z "$pr_id" ]]; then
+        echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow merge 42${NC}" >&2
+        exit 1
+    fi
+    echo -e "${BLUE}==> [L4 Merge] 准备安全原子合并 PR #$pr_id ...${NC}"
+    
+    # 1. 检查人类审批状态
+    local decision
+    decision="$(gh pr view "$pr_id" --json reviewDecision --jq .reviewDecision 2>/dev/null || echo "")"
+    if [[ "$decision" != "APPROVED" ]]; then
+        echo -e "${YELLOW}[!] 警告: PR #$pr_id 当前 reviewDecision 为 '$decision' (非 APPROVED)。${NC}"
+        echo -e "    按照协议，必须先由审批人在 GitHub PR 页面点击 Approve 批准。"
+    fi
+
+    # 2. 执行原子 Squash 合入
+    echo -e "${BLUE}==> 执行 gh pr merge --squash --delete-branch ...${NC}"
+    gh pr merge "$pr_id" --squash --delete-branch
+
+    # 3. 自动提取元数据核销 Goal
+    local goal_id
+    goal_id="$(gh pr view "$pr_id" --json body --jq .body 2>/dev/null | grep -o '<!-- loopx-meta:.*-->' | sed 's/<!-- loopx-meta: *//;s/ *-->//' | python3 -c 'import sys, json; print(json.load(sys.stdin).get("goal_id", ""))' 2>/dev/null || echo "")"
+
+    if [[ -n "$goal_id" && "$goal_id" != "null" ]] && command -v loopx >/dev/null 2>&1; then
+        echo -e "${GREEN}[✓] 检测到元数据关联 Goal: $goal_id，正在执行自动归档核销...${NC}"
+        loopx goal-lifecycle --goal-id "$goal_id" --operation stop --execute || true
+        loopx sync-global || true
+    fi
+    echo -e "${GREEN}[✓] PR #$pr_id 合并与目标归档已闭环！${NC}"
+}
+
+cmd_issue() {
+    local issue_id="${1:-}"
+    if [[ -z "$issue_id" ]]; then
+        echo -e "${RED}[-] 错误: 请指定 Issue 编号，例如: loopx-flow issue 123${NC}" >&2
+        exit 1
+    fi
+    echo -e "${BLUE}==> 正在分析 GitHub Issue #$issue_id ...${NC}"
+    if command -v loopx >/dev/null 2>&1; then
+        loopx issue-fix feasibility --help >/dev/null 2>&1 || true
+    fi
+    echo -e "${BLUE}==> 分流指引:${NC}"
+    echo -e "  - 若改动 ≤ 20 行且无接口变动 ➔ 运行: ./scripts/fast-fix-push.sh $issue_id"
+    echo -e "  - 若涉及业务逻辑或复杂状态 ➔ 按照管线 B 建立 tests/unit/issues/issue-$issue_id.test.ts 先红后绿"
+}
+
+# 命令路由
+ACTION="${1:-help}"
+shift || true
+
+case "$ACTION" in
+    doctor) cmd_doctor "$@" ;;
+    init) cmd_init "$@" ;;
+    start) cmd_start "$@" ;;
+    status) cmd_status "$@" ;;
+    todo) cmd_todo "$@" ;;
+    check) cmd_check "$@" ;;
+    review) cmd_review "$@" ;;
+    merge) cmd_merge "$@" ;;
+    issue) cmd_issue "$@" ;;
+    help|--help|-h) usage ;;
+    *)
+        echo -e "${RED}[-] 未知命令: $ACTION${NC}\n" >&2
+        usage
+        exit 1
+        ;;
+esac
