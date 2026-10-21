@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# pre-commit: Git 提交守卫钩子
+# 严禁直接向 main / master 分支提交代码，强制要求在特性分支开发并通过 PR 审查合入
+# ==============================================================================
+set -euo pipefail
+
+CURRENT_BRANCH="${TEST_GIT_BRANCH:-$(git branch --show-current 2>/dev/null || echo "")}"
+
+if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
+    echo -e "\033[0;31m======================================================================\033[0m" >&2
+    echo -e "\033[0;31m[!] 阻断拦截: 严禁直接向 $CURRENT_BRANCH 分支提交代码！\033[0m" >&2
+    echo -e "\033[0;31m======================================================================\033[0m" >&2
+    echo -e "依据 LoopX AI-Native 研发质量协议，所有变更必须走 PR 交付通道:" >&2
+    echo -e "  1. 检出特性分支:  git checkout -b feature/<feature-name>" >&2
+    echo -e "  2. 本地验证并通过四大硬门禁: bin/loopx-flow check" >&2
+    echo -e "  3. 创建 GitHub PR 并通过人类 8 项事实核验审核" >&2
+    echo -e "  4. 最终由 loopx-flow merge 原子合入并归档 Goal" >&2
+    echo -e "\033[0;33m[!] 提交已被拒绝 (Exit Code 1)。\033[0m\n" >&2
+    exit 1
+fi
+
+exit 0

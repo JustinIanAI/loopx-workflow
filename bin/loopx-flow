@@ -33,6 +33,7 @@ usage() {
   init                为当前仓库初始化工作流骨架、依赖及本地 LoopX 连接
   start <feature>     开启新特性开发，创建特性分支、LoopX Goal 与契约规范模版
   status              查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
+  gate verify <stage> 阶段流转物理熔断守卫 (decisions | contract | pr)
   todo list [goal_id] 列出指定或当前 Goal 下的全部 Agent / User Todos
   todo claim <tid>    申领指定 Todo 的排他租约 (loopx task-lease acquire)
   todo done <tid>     标记任务完成并回写对账证据 (loopx todo complete)
@@ -126,6 +127,69 @@ cmd_status() {
     fi
 }
 
+cmd_gate() {
+    local subaction="${1:-verify}"
+    local stage="${2:-}"
+    local target="${3:-}"
+
+    if [[ "$subaction" != "verify" ]]; then
+        echo -e "${RED}[-] 未知 gate 操作: $subaction (支持: verify)${NC}" >&2
+        exit 1
+    fi
+
+    case "$stage" in
+        decisions)
+            if [[ -z "$target" ]]; then
+                echo -e "${RED}[-] 用法: loopx-flow gate verify decisions <feature_name>${NC}" >&2
+                exit 1
+            fi
+            local decision_file="$PROJECT_ROOT/docs/decisions/${target}-decisions.md"
+            if [[ ! -f "$decision_file" ]]; then
+                echo -e "${RED}[!] 守卫拦截: 未找到决策文件 $decision_file${NC}" >&2
+                exit 1
+            fi
+            if ! grep -qi "Status: APPROVED BY HUMAN" "$decision_file"; then
+                echo -e "${RED}[!] 守卫拦截: 决策文件未包含 'Status: APPROVED BY HUMAN' 审批签名！${NC}" >&2
+                exit 1
+            fi
+            echo -e "${GREEN}[✓] 阶段 1 架构决策审批签名校验通过: $target${NC}"
+            ;;
+        contract)
+            if [[ -z "$target" ]]; then
+                echo -e "${RED}[-] 用法: loopx-flow gate verify contract <feature_name>${NC}" >&2
+                exit 1
+            fi
+            local task_file="$PROJECT_ROOT/.trae/specs/${target}/tasks.md"
+            if [[ ! -f "$task_file" ]]; then
+                echo -e "${RED}[!] 守卫拦截: 未找到契约任务文件 $task_file${NC}" >&2
+                exit 1
+            fi
+            if ! grep -qi "Contract-Status: FROZEN & APPROVED" "$task_file"; then
+                echo -e "${RED}[!] 守卫拦截: 契约未声明 'Contract-Status: FROZEN & APPROVED'！${NC}" >&2
+                exit 1
+            fi
+            echo -e "${GREEN}[✓] 阶段 4 契约冻结与审批签名校验通过: $target${NC}"
+            ;;
+        pr)
+            if [[ -z "$target" ]]; then
+                echo -e "${RED}[-] 用法: loopx-flow gate verify pr <pr_id>${NC}" >&2
+                exit 1
+            fi
+            local decision
+            decision="$(gh pr view "$target" --json reviewDecision --jq .reviewDecision 2>/dev/null || echo "")"
+            if [[ "$decision" != "APPROVED" ]]; then
+                echo -e "${RED}[!] 守卫拦截: PR #$target 当前 reviewDecision 为 '$decision' (未处于 APPROVED 状态)！${NC}" >&2
+                exit 1
+            fi
+            echo -e "${GREEN}[✓] 阶段 8 GitHub PR 人工审批校验通过: PR #$target (APPROVED)${NC}"
+            ;;
+        *)
+            echo -e "${RED}[-] 未知 stage: $stage (可选: decisions, contract, pr)${NC}" >&2
+            exit 1
+            ;;
+    esac
+}
+
 cmd_todo() {
     local subaction="${1:-list}"
     shift || true
@@ -137,12 +201,12 @@ cmd_todo() {
 
     case "$subaction" in
         list)
-            local gid="${1:-loopx-workflow-oss}"
+            local gid="${1:-hard-guard-feature}"
             loopx $REGISTRY_FLAG todo --goal-id "$gid" list
             ;;
         claim)
             local tid="${1:-}"
-            local gid="${2:-loopx-workflow-oss}"
+            local gid="${2:-hard-guard-feature}"
             if [[ -z "$tid" ]]; then
                 echo -e "${RED}[-] 用法: loopx-flow todo claim <todo-id> [goal-id]${NC}" >&2
                 exit 1
@@ -153,7 +217,7 @@ cmd_todo() {
         done)
             local tid="${1:-}"
             local evidence="${2:-Completed via loopx-flow}"
-            local gid="${3:-loopx-workflow-oss}"
+            local gid="${3:-hard-guard-feature}"
             if [[ -z "$tid" ]]; then
                 echo -e "${RED}[-] 用法: loopx-flow todo done <todo-id> [evidence] [goal-id]${NC}" >&2
                 exit 1
@@ -210,12 +274,16 @@ cmd_merge() {
     fi
     echo -e "${BLUE}==> [L4 Merge] 准备安全原子合并 PR #$pr_id ...${NC}"
     
-    # 1. 检查人类审批状态
+    # 1. 检查人类审批状态 (硬熔断阻断)
     local decision
     decision="$(gh pr view "$pr_id" --json reviewDecision --jq .reviewDecision 2>/dev/null || echo "")"
     if [[ "$decision" != "APPROVED" ]]; then
-        echo -e "${YELLOW}[!] 警告: PR #$pr_id 当前 reviewDecision 为 '$decision' (非 APPROVED)。${NC}"
-        echo -e "    按照协议，必须先由审批人在 GitHub PR 页面点击 Approve 批准。"
+        echo -e "${RED}======================================================================${NC}" >&2
+        echo -e "${RED}[!] 阻断拦截: PR #$pr_id 当前 reviewDecision 为 '$decision' (未通过人类 Approve 审批)！${NC}" >&2
+        echo -e "${RED}======================================================================${NC}" >&2
+        echo -e "依据 LoopX 质量安全协议，严禁合并未经人类批准的代码。合并已强制终止 (Exit Code 1)。" >&2
+        echo -e "审批人必须在 GitHub PR 页面核验 8 项事实并点击 Approve 后方可合并。\n" >&2
+        exit 1
     fi
 
     # 2. 执行原子 Squash 合入
@@ -258,6 +326,7 @@ case "$ACTION" in
     init) cmd_init "$@" ;;
     start) cmd_start "$@" ;;
     status) cmd_status "$@" ;;
+    gate) cmd_gate "$@" ;;
     todo) cmd_todo "$@" ;;
     check) cmd_check "$@" ;;
     review) cmd_review "$@" ;;
