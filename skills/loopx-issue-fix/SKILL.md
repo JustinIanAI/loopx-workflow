@@ -1,6 +1,6 @@
 ---
 name: loopx-issue-fix
-description: GitHub Issue fix workflow manager using LoopX issue-fix capabilities. Handles feasibility triage (Fast-Path vs Standard PR), failing repro test creation, surgical patch, regression, and closure.
+description: GitHub Issue fix workflow manager using LoopX issue-fix capabilities. Handles feasibility triage (Fast-Path vs Standard PR), systematic 7-layer root cause diagnosis, failing repro test creation, surgical patch, regression, and closure.
 ---
 
 # LoopX Issue Fix
@@ -34,16 +34,27 @@ Use when: Typo, docs, error log messages, isolated single-test fix, constants.
 
 #### Path B: Standard PR-Path (Complex Logic / State Bugs)
 Use when: Business logic, state persistence, schema, concurrency, or >20 lines.
-1. Plan workflow:
+1. **Plan workflow**:
    ```bash
    loopx issue-fix workflow-plan --repo <owner/repo> --issue-ref <id> --base-branch main --issue-branch fix/issue-<id>
    git checkout -b fix/issue-<id>
    ```
-2. **Failing Repro First (MUST FAIL)**: Add `tests/unit/issues/issue-<id>.test.ts`, confirm FAIL.
-3. **Surgical Patch**: Make minimal code changes, confirm test PASS.
-4. **All Gates & Code Review**: `npm run test` + `code-review` skill (escalate to `./scripts/run-ocr-audit.sh` for high-risk/complex changes).
-5. **Create PR**: Include `Fixes #<id>` and test logs.
-6. **PR Review & Reconcile**:
+2. **Systematic 7-Layer Root Cause Diagnosis (`systematic-debugging`)**:
+   - Trace defect upward through observation altitudes:
+     `L1 Symptom ➔ L2 Logic ➔ L3 System ➔ L4 Architecture ➔ L5 Contract ➔ L6 Platform ➔ L7 Spec Gap`
+   - Locate the canonical owner. Do not attempt surface-level patches that merely suppress symptoms.
+3. **Failing Repro First (MUST FAIL)**:
+   - Add `tests/unit/issues/issue-<id>.test.ts`.
+   - Confirm test FAILS by asserting on the canonical owner invariant.
+4. **Surgical Patch & Anti-Entropy**:
+   - Make minimal code changes at the canonical owner, confirm test PASS.
+   - Apply `anti-entropy-governance` principles (`delete-first` for any superseded logic).
+5. **All Gates & 4-Slot Fresh Verification Evidence**:
+   - Run `npm run typecheck && npm run lint && npm run build && npm run test`.
+   - Record fresh verification evidence (Action, Result, Covered, Uncovered/Residual Risk).
+   - Execute `code-review` skill (escalate to `./scripts/run-ocr-audit.sh` for high-risk/complex changes).
+6. **Create PR**: Include `Fixes #<id>`, 4-slot verification evidence, and reproduction logs.
+7. **PR Review & Reconcile**:
    ```bash
    loopx pr-review --target-exact-head <PR_NUMBER>@<HEAD_OID>
    loopx issue-fix pr-lifecycle --goal-id <goal-id> --issue-ref <id>

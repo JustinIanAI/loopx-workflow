@@ -1,6 +1,6 @@
 # LoopX AI-Native Coding Workflow
 
-> 面向 Coding 场景的长程自主研发工作流。以 **LoopX 控制面** 为任务管理状态中枢，配合 **11 项常用 AI-Native Skills** 与 **GitHub 交付流**，提供从需求压力测试、方案设计、契约冻结、TDD 循环、分层代码审查到自动合并归档的端到端闭环研发管线。
+> 面向 Coding 场景的长程自主研发工作流。以 **LoopX 控制面** 为任务管理状态中枢，配合 **13 项常用 AI-Native Skills** 与 **GitHub 交付流**，提供从需求压力测试、方案设计、契约冻结、TDD 循环、分层代码审查到自动合并归档的端到端闭环研发管线。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![LoopX: v2.0](https://img.shields.io/badge/LoopX-2.0.0-green.svg)](https://github.com/loopx-project)
@@ -43,15 +43,15 @@
    ├─► LoopX 排他锁机制: loopx-flow todo claim <tid> (task-lease acquire)
    │
    ├─► 【管线 A: Feature 8 阶段研发】
-   │     └─► 阶段 5: TDD 循环实现 ──► 工具: test-driven-development ➔ 四大硬门禁 100% 全绿
-   │     └─► 阶段 6: 代码级审查 (L1) ──► 工具: code-review (默认) / open-code-review (提升) ➔ 0 阻断
+   │     └─► 阶段 5: TDD 实现与反熵增 ──► 工具: test-driven-development + anti-entropy-governance ➔ 四大门禁 100% 绿 + 4维新鲜证据
+   │     └─► 阶段 6: 代码级审查 (L1) ──► 工具: code-review (默认) / open-code-review (提升) ➔ 0 阻断 (核验无幽灵代码)
    │     └─► 阶段 7: 交付级审查 (L2) ──► 工具: loopx-flow review <pr> ➔ 顶置 5-Block 报告至 PR
    │     └─► 阶段 8: 人工核验与归档 (L4) ──► 工具: loopx-flow merge <pr> ➔ 8项核验 ➔ Squash合入 ➔ 自动归档 Goal
    │
    └─► 【管线 B: GitHub Issue 修复】
          ├─► 分类判定: loopx-flow issue <id> (按改动行数、接口破坏性判定)
          ├─► 路径 A: Fast-Path ──► 改动 ≤ 20 行 ➔ 单测最小修复 ➔ 尝试直推 main (遇保护自适应降级 PR 自动合入)
-         └─► 路径 B: Standard PR ──► Failing Repro 先行 (必先红) ➔ 修复变绿 ➔ PR 5-Block 审查 ➔ 人类核验合入
+         └─► 路径 B: Standard PR ──► 工具: systematic-debugging (七层因果诊断) ➔ Failing Repro 先行 (必先红) ➔ 修复退役 ➔ PR 5-Block 审查 ➔ 人类核验合入
 ```
 
 ---
@@ -124,18 +124,20 @@ cd loopx-workflow
 
 ## 🧰 核心 Skills 资产清单
 
-位于 `skills/` 目录，涵盖 11 项 AI Agent 核心能力：
+位于 `skills/` 目录，涵盖 13 项 AI Agent 核心能力：
+- `anti-entropy-governance`: [阶段 5 / 收尾] 代码退役决策 (`delete-first`)，防范幽灵代码与复杂度熵增。
 - `code-review`: [L1 默认] 基于参与者契约的高精度语义代码审查。
-- `design-grill`: [阶段 1] 代码库感知架构方案压力测试与决策备忘录提取。
 - `create-prd`: [阶段 2] 8 板块精益 PRD 快速生成工具。
-- `strategy-red-team`: [阶段 2] 业务与架构承重假设红队攻击引擎。
-- `user-stories`: [阶段 3] 用户故事拆解与清晰 Write Scope 划定。
-- `prioritize-features`: [阶段 3] 需求价值/成本优先级评估。
-- `test-driven-development`: [阶段 5] 严格红绿重构与测试驱动开发。
-- `loopx-pr-review`: [阶段 7] GitHub PR 交付级 5-Block 审查报告生成器。
+- `design-grill`: [阶段 1] 代码库感知架构方案压力测试、第一性原理极简审查与决策备忘录提取。
+- `loopx-issue-fix`: [管线 B] GitHub Issue 双分支分流、七层因果排查与闭环修复管理。
 - `loopx-pr-merge`: [阶段 8] SHA 一致性核验、Squash 原子合入与 Goal 自动归档器。
-- `loopx-issue-fix`: [管线 B] GitHub Issue 双分支分流与闭环修复管理。
+- `loopx-pr-review`: [阶段 7] GitHub PR 交付级 5-Block 审查报告生成器。
 - `open-code-review`: [L1 提升] 阿里开源 Open Code Review 深度扫描门禁。
+- `prioritize-features`: [阶段 3] 需求价值/成本优先级评估。
+- `strategy-red-team`: [阶段 2] 业务与架构承重假设红队攻击引擎。
+- `systematic-debugging`: [管线 B / 疑难] 复杂 Bug 七层因果追踪与最小根本所有者 (Canonical Owner) 定位。
+- `test-driven-development`: [阶段 5] 严格红绿重构与测试驱动开发。
+- `user-stories`: [阶段 3] 结构化 Job Story 需求分解。
 
 ---
 

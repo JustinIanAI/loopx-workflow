@@ -23,6 +23,7 @@
 1. **决策分支完备性**：是否提炼了 3~6 个顶层架构决策分支（如并发模型、持久化选型、向下兼容策略、错误边界等）。
 2. **权衡与备选方案**：每个决策是否列出了至少 1 个被舍弃的备选方案及其被否决的原因（Pros & Cons）。
 3. **事实代码库探查**：方案中的假设是否已被代码库探查确认（如引用具体的 existing interfaces 或 configs），杜绝凭空想象。
+4. **第一性原理与极简审查 (Aegis 吸收)**：方案是否严格控制复杂度？是否避免了滥用多重 fallback/adapter？是否明确了旧路径的退役计划？
 
 ### 2. 怎么看 (How to Verify)
 ```bash
@@ -93,8 +94,10 @@ bin/loopx-flow todo list <feature>-goal
 
 ### 1. 看什么 (Inspection Focus)
 1. **本地四大门禁全绿**：`npm run typecheck && npm run lint && npm run build && npm run test` 退出码必须全为 0，单测用例只增不减。
-2. **L1 契约审查结果**：默认 `code-review` 技能审查产出 `0 Actionable Defects`。
-3. **高危场景 OCR 审查**：若涉及底层并发、安全边界或基础设施，`run-ocr-audit.sh` 扫描结果中必须零 High / Medium 严重度缺陷。
+2. **4 维新鲜证据槽合规**：凭证必须包含 Fresh Check Action、Result & Exit Status、Covered Scope、Uncovered Scope & Residual Risk，严禁拿陈旧日志充数。
+3. **代码反熵增与幽灵代码清理**：核验本次修改是否践行 `delete-first`，彻底删除废弃变量、废弃旧分支与孤儿子逻辑。
+4. **L1 契约审查结果**：默认 `code-review` 技能审查产出 `0 Actionable Defects`。
+5. **高危场景 OCR 审查**：若涉及底层并发、安全边界或基础设施，`run-ocr-audit.sh` 扫描结果中必须零 High / Medium 严重度缺陷。
 
 ### 2. 怎么看 (How to Verify)
 ```bash
@@ -125,8 +128,8 @@ cat /tmp/l1-review-evidence.md
 |---|---|---|---|
 | **1** | **改动范围 (Scope)** | 改动行数建议 ≤ 500 行，无多余未跟踪文件或无意义格式微调 | 网页查看 Files Changed，或运行：<br>`gh pr diff <PR_ID> --stat` |
 | **2** | **契约稳定性** | 严格遵守阶段 4 冻结的 TypeScript 接口，无破坏性 API 变更 | 对比 `.trae/specs/<feature>/tasks.md` 顶部的类型定义与实际代码 |
-| **3** | **四大门禁事实** | 本地 Typecheck, Lint, Build, Test 全绿通过凭据在位 | PR 描述中“门禁自检结果”各 Checkbox 是否全勾选 |
-| **4** | **L1 审查闭环** | 零 Actionable 缺陷，代码建议项已就地处理 | 查看 PR 顶置评论中的 5-Block 报告或 `/tmp/l1-review-evidence.md` |
+| **3** | **四大门禁与新鲜证据** | 本地四大门禁全绿，且具备 4 维新鲜证据（动作、结果、覆盖度、残余风险） | PR 描述中门禁全绿且 4 维证据槽如实完整填报 |
+| **4** | **L1 审查与反熵增闭环** | 零 Actionable 缺陷，幽灵代码已彻底删除 (`delete-first`) | 查看 PR 顶置评论中的 5-Block 报告或 `/tmp/l1-review-evidence.md` |
 | **5** | **分支无漂移** | 本地已完成预集成，无潜在 merge 冲突 | 运行 `loopx integration-branch` 校验，或确认 GitHub 显示 "Able to merge" |
 | **6** | **机器元数据完整** | PR 正文中包含正确的 `<!-- loopx-meta: ... -->` 注释 | 检查 PR Body 中包含：<br>`<!-- loopx-meta: {"goal_id": "...", "todo_id": "..."} -->` |
 | **7** | **HEAD SHA 一致** | 当前 PR 最新的 Commit SHA 与审查时完全一致 | `gh pr view <PR_ID> --json headRefOid` 比对顶置报告基准 SHA |
