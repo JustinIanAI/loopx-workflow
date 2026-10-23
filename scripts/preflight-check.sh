@@ -156,7 +156,7 @@ fi
 # 6. 检查核心技能挂载状态
 echo -n "[6/6] 检查核心技能文件完整性... "
 MISSING_SKILLS=0
-CORE_SKILLS=("code-review" "design-grill" "create-prd" "strategy-red-team" "user-stories" "prioritize-features" "test-driven-development" "loopx-pr-review" "loopx-pr-merge" "loopx-issue-fix" "open-code-review")
+CORE_SKILLS=("code-review" "design-grill" "create-prd" "strategy-red-team" "user-stories" "prioritize-features" "test-driven-development" "loopx-pr-review" "loopx-pr-merge" "loopx-issue-fix" "open-code-review" "systematic-debugging" "anti-entropy-governance")
 for s in "${CORE_SKILLS[@]}"; do
     if [[ ! -f "skills/$s/SKILL.md" ]]; then
         MISSING_SKILLS=$((MISSING_SKILLS + 1))
@@ -164,7 +164,7 @@ for s in "${CORE_SKILLS[@]}"; do
 done
 
 if [[ $MISSING_SKILLS -eq 0 ]]; then
-    echo -e "${GREEN}PASS${NC} (11 项核心技能全部在位)"
+    echo -e "${GREEN}PASS${NC} (13 项核心技能全部在位)"
 else
     echo -e "${RED}FAIL${NC} (缺失 $MISSING_SKILLS 项核心技能)"
     ERRORS=$((ERRORS + 1))

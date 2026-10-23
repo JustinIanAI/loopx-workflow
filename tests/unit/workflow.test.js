@@ -30,7 +30,7 @@ test('1. Directory skeleton integrity check', () => {
   }
 });
 
-test('2. Core 11 AI-Native skills integrity check', () => {
+test('2. Core 13 AI-Native skills integrity check', () => {
   const coreSkills = [
     'code-review',
     'design-grill',
@@ -42,7 +42,9 @@ test('2. Core 11 AI-Native skills integrity check', () => {
     'loopx-pr-review',
     'loopx-pr-merge',
     'loopx-issue-fix',
-    'open-code-review'
+    'open-code-review',
+    'systematic-debugging',
+    'anti-entropy-governance'
   ];
 
   for (const skill of coreSkills) {
