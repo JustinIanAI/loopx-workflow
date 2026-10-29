@@ -251,3 +251,21 @@ bug-free.
   broader review. This skill does not restate either.
 - For the doc-vs-code axis use the `intended-vs-implemented` skill.
 - A static review produces code-review findings, not confirmed exploits or measured regressions.
+
+## LoopX Quality Integration (change-quality)
+
+Review findings are never isolated. They must be ingested into LoopX's code quality engine to produce a tamper-proof, Git-Diff-bound Quality Receipt.
+
+Use the bundled ingestion script:
+```bash
+node skills/code-review/scripts/ingest-to-loopx-quality.js \
+  --feature <feature-name> \
+  --goal-id <goal-id> \
+  --review-json <path-to-review-findings.json>
+```
+
+The script:
+1. Maps actionable contract defects to LoopX `risks[].severity = "blocker"`.
+2. Validates against the 4 local gates (`typecheck`, `lint`, `build`, `test`).
+3. Invokes `loopx change-quality record` and `loopx change-quality verify`.
+4. Renders and writes the structured report to `specs/features/<feature>/05-evidence.md`.

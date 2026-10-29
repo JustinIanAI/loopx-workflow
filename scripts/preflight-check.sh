@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# preflight-check.sh: LoopX AI-Native 流水线前置环境与工程骨架体检哨兵
-# 在 Agent 开始任何编码或研发阶段前必须调用，确保环境、CLI、认证与工程契约就绪
+# preflight-check.sh: LoopX AI-Native 流水线前置环境与工程骨架体检哨兵 (v2.0)
+# 验证核心 CLI、四大硬门禁、specs/features 资产包架构与核心技能完整性
 # ==============================================================================
 set -euo pipefail
 
@@ -10,11 +10,11 @@ if [[ "${1:-}" == "--fix" ]]; then
     AUTO_FIX=true
 fi
 
-RED='[0;31m'
-GREEN='[0;32m'
-YELLOW='[0;33m'
-BLUE='[0;34m'
-NC='[0m' # No Color
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
 ERRORS=0
 WARNINGS=0
@@ -27,7 +27,6 @@ echo -e "${BLUE}================================================================
 echo -n "[1/6] 检查 Git 版本控制状态... "
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo -e "${GREEN}PASS${NC} (已在 Git 仓库内)"
-    # 检查远程 remote
     if ! git remote -v | grep -q 'origin'; then
         echo -e "      ${YELLOW}[!] 警告: 未配置名为 'origin' 的 Git Remote${NC}"
         WARNINGS=$((WARNINGS + 1))
@@ -45,89 +44,69 @@ fi
 
 # 2. 检查核心 CLI 工具连通性
 echo "[2/6] 检查核心 CLI 工具链..."
-REQUIRED_TOOLS=("git" "gh" "node" "npm" "python3")
-RECOMMENDED_TOOLS=("loopx" "ocr")
+REQUIRED_TOOLS=("git" "gh" "node" "npm")
+RECOMMENDED_TOOLS=("loopx")
 
 for tool in "${REQUIRED_TOOLS[@]}"; do
-    echo -n "      - 依赖工具: $tool ... "
     if command -v "$tool" >/dev/null 2>&1; then
-        echo -e "${GREEN}PASS${NC} ($(command -v "$tool"))"
+        echo -e "      - 必需工具 $tool: ${GREEN}INSTALLED${NC} ($(which "$tool"))"
     else
-        echo -e "${RED}FAIL${NC} (未在 PATH 中找到)"
+        echo -e "      - 必需工具 $tool: ${RED}NOT FOUND${NC}"
         ERRORS=$((ERRORS + 1))
     fi
 done
 
 for tool in "${RECOMMENDED_TOOLS[@]}"; do
-    echo -n "      - 推荐工具: $tool ... "
     if command -v "$tool" >/dev/null 2>&1; then
-        echo -e "${GREEN}PASS${NC} ($(command -v "$tool"))"
+        echo -e "      - 推荐工具 $tool: ${GREEN}INSTALLED${NC} ($(which "$tool"))"
     else
-        echo -e "${YELLOW}WARN${NC} (未在 PATH 中找到，部分自动化特性将受限或降级)"
+        echo -e "      - 推荐工具 $tool: ${YELLOW}NOT FOUND (部分控制面特性受限)${NC}"
         WARNINGS=$((WARNINGS + 1))
     fi
 done
 
-# 3. 检查 GitHub CLI (gh) 认证
-echo -n "[3/6] 检查 GitHub 认证凭据 (gh auth)... "
+# 3. 检查 GitHub 认证状态
+echo -n "[3/6] 检查 GitHub CLI 认证状态... "
 if gh auth status >/dev/null 2>&1; then
-    USER_NAME=$(gh api user --jq .login 2>/dev/null || echo "Unknown")
-    echo -e "${GREEN}PASS${NC} (已登录为: $USER_NAME)"
+    echo -e "${GREEN}PASS${NC} (已登录 GitHub)"
 else
-    echo -e "${RED}FAIL${NC} (未登录，请执行 gh auth login)"
-    ERRORS=$((ERRORS + 1))
+    echo -e "${YELLOW}WARN${NC} (未登录 gh CLI，PR 自动提交与核验功能将受限)"
+    WARNINGS=$((WARNINGS + 1))
 fi
 
-# 4. 检查四大门禁就绪度 (package.json scripts)
-echo -n "[4/6] 检查四大门禁脚本 (Typecheck, Lint, Build, Test)... "
+# 4. 检查 package.json 与四大硬门禁配置
+echo -n "[4/6] 检查本地四大硬门禁 (Typecheck, Lint, Build, Test)... "
 if [[ -f "package.json" ]]; then
+    REQUIRED_GATES=("typecheck" "lint" "build" "test")
     MISSING_GATES=()
-    for gate in "typecheck" "lint" "build" "test"; do
-        if ! grep -q -E "\"$gate\"[[:space:]]*:" package.json; then
+    for gate in "${REQUIRED_GATES[@]}"; do
+        if ! grep -q "\"$gate\":" package.json; then
             MISSING_GATES+=("$gate")
         fi
     done
     if [[ ${#MISSING_GATES[@]} -eq 0 ]]; then
-        echo -e "${GREEN}PASS${NC} (四大门禁已全部就绪)"
+        echo -e "${GREEN}PASS${NC} (四大硬门禁配置完整)"
     else
-        echo -e "${YELLOW}WARN${NC} (缺少门禁: ${MISSING_GATES[*]})"
-        WARNINGS=$((WARNINGS + 1))
+        echo -e "${RED}FAIL${NC} (缺失门禁 scripts: ${MISSING_GATES[*]})"
+        ERRORS=$((ERRORS + 1))
     fi
 else
-    echo -e "${RED}FAIL${NC} (项目根目录缺少 package.json)"
+    echo -e "${RED}FAIL${NC} (缺失 package.json)"
     ERRORS=$((ERRORS + 1))
-    if [[ "$AUTO_FIX" == true ]]; then
-        echo -e "      ${BLUE}[Auto-Fix] 生成基础 package.json 占位骨架...${NC}"
-        cat << 'JSONEOF' > package.json
-{
-  "name": "loopx-project",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "typecheck": "tsc --noEmit || true",
-    "lint": "eslint . || true",
-    "build": "echo 'Build passed' || true",
-    "test": "npm run test:unit || true",
-    "test:unit": "echo 'No tests yet'"
-  }
-}
-JSONEOF
-        echo -e "      ${GREEN}[✓] package.json 初始化完成${NC}"
-        ERRORS=$((ERRORS - 1))
-    fi
 fi
 
 # 5. 检查工作流规范工程目录骨架
-echo "[5/6] 检查流水线交付物目录骨架..."
+echo "[5/6] 检查流水线交付物与 Feature 资产包目录骨架..."
 REQUIRED_DIRS=(
-    "docs/decisions"
-    "docs/prd"
-    "docs/stories"
-    ".trae/specs"
+    "specs/features"
+    "specs/archive"
+    "docs/design"
+    "docs/guides"
     "tests/unit"
     "tests/unit/issues"
     "scripts"
     "skills"
+    "bin"
 )
 
 MISSING_DIRS=()
@@ -156,7 +135,18 @@ fi
 # 6. 检查核心技能挂载状态
 echo -n "[6/6] 检查核心技能文件完整性... "
 MISSING_SKILLS=0
-CORE_SKILLS=("code-review" "design-grill" "create-prd" "strategy-red-team" "user-stories" "prioritize-features" "test-driven-development" "loopx-pr-review" "loopx-pr-merge" "loopx-issue-fix" "open-code-review" "systematic-debugging" "anti-entropy-governance")
+CORE_SKILLS=(
+    "code-review"
+    "design-grill"
+    "create-prd"
+    "strategy-red-team"
+    "user-stories"
+    "prioritize-features"
+    "test-driven-development"
+    "open-code-review"
+    "systematic-debugging"
+    "anti-entropy-governance"
+)
 for s in "${CORE_SKILLS[@]}"; do
     if [[ ! -f "skills/$s/SKILL.md" ]]; then
         MISSING_SKILLS=$((MISSING_SKILLS + 1))
@@ -164,7 +154,7 @@ for s in "${CORE_SKILLS[@]}"; do
 done
 
 if [[ $MISSING_SKILLS -eq 0 ]]; then
-    echo -e "${GREEN}PASS${NC} (13 项核心技能全部在位)"
+    echo -e "${GREEN}PASS${NC} (核心技能全部在位，PR Review / Issue Fix 已下沉 LoopX 原生生态)"
 else
     echo -e "${RED}FAIL${NC} (缺失 $MISSING_SKILLS 项核心技能)"
     ERRORS=$((ERRORS + 1))

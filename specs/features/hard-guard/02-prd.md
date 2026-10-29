@@ -43,7 +43,7 @@ fi
 
 ### 4.2 阶段守卫检查器 (`loopx-flow gate verify <stage>`)
 - `loopx-flow gate verify decisions <feature>`：检查 `docs/decisions/<feature>-decisions.md` 是否存在且包含 `Status: APPROVED BY HUMAN`。
-- `loopx-flow gate verify contract <feature>`：检查 `.trae/specs/<feature>/tasks.md` 是否包含 `Contract-Status: FROZEN & APPROVED`。
+- `loopx-flow gate verify contract <feature>`：检查 `.feat/specs/<feature>/tasks.md` 是否包含 `Contract-Status: FROZEN & APPROVED`。
 - `loopx-flow gate verify pr <pr_id>`：检查 PR reviewDecision 是否为 `APPROVED`。
 
 ### 4.3 Git 主干防直推钩子 (`scripts/git-hooks/pre-commit`)

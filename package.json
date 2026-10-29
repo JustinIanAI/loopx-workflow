@@ -8,6 +8,6 @@
     "lint": "bash -n scripts/*.sh && bash -n scripts/git-hooks/* && if [ -d bin ]; then bash -n bin/*; fi",
     "build": "chmod +x scripts/*.sh && chmod +x scripts/git-hooks/* && if [ -d bin ]; then chmod +x bin/*; fi && echo 'Build verification passed.'",
     "test": "npm run test:unit",
-    "test:unit": "node --test tests/unit/workflow.test.js tests/unit/guard.test.js"
+    "test:unit": "node --test tests/unit/workflow.test.js tests/unit/guard.test.js tests/unit/pipeline-pr.test.js"
   }
 }

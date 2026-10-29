@@ -1,33 +1,33 @@
 ---
 name: open-code-review
-description: Backup and escalated deep scan skill using Alibaba open-code-review (ocr CLI). Used as an escalation path for high-risk concurrency/security/schema changes or independent fallback audit. High/Medium defects must block delivery.
+description: "Alibaba Open Code Review (ocr CLI) escalated deep scan. Optional capability self-contained with auto-check, auto-install, scan, and ingestion into LoopX change-quality engine. High/Medium defects block delivery."
 ---
 
 # Open Code Review (OCR)
 
-Use this skill as a **备份与可提升深度审查能力 (Backup & Escalated Deep Scan Capability)** at L1 before creating or merging a PR (default review uses native `code-review` skill).
+Use this skill as an **选配深度审查与跨模型二次审计能力 (Optional Escalated Deep Scan)**.
+Default review uses the zero-dependency native `code-review` skill. Activate this skill only on high-risk concurrency, persistence, security boundaries, or when explicitly requested by user.
 
-## Quick Execution
+## Self-Contained Lifecycle
 
-Always prefer the bundled automated blocking audit script:
+This skill is fully self-contained:
+1. **Self-Check**: Checks if `ocr` CLI is installed in the local environment.
+2. **Auto-Install**: Automatically installs `@alibaba-group/open-code-review` if missing.
+3. **Scan Execution**: Runs deep cross-model scan from target `base-ref` to `HEAD`.
+4. **LoopX Ingestion**: Translates findings into LoopX `change_quality_agent_result_v2`, writes a tamper-proof Receipt, and syncs evidence into `specs/features/<feature>/05-evidence.md`.
+
+## Execution
+
+Run via the bundled self-contained script:
 ```bash
-./scripts/run-ocr-audit.sh [BASE_REF] [OUTPUT_JSON]
-# 示例:
-./scripts/run-ocr-audit.sh origin/main /tmp/ocr-audit-report.json
+./skills/open-code-review/run-ocr.sh [BASE_REF] [FEATURE]
 ```
 
-Or execute manually with required environment PATH:
+Or trigger through the orchestrator:
 ```bash
-export PATH="$PATH:$HOME/.npm-global/bin"
-ocr review --audience agent --repo . --from origin/main --to HEAD --format json --output /tmp/ocr-audit-report.json
+loopx-flow check --with-ocr
 ```
 
-## Parsing & Blocking Rule (Critical)
-
-1. **High / Medium (Blocking)**:
-   - Any comments with `severity: "high"` or `severity: "medium"` represent critical risks (e.g., null pointers, unhandled Promise rejections, memory leaks, concurrency races, security flaws).
-   - **MUST BLOCK**: Do not proceed to PR creation or merge. Fix the code immediately and rerun audit until blocking count is 0.
-2. **Low / Style (Advisory)**:
-   - Record in delivery notes or fix directly if trivial.
-3. **Caveat on Fields**:
-   - In JSON output, the file path is located at `comments[].path` (NOT `.file`).
+## Blocking Rule
+- **High / Medium defects**: Mapped to LoopX `risks[].severity = "blocker"`. The LoopX Quality Receipt will fail and physically block PR creation and merge.
+- **Low / Style issues**: Mapped to `warning` or `advisory`.

@@ -6,13 +6,11 @@ const { execSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 
-test('1. Directory skeleton integrity check', () => {
+test('1. Feature Capsule & Directory skeleton integrity check', () => {
   const requiredDirs = [
-    'docs/decisions',
-    'docs/prd',
-    'docs/stories',
+    'specs/features',
+    'specs/archive',
     'docs/guides',
-    '.trae/specs',
     'scripts',
     'skills',
     'bin',
@@ -28,9 +26,29 @@ test('1. Directory skeleton integrity check', () => {
       `Directory must exist: ${dir}`
     );
   }
+
+  // Clean-clone invariant: Git does not track empty directories, so every
+  // required directory must contain at least one tracked entry (use .gitkeep
+  // for empty ones). Otherwise a fresh `git clone && npm test` fails here.
+  for (const dir of requiredDirs) {
+    const tracked = execSync(`git ls-files -- ${dir}`, { cwd: PROJECT_ROOT, encoding: 'utf8' }).trim();
+    assert.strictEqual(
+      tracked.length > 0,
+      true,
+      `Directory must be git-tracked (add .gitkeep if empty): ${dir}`
+    );
+  }
+
+  // Check that sample feature capsule exists and contains self-contained files
+  const hardGuardDir = path.join(PROJECT_ROOT, 'specs/features/hard-guard');
+  assert.strictEqual(fs.existsSync(hardGuardDir), true, 'Sample feature specs/features/hard-guard must exist');
+  const capsuleFiles = ['00-INDEX.md', '01-decisions.md', '02-prd.md', '03-stories.md', '04-contract.md', '05-evidence.md'];
+  for (const f of capsuleFiles) {
+    assert.strictEqual(fs.existsSync(path.join(hardGuardDir, f)), true, `Capsule file ${f} must exist in hard-guard`);
+  }
 });
 
-test('2. Core 13 AI-Native skills integrity check', () => {
+test('2. Core AI-Native Prompt & Review skills integrity check', () => {
   const coreSkills = [
     'code-review',
     'design-grill',
@@ -39,9 +57,6 @@ test('2. Core 13 AI-Native skills integrity check', () => {
     'user-stories',
     'prioritize-features',
     'test-driven-development',
-    'loopx-pr-review',
-    'loopx-pr-merge',
-    'loopx-issue-fix',
     'open-code-review',
     'systematic-debugging',
     'anti-entropy-governance'
@@ -65,7 +80,7 @@ test('3. Pipeline scripts syntax and executable permissions', () => {
     'scripts/preflight-check.sh',
     'scripts/workflow-init.sh',
     'scripts/fast-fix-push.sh',
-    'scripts/run-ocr-audit.sh',
+    'skills/open-code-review/run-ocr.sh',
     'bin/loopx-flow'
   ];
 
@@ -82,6 +97,10 @@ test('3. Pipeline scripts syntax and executable permissions', () => {
       execSync(`bash -n "${fullPath}"`);
     }, `Bash script syntax must be valid: ${script}`);
   }
+
+  // Check code review quality ingestion script
+  const ingestionScript = path.join(PROJECT_ROOT, 'skills/code-review/scripts/ingest-to-loopx-quality.js');
+  assert.strictEqual(fs.existsSync(ingestionScript), true, 'Quality ingestion script must exist');
 });
 
 test('4. Open Source assets check (LICENSE, .gitignore, README, templates)', () => {
@@ -107,8 +126,9 @@ test('5. CLI orchestrator (loopx-flow) sanity check', () => {
   const loopxFlow = path.join(PROJECT_ROOT, 'bin/loopx-flow');
   const output = execSync(`"${loopxFlow}" --help`, { encoding: 'utf8' });
   assert.strictEqual(output.includes('LoopX AI-Native Flow Orchestrator'), true);
-  assert.strictEqual(output.includes('doctor'), true);
-  assert.strictEqual(output.includes('start'), true);
-  assert.strictEqual(output.includes('todo'), true);
+  assert.strictEqual(output.includes('feature'), true);
+  assert.strictEqual(output.includes('approve'), true);
   assert.strictEqual(output.includes('check'), true);
+  assert.strictEqual(output.includes('merge'), true);
+  assert.strictEqual(output.includes('context'), true);
 });

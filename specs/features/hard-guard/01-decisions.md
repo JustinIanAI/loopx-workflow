@@ -25,7 +25,7 @@
 - **选定方案**：**选项 A（显式签名检查器 `loopx-flow gate verify <stage>`）**
 - **技术规范**：
   - **阶段 4 准入前**：检查 `docs/decisions/<feature>-decisions.md` 是否存在且包含 `Status: APPROVED BY HUMAN`，否则拒绝生成后续任务与代码骨架。
-  - **阶段 5 编码准入前**：检查 `.trae/specs/<feature>/tasks.md` 是否存在且包含 `Contract-Status: FROZEN & APPROVED`，否则四大门禁脚本与构建工具直接抛错。
+  - **阶段 5 编码准入前**：检查 `.feat/specs/<feature>/tasks.md` 是否存在且包含 `Contract-Status: FROZEN & APPROVED`，否则四大门禁脚本与构建工具直接抛错。
 - **否决备选**：选项 B（仅在 PR 集中校验），中途无断点会导致返工成本过高。
 
 ### 决策分支 3：Git 主干直接提交拦截 (Git Pre-Commit Hook)
