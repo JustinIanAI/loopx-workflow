@@ -79,6 +79,16 @@ if [[ "$args" == *"--check-merge-readiness"* ]]; then
   exit 0
 fi
 
+if [[ "$args" == *"--check-result"* ]]; then
+  echo '{"ok": true, "status": "consistent"}'
+  exit 0
+fi
+
+if [[ "$args" == *"pr-review"* && "$args" == *"--format json"* ]]; then
+  echo '{"schema_version":"pull_request_review_packet_v0","repository":"local/sim","pull_requests":[]}'
+  exit 0
+fi
+
 if [[ "$args" == *"change-quality verify"* ]]; then
   echo '{"ok": true, "enabled": false, "status": "receipt_valid", "receipt_state": "recorded"}'
   exit 0
@@ -89,6 +99,24 @@ exit 0
 `;
 
   fs.writeFileSync(mockLoopxPath, mockLoopxScript, { mode: 0o755 });
+
+  // Feature 5: authentic review pipeline stubs (codex default-model agent + npm gates)
+  const codexStub = `#!/usr/bin/env bash
+headSha="$(git rev-parse HEAD 2>/dev/null || echo localhead)"
+cat <<JSON
+\\\`\\\`\\\`json
+{"schemaVersion":"authentic_review_result_v1","verdict":"approve","findings":[],"declaration":{"reviewer":"codex","model":"codex-default","declaration":"runtime_reported"},"headOid":"\${headSha}"}
+JSON
+exit 0
+`;
+  fs.writeFileSync(path.join(MOCK_BIN_DIR, 'codex'), codexStub, { mode: 0o755 });
+
+  const npmStub = `#!/usr/bin/env bash
+echo "mock gate OK"
+exit 0
+`;
+  fs.writeFileSync(path.join(MOCK_BIN_DIR, 'npm'), npmStub, { mode: 0o755 });
+
   return mockLoopxPath;
 }
 
@@ -154,7 +182,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
       env: testEnv
     });
     assert.strictEqual(reviewRes.status, 0, `Review must succeed: ${reviewRes.stderr}`);
-    assert.strictEqual(reviewRes.stdout.includes('审查报告已成功推送到 GitHub PR'), true);
+    assert.strictEqual(reviewRes.stdout.includes('Authentic 审查管线完成'), true);
 
     // 5. Step 5: Checkpoint 2 Merge Verification & Atomic Archival
     console.log('[Test E2E] 5. Running loopx-flow merge for PR #101...');

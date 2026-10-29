@@ -354,6 +354,7 @@ process.stdout.write(d.ok === true ? "true" : "false");
 
 cmd_review() {
     local pr_id="${1:-}"
+    shift || true
     if [[ -z "$pr_id" ]]; then
         echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow review 12${NC}" >&2
         exit 1
@@ -364,95 +365,35 @@ cmd_review() {
         exit 1
     fi
 
-    echo -e "${BLUE}==> [交付审查 L2] 正在提取 PR #$pr_id 真实元数据 (gh pr view)...${NC}"
-    local pr_json
-    pr_json="$(gh pr view "$pr_id" --json number,title,headRefName,headRefOid,additions,deletions,changedFiles,reviewDecision 2>/dev/null || echo '{}')"
+    echo -e "${BLUE}==> [交付审查 L2] 正在执行真实模型审查管线 (codex exec 默认模型 + LoopX check-result 核验)...${NC}"
+    local repo
+    repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo '')"
+    if [[ -z "$repo" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法解析 owner/repo，拒绝执行无锚定审查。${NC}" >&2
+        exit 1
+    fi
 
-    # Dynamic metadata extraction via node (no jq dependency, mock-friendly)
-    local parsed
-    parsed="$(node -e '
-const fs = require("fs");
-let d = {};
-try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {}
-process.stdout.write([
-  String(d.number ?? ""), String(d.title ?? ""), String(d.headRefName ?? ""),
-  String(d.headRefOid ?? ""), String(d.additions ?? 0), String(d.deletions ?? 0),
-  String(d.changedFiles ?? 0), String(d.reviewDecision ?? "")
-].join("\u0001"));
-' <<< "$pr_json")"
-
-    local p_number p_title p_branch p_oid p_add p_del p_files p_decision
-    IFS=$'\001' read -r p_number p_title p_branch p_oid p_add p_del p_files p_decision <<< "$parsed"
-
-    # Fallback to command argument when PR JSON is unavailable
-    [[ -z "$p_number" ]] && p_number="$pr_id"
-
-    # Infer target feature from head branch (feature/<name>)
+    # Infer target feature from current branch (feature/<name>) for capsule evidence
     local feature=""
-    if [[ "$p_branch" =~ ^feature/(.+) ]]; then
+    local cur_branch
+    cur_branch="$(git branch --show-current 2>/dev/null || echo "")"
+    if [[ "$cur_branch" =~ ^feature/(.+) ]]; then
         feature="${BASH_REMATCH[1]}"
     fi
 
-    # Feature capsule contract evidence
-    local contract_status="NOT_FOUND"
-    local contract_sha="N/A"
-    local contract_file="$PROJECT_ROOT/specs/features/$feature/04-contract.md"
-    if [[ -n "$feature" && -f "$contract_file" ]]; then
-        if grep -q "FROZEN & APPROVED" "$contract_file"; then
-            contract_status="FROZEN & APPROVED"
-        else
-            contract_status="DRAFT"
-        fi
-        contract_sha="$(node -e 'const fs=require("fs"),crypto=require("crypto");console.log(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$contract_file")"
+    local args=(--pr "$pr_id" --repo "$repo")
+    [[ -n "$feature" ]] && args+=(--feature "$feature")
+    for a in "$@"; do
+        case "$a" in
+            --cross-validate|--rebuild-body) args+=("$a") ;;
+        esac
+    done
+
+    if ! node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" "${args[@]}"; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 真实审查管线未通过 (NOT_VERIFIED / HEAD 漂移 / 门禁失败 / check-result 拒绝)。${NC}" >&2
+        exit 1
     fi
-
-    # Single-feature boundary check (≤ 500 changed lines)
-    local total_lines=$(( ${p_add:-0} + ${p_del:-0} ))
-    local within_limit="YES (符合单一特性边界)"
-    if [[ $total_lines -gt 500 ]]; then
-        within_limit="NO (超出 500 行单一特性边界，需拆分)"
-    fi
-
-    echo -e "    分支: ${BOLD}$p_branch${NC} | 变更: ${BOLD}+$p_add / -$p_del across $p_files files${NC}"
-    echo -e "${BLUE}==> 正在调用 LoopX 原生 pr-review 执行交付级扫描...${NC}"
-    if command -v loopx >/dev/null 2>&1; then
-        loopx pr-review --repo "$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo '')" --state open || true
-    fi
-
-    # Dynamic 5-Block bilingual review report (no static hardcoding)
-    local review_comment
-    review_comment="$(cat << REVIEWTXT
-## 📋 LoopX AI-Native Delivery Review Report (5-Block Bilingual)
-
-> **PR #$p_number**: $p_title
-> **Generated**: $(date '+%Y-%m-%d %H:%M:%S') | **Mode**: Dynamic (real PR metadata + feature capsule evidence)
-
-### 1. 变动身份与范围 (Identity & Scope)
-- **Head Branch**: $p_branch | **HEAD OID**: $p_oid
-- **Scope: +$p_add / -$p_del lines across $p_files files** | **Within Limit (≤500)**: $within_limit
-- **Target Feature**: ${feature:-UNKNOWN} (capsule: specs/features/${feature:-UNKNOWN}/)
-
-### 2. 需求契约符合性 (Contract Conformity)
-- **Contract Status**: $contract_status
-- **Contract SHA256**: \`$contract_sha\`
-- **Breaking API Drift**: 0 (frozen TypeScript invariants intact)
-
-### 3. 本地硬门禁与真实凭证 (Gate Evidence)
-- **Typecheck & Lint & Build & Test**: PASSED (fresh execution via npm run gates)
-- **LoopX Change-Quality**: Verified passing receipt with 0 blocker defects
-
-### 4. 爆炸半径与兼容性 (Blast Radius & Compat)
-- **Boundary Risk**: Bounded to feature domain: ${feature:-UNKNOWN}
-- **Anti-Entropy**: delete-first applied, zero ghost/orphaned code
-
-### 5. 应急回滚预案 (Rollback Plan)
-- **Strategy**: Clean Git squash revert of PR #$p_number (HEAD $p_oid) or feature toggle disablement.
-REVIEWTXT
-)"
-
-    echo -e "==> 正在顶置 5-Block 审查报告至 GitHub PR #$pr_id ..."
-    gh pr comment "$pr_id" --body "$review_comment" || true
-    echo -e "${GREEN}[✓] 动态审查报告已成功推送到 GitHub PR #$pr_id 页面！${NC}"
+    echo -e "${GREEN}[✓] Authentic 审查管线完成：真实 findings 已核验并发布至 PR ${pr_id}。${NC}"
 }
 
 cmd_merge() {

@@ -1,0 +1,9 @@
+{
+  "findings": [
+    {
+      "file": "skills/code-review/scripts/authentic-review.js",
+      "severity": "blocker",
+      "summary": "loopx pr-review --check-result rejected (pull_request_review_result_v1 adaptation pending): # Project PR Review Queue  - ok: `False` - error: review packet or result is unreadable; check the supplied files "
+    }
+  ]
+}
