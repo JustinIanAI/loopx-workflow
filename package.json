@@ -4,10 +4,14 @@
   "description": "LoopX AI-Native long-running task workflow for coding and automated delivery",
   "private": true,
   "scripts": {
-    "typecheck": "node -e 'const fs=require(\"fs\"); fs.accessSync(\"docs/design/coding-workflow-tools-spec.md\"); console.log(\"Specs and interface definitions valid.\");'",
-    "lint": "bash -n scripts/*.sh && bash -n scripts/git-hooks/* && if [ -d bin ]; then bash -n bin/*; fi",
-    "build": "chmod +x scripts/*.sh && chmod +x scripts/git-hooks/* && if [ -d bin ]; then chmod +x bin/*; fi && echo 'Build verification passed.'",
+    "typecheck": "tsc --noEmit",
+    "lint": "./scripts/gate-lint.sh",
+    "build": "./scripts/gate-build.sh",
     "test": "npm run test:unit",
-    "test:unit": "node --test tests/unit/workflow.test.js tests/unit/guard.test.js tests/unit/pipeline-pr.test.js"
+    "test:unit": "node --test --test-concurrency=1 tests/unit/workflow.test.js tests/unit/guard.test.js tests/unit/pipeline-pr.test.js tests/unit/gates-hardening.test.js tests/unit/change-quality-failclosed.test.js tests/unit/delivery-review-merge-lock.test.js tests/unit/native-dispatch.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   }
 }

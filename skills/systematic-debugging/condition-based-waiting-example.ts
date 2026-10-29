@@ -2,8 +2,17 @@
 // From: Lace test infrastructure improvements (2025-10-03)
 // Context: Fixed 15 flaky tests by replacing arbitrary timeouts
 
-import type { ThreadManager } from '~/threads/thread-manager';
-import type { LaceEvent, LaceEventType } from '~/threads/types';
+export type LaceEventType = 'TOOL_CALL' | 'TOOL_RESULT' | 'AGENT_MESSAGE' | string;
+
+export interface LaceEvent {
+  type: LaceEventType;
+  data?: Record<string, unknown>;
+  timestamp?: number;
+}
+
+export interface ThreadManager {
+  getEvents(threadId: string): LaceEvent[];
+}
 
 // A timer callback runs after the Promise executor has returned, so every
 // poll must explicitly convert getter/predicate exceptions into rejection.
