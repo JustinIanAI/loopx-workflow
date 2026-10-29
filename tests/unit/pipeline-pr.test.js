@@ -79,6 +79,11 @@ if [[ "$args" == *"--check-merge-readiness"* ]]; then
   exit 0
 fi
 
+if [[ "$args" == *"change-quality verify"* ]]; then
+  echo '{"ok": true, "enabled": false, "status": "receipt_valid", "receipt_state": "recorded"}'
+  exit 0
+fi
+
 echo "[Mock LoopX] $args"
 exit 0
 `;

@@ -328,9 +328,22 @@ cmd_check() {
         node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" ${feature:+--feature "$feature"}
     fi
 
-    echo -e "\n${BOLD}[3/3] 正在核验 LoopX change-quality 严格收据凭据...${NC}"
+    echo -e "\n${BOLD}[3/3] 正在核验 LoopX change-quality 严格收据凭据 (Fail-Closed)...${NC}"
     if command -v loopx >/dev/null 2>&1 && [[ -n "$feature" ]]; then
-        loopx change-quality verify --goal-id "${feature}-goal" --repo-path .
+        local cq_json cq_ok
+        cq_json="$(loopx change-quality verify --goal-id "${feature}-goal" --repo-path . --format json 2>/dev/null || echo '{}')"
+        cq_ok="$(node -e '
+const fs = require("fs");
+let d = {};
+try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {}
+process.stdout.write(d.ok === true ? "true" : "false");
+' <<< "$cq_json")"
+        if [[ "$cq_ok" != "true" ]]; then
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX change-quality 收据核验未通过 (ok=false)，禁止进入交付阶段。${NC}" >&2
+            echo -e "${RED}    请先运行 prepare/review 并记录与当前 exact-scope 对齐的通过收据。${NC}" >&2
+            exit 1
+        fi
+        echo -e "    ${GREEN}[✓] 严格收据核验通过 (ok=true)。${NC}"
     fi
 
     echo -e "${GREEN}======================================================================${NC}"
