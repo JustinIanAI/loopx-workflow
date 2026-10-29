@@ -60,6 +60,33 @@ exit 0
   return mockGhPath;
 }
 
+// Set up mock loopx binary to simulate LoopX control-plane readiness lock
+function setupMockLoopx() {
+  if (!fs.existsSync(MOCK_BIN_DIR)) {
+    fs.mkdirSync(MOCK_BIN_DIR, { recursive: true });
+  }
+
+  const mockLoopxPath = path.join(MOCK_BIN_DIR, 'loopx');
+  const mockLoopxScript = `#!/usr/bin/env bash
+args="$*"
+
+if [[ "$args" == *"--check-merge-readiness"* ]]; then
+  if [[ "\${MOCK_LOOPX_READINESS_FAIL:-}" == "1" ]]; then
+    echo "[Mock LoopX] Merge readiness check FAILED (simulated)" >&2
+    exit 1
+  fi
+  echo "[Mock LoopX] Merge readiness check PASSED: $args"
+  exit 0
+fi
+
+echo "[Mock LoopX] $args"
+exit 0
+`;
+
+  fs.writeFileSync(mockLoopxPath, mockLoopxScript, { mode: 0o755 });
+  return mockLoopxPath;
+}
+
 function cleanupMockGh() {
   if (fs.existsSync(MOCK_BIN_DIR)) {
     fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true });
@@ -70,6 +97,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
   const featureName = 'e2e-pipeline-demo';
   const featureDir = path.join(PROJECT_ROOT, 'specs/features', featureName);
   const archiveDir = path.join(PROJECT_ROOT, 'specs/archive', featureName);
+  const originalBranch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8' }).trim();
 
   // Clean before test
   if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
@@ -77,6 +105,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
 
   const currentHeadSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
   setupMockGh(currentHeadSha);
+  setupMockLoopx();
 
   const testEnv = {
     ...process.env,
@@ -142,5 +171,46 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
     cleanupMockGh();
     if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
     if (fs.existsSync(archiveDir)) fs.rmSync(archiveDir, { recursive: true, force: true });
+    // Restore the developer's original branch: `loopx-flow feature` switches branches as a side effect
+    try {
+      const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8' }).trim();
+      if (currentBranch !== originalBranch) {
+        execSync(`git checkout ${originalBranch}`, { encoding: 'utf8' });
+      }
+    } catch (_) {}
+  }
+});
+
+test('Merge Readiness Fail-Closed: loopx-flow merge must block when LoopX readiness lock fails', (t) => {
+  const currentHeadSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+  setupMockGh(currentHeadSha);
+  setupMockLoopx();
+
+  const testEnv = {
+    ...process.env,
+    PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
+    MOCK_LOOPX_READINESS_FAIL: '1'
+  };
+
+  try {
+    const mergeRes = spawnSync(LOOPX_FLOW, ['merge', '101', 'failclosed-demo'], {
+      encoding: 'utf8',
+      env: testEnv
+    });
+
+    assert.strictEqual(mergeRes.status, 1, `Merge must exit 1 on readiness lock failure: ${mergeRes.stdout}`);
+    assert.strictEqual(
+      `${mergeRes.stderr}${mergeRes.stdout}`.includes('LoopX 合入就绪度核验失败'),
+      true,
+      'Merge must print explicit fail-closed message when readiness lock fails'
+    );
+    assert.strictEqual(
+      `${mergeRes.stderr}${mergeRes.stdout}`.includes('GitHub PR 已成功 Squash 合入主干'),
+      false,
+      'Merge must never proceed to squash merge when readiness lock fails'
+    );
+    console.log('[Test E2E] Fail-closed merge readiness lock verification completed successfully!');
+  } finally {
+    cleanupMockGh();
   }
 });

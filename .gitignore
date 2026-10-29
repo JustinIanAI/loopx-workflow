@@ -30,3 +30,9 @@ coverage/
 
 # LoopX private runtime artifacts
 .loopx/shadow/
+
+# LoopX local IDE runtime state (goal leases / active states)
+.codex/
+
+# Test mock binaries
+.tmp-mock-bin*
