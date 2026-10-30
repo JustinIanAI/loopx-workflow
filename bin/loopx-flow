@@ -536,6 +536,9 @@ cmd_gate() {
     case "$stage" in
         decisions)
             local decision_file="$PROJECT_ROOT/specs/features/$feature/01-decisions.md"
+            if [[ ! -f "$decision_file" && -f "$PROJECT_ROOT/specs/archive/$feature/01-decisions.md" ]]; then
+                decision_file="$PROJECT_ROOT/specs/archive/$feature/01-decisions.md"
+            fi
             if [[ ! -f "$decision_file" ]]; then
                 echo -e "${RED}[-] [GATE FAIL] 未找到决策文件: $decision_file${NC}" >&2
                 exit 1
@@ -548,6 +551,9 @@ cmd_gate() {
             ;;
         contract)
             local contract_file="$PROJECT_ROOT/specs/features/$feature/04-contract.md"
+            if [[ ! -f "$contract_file" && -f "$PROJECT_ROOT/specs/archive/$feature/04-contract.md" ]]; then
+                contract_file="$PROJECT_ROOT/specs/archive/$feature/04-contract.md"
+            fi
             if [[ ! -f "$contract_file" ]]; then
                 echo -e "${RED}[-] [GATE FAIL] 未找到契约文件: $contract_file${NC}" >&2
                 exit 1

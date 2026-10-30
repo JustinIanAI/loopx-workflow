@@ -24,7 +24,9 @@ test('2. ADR-002: Double-anchored Contract Gate: passes on matching SHA256', () 
 });
 
 test('3. ADR-002: Double-anchored Contract Gate: fails closed on tampered contract SHA256', () => {
-  const contractFile = path.join(PROJECT_ROOT, 'specs/features/fail-closed-hardening/04-contract.md');
+  const contractFile = fs.existsSync(path.join(PROJECT_ROOT, 'specs/features/fail-closed-hardening/04-contract.md'))
+    ? path.join(PROJECT_ROOT, 'specs/features/fail-closed-hardening/04-contract.md')
+    : path.join(PROJECT_ROOT, 'specs/archive/fail-closed-hardening/04-contract.md');
   const originalContent = fs.readFileSync(contractFile, 'utf8');
 
   try {
