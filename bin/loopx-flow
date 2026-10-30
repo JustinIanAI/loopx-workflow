@@ -510,7 +510,7 @@ cmd_merge() {
 
     if command -v loopx >/dev/null 2>&1 && [[ -n "$feature" ]]; then
         local goal_id="${feature}-goal"
-        loopx goal-lifecycle --goal-id "$goal_id" --operation stop --execute 2>/dev/null || true
+        loopx goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "Feature delivered and archived" --execute 2>/dev/null || true
         loopx sync-global 2>/dev/null || true
         echo -e "    ${GREEN}[✓] LoopX Goal $goal_id 已闭环核销！${NC}"
     fi
