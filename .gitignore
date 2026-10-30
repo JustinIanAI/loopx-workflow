@@ -31,19 +31,8 @@ coverage/
 # LoopX private runtime artifacts
 .loopx/shadow/
 
-# LoopX Lark event collector + inbox (local-private)
-.loopx/config/lark-collector.json
-.loopx/config/lark/
-.loopx/inbox/
-
 # LoopX local IDE runtime state (goal leases / active states)
 .codex/
 
 # Test mock binaries
 .tmp-mock-bin*
-
-# LoopX dynamic goal channel & review carryover
-.loopx/goal-channel*
-.loopx/lark-kanban.json
-review-carryover.json
-specs/features/*/review-carryover.json

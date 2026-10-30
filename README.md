@@ -4,8 +4,8 @@
 > 以 **LoopX（https://github.com/loopx-project/loopx） 原生能力引擎** 为内核底座，**Feature 自包含资产胶囊** 为组织单元，配合 **场景化编排器 (`loopx-flow`)** 与 **GitHub 交付流**，提供从需求澄清、方案设计、Specs冻结、TDD 循环、质量控制融合到原子归档的端到端闭环研发管线。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![LoopX: v2.x](https://img.shields.io/badge/LoopX-2.x-green.svg)](https://github.com/loopx-project)
-[![Node: >=22.22.3](https://img.shields.io/badge/Node-%3E%3D22.22.3-brightgreen.svg)](package.json)
+[![LoopX: v2.0](https://img.shields.io/badge/LoopX-2.0.0-green.svg)](https://github.com/loopx-project)
+[![Node: >=18](https://img.shields.io/badge/Node-%3E%3D18-brightgreen.svg)](package.json)
 
 ---
 

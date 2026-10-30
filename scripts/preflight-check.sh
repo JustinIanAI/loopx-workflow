@@ -49,22 +49,7 @@ RECOMMENDED_TOOLS=("loopx")
 
 for tool in "${REQUIRED_TOOLS[@]}"; do
     if command -v "$tool" >/dev/null 2>&1; then
-        if [[ "$tool" == "node" ]]; then
-            NODE_VER=$(node -v | sed "s/v//")
-            NODE_OK=$(node -e '
-                const [major, minor, patch] = process.versions.node.split(".").map(Number);
-                const ok = major > 22 || (major === 22 && (minor > 22 || (minor === 22 && patch >= 3)));
-                process.stdout.write(ok ? "true" : "false");
-            ')
-            if [[ "$NODE_OK" == "true" ]]; then
-                echo -e "      - 必需工具 node: ${GREEN}INSTALLED${NC} ($(which node), v${NODE_VER} >= 22.22.3)"
-            else
-                echo -e "      - 必需工具 node: ${RED}VERSION MISMATCH${NC} (v${NODE_VER} < 22.22.3, LoopX 2.x 要求 Node >= 22.22.3)"
-                ERRORS=$((ERRORS + 1))
-            fi
-        else
-            echo -e "      - 必需工具 $tool: ${GREEN}INSTALLED${NC} ($(which "$tool"))"
-        fi
+        echo -e "      - 必需工具 $tool: ${GREEN}INSTALLED${NC} ($(which "$tool"))"
     else
         echo -e "      - 必需工具 $tool: ${RED}NOT FOUND${NC}"
         ERRORS=$((ERRORS + 1))

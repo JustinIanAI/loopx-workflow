@@ -135,7 +135,6 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
   // Clean before test
   if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
   if (fs.existsSync(archiveDir)) fs.rmSync(archiveDir, { recursive: true, force: true });
-  try { execSync("git branch -D feature/" + featureName, { stdio: "ignore" }); } catch (_) {}
 
   const currentHeadSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
   setupMockGh(currentHeadSha);
@@ -211,7 +210,6 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
       if (currentBranch !== originalBranch) {
         execSync(`git checkout ${originalBranch}`, { encoding: 'utf8' });
       }
-      try { execSync("git branch -D feature/" + featureName, { stdio: "ignore" }); } catch (_) {}
     } catch (_) {}
   }
 });

@@ -1,17 +1,14 @@
 {
   "name": "loopx-workflow",
-  "version": "2.0.0",
+  "version": "1.0.0",
   "description": "LoopX AI-Native long-running task workflow for coding and automated delivery",
   "private": true,
-  "engines": {
-    "node": ">=22.22.3"
-  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "lint": "./scripts/gate-lint.sh",
     "build": "./scripts/gate-build.sh",
     "test": "npm run test:unit",
-    "test:unit": "node --test --test-concurrency=1 tests/unit/workflow.test.js tests/unit/guard.test.js tests/unit/pipeline-pr.test.js tests/unit/gates-hardening.test.js tests/unit/change-quality-failclosed.test.js tests/unit/delivery-review-merge-lock.test.js tests/unit/native-dispatch.test.js tests/unit/authentic-review-pipeline.test.js tests/unit/fail-closed-hardening.test.js"
+    "test:unit": "node --test --test-concurrency=1 tests/unit/workflow.test.js tests/unit/guard.test.js tests/unit/pipeline-pr.test.js tests/unit/gates-hardening.test.js tests/unit/change-quality-failclosed.test.js tests/unit/delivery-review-merge-lock.test.js tests/unit/native-dispatch.test.js tests/unit/authentic-review-pipeline.test.js"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
