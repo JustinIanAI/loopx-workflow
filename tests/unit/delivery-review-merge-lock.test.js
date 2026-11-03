@@ -65,7 +65,7 @@ exit 0
   const codexStub = `#!/usr/bin/env bash
 cat <<'JSON'
 \`\`\`json
-{"schemaVersion":"authentic_review_result_v1","verdict":"approve","findings":[{"file":"bin/loopx-flow","line":3,"severity":"minor","summary":"dynamic review verified by mock agent"}],"declaration":{"reviewer":"codex","model":"codex-default","declaration":"runtime_reported"},"headOid":"abcd1234ef567890"}
+{"review_body":"Reviewer: model_agent\\n## 动机\\nPR #123 · 分支 feature/delivery-review-merge-lock · 3 files changed。动机段落说明本次交付审查的必要性与动态元数据来源。\\n## 改动思路\\n按 LoopX 原生 review_template 五段式组织审查证据，说明实现路径与取舍，并覆盖动态证据来源。\\n## 具体改动\\n### 关键代码讲解\\n- bin/loopx-flow — dynamic review verified by mock agent\\n## 对主干的风险\\n风险段落说明触发条件与最小修复方向，并要求精确 head 复核。\\n## 我的整体评价\\n评价段落给出交付、长程与体验判断，并说明复审所需证据。\\nEnglish verdict: APPROVE","verdict":"APPROVE","findings":[{"file":"bin/loopx-flow","line":3,"severity":"minor","summary":"dynamic review verified by mock agent"}],"reviewer":{"actor_kind":"model_agent","declaration_source":"self_reported","declared_model":"codex","declared_provider":"openai"},"headOid":"abcd1234ef567890"}
 \`\`\`
 JSON
 exit 0
@@ -75,11 +75,13 @@ exit 0
   const loopxStub = `#!/usr/bin/env bash
 args="$*"
 if [[ "$args" == *"--check-result"* ]]; then
-  echo '{"ok": true, "status": "consistent"}'
+  echo '{"ok": true, "review_body_check": {"valid": true}, "errors": [], "approval_consistent": true}'
   exit 0
 fi
 if [[ "$args" == *"pr-review"* && "$args" == *"--format json"* ]]; then
-  echo '{"schema_version":"pull_request_review_packet_v0","repository":"local/sim","pull_requests":[]}'
+  cat <<JSON
+{"schema_version":"pull_request_review_packet_v0","repository":"local/sim","reviewer_execution":{"status":"unavailable","reason":"session_not_bound"},"pull_requests":[{"number":123,"head_oid":"abcd1234ef567890","headRefOid":"abcd1234ef567890","headRefName":"feature/delivery-review-merge-lock","title":"t","review_action_kind":"review","review_template":{"schema":"pr_review_five_block_template_v0","sections":[{"label":"动机","minimum_prose_characters":40,"agent_instruction":"x"},{"label":"改动思路","minimum_prose_characters":80,"agent_instruction":"x"},{"label":"具体改动","minimum_prose_characters":180,"agent_instruction":"x"},{"label":"对主干的风险","minimum_prose_characters":120,"agent_instruction":"x"},{"label":"我的整体评价","minimum_prose_characters":60,"agent_instruction":"x"}],"output_hint":"x"},"review_plan":{"required_evidence_ids":[],"applicability":{"behavior_bearing_change":true}},"evidence_commands":[],"motivation":"m1。m2。m3。m4。"}]}
+JSON
   exit 0
 fi
 if [[ "$args" == *"--check-merge-readiness"* ]]; then
@@ -108,7 +110,7 @@ function cleanupMock() {
   }
 }
 
-test('1. Dynamic 5-Block Review: loopx-flow review must render dynamic PR metadata and feature capsule evidence', () => {
+test('1. Native Five-Section Review: loopx-flow review must render loopx pr-review review_template format with dynamic metadata', () => {
   cleanupMock();
   setupMockGh({ reviewDecision: 'APPROVED' });
 
@@ -128,12 +130,18 @@ test('1. Dynamic 5-Block Review: loopx-flow review must render dynamic PR metada
     assert.strictEqual(fs.existsSync('/tmp/last-mock-pr-comment.txt'), true, 'Must post comment via gh');
     const comment = fs.readFileSync('/tmp/last-mock-pr-comment.txt', 'utf8');
 
-    // Must contain dynamic metadata from real PR view + codex findings, not pure static text
+    // 原生五段式章节齐备，且必须携带动态元数据/声明/关键代码讲解
+    for (const label of ['动机', '改动思路', '具体改动', '对主干的风险', '我的整体评价']) {
+      assert.strictEqual(comment.includes(`## ${label}`), true, `Must include native section: ${label}`);
+    }
+    assert.strictEqual(comment.includes('### 关键代码讲解'), true, 'Code changes must include key code walkthrough');
     assert.strictEqual(comment.includes('#123'), true, 'Must include dynamic PR number');
     assert.strictEqual(comment.includes('feature/delivery-review-merge-lock'), true, 'Must include dynamic target branch');
     assert.strictEqual(comment.includes('3 files changed'), true, 'Must include dynamic diff stats');
-    assert.strictEqual(comment.includes('runtime_reported'), true, 'Must carry model declaration');
+    assert.strictEqual(comment.includes('declaration=self_reported'), true, 'Must publish reviewer declaration source token');
     assert.strictEqual(comment.includes('dynamic review verified by mock agent'), true, 'Must carry agent finding');
+    // 严禁自造 Block 版式
+    assert.doesNotMatch(comment, /5-Block|Block\s*[1-5]\b|fiveBlock/i);
   } finally {
     cleanupMock();
   }

@@ -81,8 +81,8 @@ cat specs/features/<feature-name>/05-evidence.md
 |---|---|---|---|
 | **1** | **改动范围 (Scope)** | 改动行数建议 ≤ 500 行，无多余未跟踪文件或无意义格式微调 | 网页 Files Changed，或 `gh pr diff <PR> --stat` |
 | **2** | **契约稳定性** | 严格遵守 `04-contract.md` 冻结的 TypeScript 接口，无破坏性变更 | 对比契约文件顶部的类型定义与实际代码 |
-| **3** | **四大门禁凭证** | 本地四大门禁全绿，且在 `05-evidence.md` 中如实填报 | 查阅 PR 描述或顶置 5-Block 报告中的门禁凭证 |
-| **4** | **代码审查闭环** | 零 Actionable 缺陷，幽灵代码已彻底删除 (`delete-first`) | 查阅顶置 5-Block 报告与 `05-evidence.md` |
+| **3** | **四大门禁凭证** | 本地四大门禁全绿，且在 `05-evidence.md` 中如实填报 | 查阅 PR 描述或顶置原生五段式报告中的门禁凭证 |
+| **4** | **代码审查闭环** | 零 Actionable 缺陷，幽灵代码已彻底删除 (`delete-first`) | 查阅顶置原生五段式报告与 `05-evidence.md` |
 | **5** | **分支无漂移** | 本地已完成隔离预集成，无潜在 merge 冲突 | GitHub 页面显示 "Able to merge" |
 | **6** | **机器元数据完整** | PR 正文中包含正确的 `<!-- loopx-meta: ... -->` 注释 | 检查 PR Body 中包含 Goal 与 PR 映射元数据 |
 | **7** | **HEAD SHA 一致** | 当前 PR 最新的 Commit SHA 与审查时完全一致 (防偷跑提交) | `gh pr view <PR> --json headRefOid` 比对基准 SHA |

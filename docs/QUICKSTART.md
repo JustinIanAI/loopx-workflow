@@ -76,7 +76,7 @@ git push -u origin feature/order-checkout
 # 创建 PR
 gh pr create --fill
 
-# 触发官方交付级 5-Block 审查报告顶置
+# 触发 LoopX 原生五段式交付审查报告顶置（复用 pr-review review_template）
 bin/loopx-flow review <PR_NUMBER>
 ```
 

@@ -36,3 +36,14 @@ coverage/
 
 # Test mock binaries
 .tmp-mock-bin*
+
+# LoopX private runtime registry & state (boundary compliance)
+.loopx/registry.json
+.loopx/state/
+.loopx/cache/
+.loopx/reviews/
+.loopx/*.sqlite*
+
+# Local agent scratch / test isolation artifacts (must never pollute diff scope)
+.workbuddy/
+specs/features/cq-isolated-*/
