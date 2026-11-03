@@ -225,18 +225,25 @@ function main() {
   for (const m of scopeDiff.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)) {
     if (!changedFiles.includes(m[2])) changedFiles.push(m[2]);
   }
+  const fallbackRefs = opts.feature
+    ? [`path:specs/features/${opts.feature}/05-evidence.md`]
+    : [`path:package.json`];
+  const groundedRefs = changedFiles.length > 0
+    ? changedFiles.slice(0, 3).map(f => `path:${f}`)
+    : fallbackRefs;
+
   const qualityResult = {
     schema_version: 'change_quality_agent_result_v2',
     reviewed_final_scope: true,
     reuse: {
       outcome: 'retained',
       summary: 'Reused established helpers, types, and durable knowledge across the exact scope',
-      evidence_refs: changedFiles.slice(0, 3).map(f => `path:${f}`)
+      evidence_refs: groundedRefs
     },
     simplification: {
       outcome: 'retained',
       summary: 'delete-first applied without dead code or speculative abstractions',
-      evidence_refs: changedFiles.slice(0, 3).map(f => `path:${f}`),
+      evidence_refs: groundedRefs,
       safe_fix_applied: false
     },
     risks,

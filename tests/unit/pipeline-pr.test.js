@@ -85,7 +85,10 @@ if [[ "$args" == *"--check-result"* ]]; then
 fi
 
 if [[ "$args" == *"pr-review"* && "$args" == *"--format json"* ]]; then
-  echo '{"schema_version":"pull_request_review_packet_v0","repository":"local/sim","pull_requests":[]}'
+  headSha="$(git rev-parse HEAD 2>/dev/null || echo localhead)"
+  cat <<JSON
+{"schema_version":"pull_request_review_packet_v0","repository":"local/sim","reviewer_execution":{"status":"unavailable","reason":"session_not_bound"},"pull_requests":[{"number":101,"head_oid":"\${headSha}","headRefOid":"\${headSha}","headRefName":"feature/e2e-pipeline-demo","title":"t","review_action_kind":"review","review_template":{"schema":"pr_review_five_block_template_v0","sections":[{"label":"动机","minimum_prose_characters":40,"agent_instruction":"x"},{"label":"改动思路","minimum_prose_characters":80,"agent_instruction":"x"},{"label":"具体改动","minimum_prose_characters":180,"agent_instruction":"x"},{"label":"对主干的风险","minimum_prose_characters":120,"agent_instruction":"x"},{"label":"我的整体评价","minimum_prose_characters":60,"agent_instruction":"x"}],"output_hint":"x"},"review_plan":{"required_evidence_ids":[],"applicability":{"behavior_bearing_change":true}},"evidence_commands":[],"motivation":"m1。m2。m3。m4。"}]}
+JSON
   exit 0
 fi
 
@@ -105,7 +108,7 @@ exit 0
 headSha="$(git rev-parse HEAD 2>/dev/null || echo localhead)"
 cat <<JSON
 \\\`\\\`\\\`json
-{"schemaVersion":"authentic_review_result_v1","verdict":"approve","findings":[],"declaration":{"reviewer":"codex","model":"codex-default","declaration":"runtime_reported"},"headOid":"\${headSha}"}
+{"review_body":"Reviewer: model_agent\\n## 动机\\n动机内容足够长以通过字数下限约束，说明本次改造的必要性与用户价值，并覆盖问题背景与目标。\\n## 改动思路\\n改动思路段落说明架构与实现路径，足以通过字数下限并解释方案取舍与边界。\\n## 具体改动\\n### 关键代码讲解\\n- bin/loopx-flow — 命令编排调整\\n## 对主干的风险\\n风险段落说明触发条件、影响面与最小修复方向，满足字数下限要求并给出复现路径。\\n## 我的整体评价\\n评价段落给出交付、长程与体验判断，并说明残余风险。\\nEnglish verdict: APPROVE","verdict":"APPROVE","findings":[],"reviewer":{"actor_kind":"model_agent","declaration_source":"self_reported","declared_model":"codex","declared_provider":"openai"},"headOid":"\${headSha}"}
 JSON
 exit 0
 `;
@@ -135,6 +138,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
   // Clean before test
   if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
   if (fs.existsSync(archiveDir)) fs.rmSync(archiveDir, { recursive: true, force: true });
+  try { execSync("git branch -D feature/" + featureName, { stdio: "ignore" }); } catch (_) {}
 
   const currentHeadSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
   setupMockGh(currentHeadSha);
@@ -210,6 +214,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
       if (currentBranch !== originalBranch) {
         execSync(`git checkout ${originalBranch}`, { encoding: 'utf8' });
       }
+      try { execSync("git branch -D feature/" + featureName, { stdio: "ignore" }); } catch (_) {}
     } catch (_) {}
   }
 });

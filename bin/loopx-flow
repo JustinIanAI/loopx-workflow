@@ -32,13 +32,15 @@ usage() {
   feature <name>          开启新特性管线，生成 specs/features/<name> 资产包与 Goal (阶段 0~4)
   approve contract <name> 【断点 1】方案与契约审批，锁定 SHA256 契约基线并放行 TDD 编码
   check [--with-ocr]      执行四大硬门禁与代码审查，生成并校验 LoopX change-quality 严格收据
-  review <pr_id>          执行 L2 交付审查并顶置 5-Block 报告至 GitHub PR
+  pr <action> [feature]   按 PR #7545 官方标准从胶囊生成 4-Part 描述并提交/预览/更新 PR (create|preview|update)
+  review <pr_id>          执行 L2 交付审查并顶置 LoopX 原生五段式评审报告（复用 pr-review review_template）
+  respond <pr_id>         复用 LoopX 原生五段式格式提交针对 Review findings 的逐项闭环汇报
   merge <pr_id> [feature] 【断点 2】核验 HEAD SHA 与 Approve 决议，Squash 合入并原子归档资产包
   issue <issue_id>        GitHub Issue 缺陷智能分流 (LoopX issue-fix feasibility 因果路由: fix_pr | comment_only | triage_only)
   integrate [--execute|--status]  LoopX 集成分支本地预集成 (默认 preview 不落盘)
   context <feature>       生成当前特性的长程上下文胶囊，供开发者与 AI Agent 快速穿透审阅
   archive <feature>       原子归档已合入特性的资产包 (specs/features/ -> specs/archive/)
-  gate verify <stage> <f> 阶段流转物理熔断守卫 (decisions | contract | pr)
+  gate verify <stage> <f> 阶段流转物理熔断守卫 (decisions | contract)
   doctor                  前置环境与 LoopX 就绪度全维评分 (preflight + loopx doctor)
   init                    初始化项目工作流骨架、依赖及本地 LoopX 连接
   status                  查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
@@ -56,7 +58,12 @@ cmd_doctor() {
 
     echo -e "\n${BLUE}==> [2/2] 运行 LoopX 原生健康自检 (LoopX Doctor)...${NC}"
     if command -v loopx >/dev/null 2>&1; then
-        loopx doctor || true
+        if ! loopx doctor; then
+            echo -e "\n${RED}[-] [FAIL-CLOSED] LoopX 原生健康自检失败！${NC}" >&2
+            echo -e "💡 为什么阻断？LoopX 控制面存在配置损坏或环境缺失，继续执行可能导致状态丢失。" >&2
+            echo -e "🛠️ 修复指令: 查看上方详细自检日志，或运行 python3 -m pip install --upgrade loopx 进行修复。" >&2
+            exit 1
+        fi
     else
         echo -e "${YELLOW}[!] 未安装 loopx CLI，部分控制面特性受限。${NC}"
     fi
@@ -67,7 +74,10 @@ cmd_init() {
     "$PROJECT_ROOT/scripts/workflow-init.sh"
     if command -v loopx >/dev/null 2>&1; then
         echo -e "${BLUE}==> 正在连接 LoopX 本地项目状态...${NC}"
-        loopx bootstrap --project "$PROJECT_ROOT" || true
+        if ! loopx bootstrap --project "$PROJECT_ROOT"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 本地项目状态初始化失败！${NC}" >&2
+            exit 1
+        fi
     fi
     echo -e "${GREEN}[✓] 初始化完成！建议随后运行: loopx-flow doctor${NC}"
 }
@@ -84,9 +94,19 @@ cmd_feature() {
 
     echo -e "${BLUE}==> [1/3] 检查并切换特性分支: $branch_name ...${NC}"
     if git rev-parse --verify "$branch_name" >/dev/null 2>&1; then
-        git checkout "$branch_name" 2>/dev/null || echo "    [!] 切换分支受限，继续初始化..."
+        if ! git checkout "$branch_name" 2>/dev/null; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 切换特性分支 $branch_name 失败，流程已物理熔断！${NC}" >&2
+            echo -e "💡 为什么阻断？工作区可能存在脏文件阻碍切换，严禁在当前分支继续执行。" >&2
+            echo -e "🛠️ 修复指令: 运行 git status 检查未暂存改动或使用 git stash 暂存后重试。" >&2
+            exit 1
+        fi
     else
-        git checkout -b "$branch_name" 2>/dev/null || echo "    [!] 创建分支受限，继续初始化..."
+        if ! git checkout -b "$branch_name" 2>/dev/null; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 创建特性分支 $branch_name 失败，流程已物理熔断！${NC}" >&2
+            echo -e "💡 为什么阻断？严禁在 main 主干或非目标分支直接初始化资产包。" >&2
+            echo -e "🛠️ 修复指令: 运行 git status 检查工作区状态或使用 git stash 暂存后重试。" >&2
+            exit 1
+        fi
     fi
 
     echo -e "${BLUE}==> [2/3] 初始化 Feature 资产胶囊: specs/features/$feature/ ...${NC}"
@@ -185,9 +205,25 @@ EVIEEOF
 
     echo -e "    ${GREEN}[✓] 已生成自包含资产包: specs/features/$feature/${NC}"
 
-    echo -e "${BLUE}==> [3/3] 注册 LoopX Goal 实体...${NC}"
+    echo -e "${BLUE}==> [3/3] 注册 LoopX Goal 实体与持久化状态 (Capsule State Bound)...${NC}"
+    local state_file="specs/features/$feature/ACTIVE_STATE.md"
+    if [[ ! -f "$PROJECT_ROOT/$state_file" ]]; then
+        cat << STATEEOF > "$PROJECT_ROOT/$state_file"
+# Active Goal State: $goal_id
+- **Feature**: $feature
+- **Created At**: $(date "+%Y-%m-%d %H:%M:%S")
+- **Status**: active
+STATEEOF
+    fi
+
     if command -v loopx >/dev/null 2>&1; then
-        loopx $REGISTRY_FLAG bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" || true
+        if ! loopx $REGISTRY_FLAG bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" --state-file "specs/features/$feature/ACTIVE_STATE.md"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 注册 LoopX Goal $goal_id 失败，流程已阻断！${NC}" >&2
+            echo -e "💡 为什么阻断？目标实体注册失败将导致任务无法被正确追踪与审计。" >&2
+            echo -e "🛠️ 修复指令: 运行 loopx doctor 排查本地注册表健康状态。" >&2
+            exit 1
+        fi
+        loopx sync-global --goal-id "$goal_id" 2>/dev/null || true
     fi
 
     echo -e "\n${BOLD}${GREEN}======================================================================${NC}"
@@ -279,7 +315,13 @@ fs.writeFileSync(file, text);
     echo -e "    契约 SHA256 指纹: ${BOLD}$contract_sha${NC}"
     if command -v loopx >/dev/null 2>&1; then
         local goal_id="${feature}-goal"
-        loopx configure-goal --goal-id "$goal_id" --progress-review-contract-revision "$contract_sha" --execute 2>/dev/null || true
+        if ! loopx configure-goal --goal-id "$goal_id" --progress-review-contract-revision "$contract_sha" --execute 2>/dev/null; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 契约 SHA256 物理锁定失败 (loopx configure-goal 返回非零)！${NC}" >&2
+            echo -e "💡 为什么阻断？契约指纹未能同步锁定至 LoopX 控制面，无法保证后续防偷跑核验。" >&2
+            echo -e "🛠️ 修复指令: 运行 loopx status 确认 Goal 状态，或重新 bootstrap 该 Goal 后重试。" >&2
+            exit 1
+        fi
+        loopx sync-global --goal-id "$goal_id" 2>/dev/null || true
     fi
 
     echo -e "\n${GREEN}[✓] 断点 1 方案与契约审批通过！契约已锁定。${NC}"
@@ -329,7 +371,13 @@ cmd_check() {
     fi
 
     echo -e "\n${BOLD}[3/3] 正在核验 LoopX change-quality 严格收据凭据 (Fail-Closed)...${NC}"
-    if command -v loopx >/dev/null 2>&1 && [[ -n "$feature" ]]; then
+    if [[ -n "$feature" ]]; then
+        if ! command -v loopx >/dev/null 2>&1; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 严格收据核验失败: 未检测到 loopx CLI，禁止进入交付阶段。${NC}" >&2
+            echo -e "💡 为什么阻断？质量门禁收据核验是强阻断项，必须依赖 LoopX 校验不可篡改凭据。" >&2
+            echo -e "🛠️ 修复指令: 安装 loopx (python3 -m pip install --upgrade loopx) 后重试。" >&2
+            exit 1
+        fi
         local cq_json cq_ok
         cq_json="$(loopx change-quality verify --goal-id "${feature}-goal" --repo-path . --format json 2>/dev/null || echo '{}')"
         cq_ok="$(node -e '
@@ -383,9 +431,19 @@ cmd_review() {
 
     local args=(--pr "$pr_id" --repo "$repo")
     [[ -n "$feature" ]] && args+=(--feature "$feature")
-    for a in "$@"; do
-        case "$a" in
-            --cross-validate|--rebuild-body) args+=("$a") ;;
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cross-validate|--rebuild-body)
+                args+=("$1")
+                shift
+                ;;
+            --agent-bin)
+                args+=("$1" "$2")
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
         esac
     done
 
@@ -396,6 +454,255 @@ cmd_review() {
     echo -e "${GREEN}[✓] Authentic 审查管线完成：真实 findings 已核验并发布至 PR ${pr_id}。${NC}"
 }
 
+
+cmd_respond() {
+    local pr_id="${1:-}"
+    shift || true
+    local result_file=""
+    local resolutions_file=""
+    local dry_run="false"
+
+    if [[ "$pr_id" == "--help" || "$pr_id" == "-h" || -z "$pr_id" ]]; then
+        cat << 'HELPTXT'
+用法: loopx-flow respond <pr_id> [--result-file <path>] [--resolutions-file <path>] [--dry-run]
+说明: 复用 LoopX `pr-review` 的 `review_template` 五段式格式（动机/改动思路/具体改动/对主干的风险/我的整体评价），
+      基于原生评审产物 (.loopx/reviews/<pr>@<head>.json) 逐项闭环 Review findings，并附带实测验证矩阵。
+      失败一票熔断：找不到原生评审产物或门禁不通过时拒绝发布。
+HELPTXT
+        exit 0
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --result-file) result_file="${2:-}"; shift 2 ;;
+            --resolutions-file) resolutions_file="${2:-}"; shift 2 ;;
+            --dry-run) dry_run="true"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    local repo
+    repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "")"
+    if [[ -z "$repo" ]]; then
+        echo -e "${RED}[-] 错误: 无法获取 GitHub repo 标识。${NC}" >&2
+        exit 1
+    fi
+
+    local head_oid
+    head_oid="$(gh pr view "$pr_id" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")"
+    if [[ -z "$head_oid" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法获取 PR #$pr_id 的 HEAD commit，PR 不存在或无访问权限！${NC}" >&2
+        exit 1
+    fi
+    local short_sha="${head_oid:0:9}"
+
+    echo -e "${BLUE}==> [Review 回复] 复用 LoopX 原生五段式格式，执行门禁实测并生成逐项闭环汇报 (Commit $short_sha)...${NC}"
+
+    # 真实执行验证，失败一票熔断 (Fail-Closed)
+    echo -e "    [1/5] 执行 Typecheck..."
+    if ! npm run typecheck >/dev/null 2>&1; then
+        echo -e "${RED}[-] [FAIL-CLOSED] Typecheck 失败，阻断回复发布！${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "    [2/5] 执行 Lint..."
+    if ! npm run lint >/dev/null 2>&1; then
+        echo -e "${RED}[-] [FAIL-CLOSED] Lint 失败，阻断回复发布！${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "    [3/5] 执行 Build..."
+    if ! npm run build >/dev/null 2>&1; then
+        echo -e "${RED}[-] [FAIL-CLOSED] Build 失败，阻断回复发布！${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "    [4/5] 执行 Test..."
+    if ! npm test >/dev/null 2>&1; then
+        echo -e "${RED}[-] [FAIL-CLOSED] Test 失败，阻断回复发布！${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "    [5/5] 执行 LoopX Status..."
+    local loopx_status="PASSED"
+    if command -v loopx >/dev/null 2>&1; then
+        if ! loopx $REGISTRY_FLAG status >/dev/null 2>&1; then
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX status 检查失败，阻断回复发布！${NC}" >&2
+            exit 1
+        fi
+    else
+        loopx_status="SKIPPED"
+    fi
+
+    local gates_json
+    gates_json="$(printf '{"typecheck":"PASSED","lint":"PASSED","build":"PASSED","test":"PASSED","loopx_status":"%s"}' "$loopx_status")"
+
+    local helper_args=(--pr "$pr_id" --head "$head_oid" --review-dir "$PROJECT_ROOT/.loopx/reviews" --gates-json "$gates_json")
+    [[ -n "$result_file" ]] && helper_args+=(--result-file "$result_file")
+    [[ -n "$resolutions_file" ]] && helper_args+=(--resolutions-file "$resolutions_file")
+
+    if [[ "$dry_run" == "true" ]]; then
+        if ! node "$PROJECT_ROOT/skills/code-review/scripts/respond-report.js" "${helper_args[@]}" --print; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 原生格式回复生成失败（dry-run），未发布。${NC}" >&2
+            exit 1
+        fi
+        echo -e "${GREEN}[✓] dry-run 完成：未向 PR 发布评论。${NC}"
+        exit 0
+    fi
+
+    local report_file
+    if ! report_file="$(node "$PROJECT_ROOT/skills/code-review/scripts/respond-report.js" "${helper_args[@]}")"; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 原生格式回复生成失败（缺少评审产物或格式不符），未发布。${NC}" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$report_file" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 回复报告文件不存在: $report_file${NC}" >&2
+        exit 1
+    fi
+
+    gh pr comment "$pr_id" --repo "$repo" --body-file "$report_file"
+    rm -f "$report_file"
+    echo -e "${GREEN}[✓] 已发布 LoopX 原生五段式更新汇报至 PR #${pr_id}（head $short_sha）！${NC}"
+}
+
+cmd_pr() {
+    local sub="${1:-}"
+    shift || true
+
+    if [[ "$sub" == "--help" || "$sub" == "-h" || -z "$sub" ]]; then
+        cat << 'HELPTXT'
+用法:
+  loopx-flow pr create [feature] [--title "feat(...)"]
+  loopx-flow pr preview [feature]
+  loopx-flow pr update <pr_id> [feature]
+
+说明:
+  按照 LoopX PR #7545 官方标准，从特性胶囊与真实 Git Diff 自动生成双语 4-Part 结构的 PR 描述（包含动机剖析、架构思路、关键代码逐文件讲解、主干风险及四大门禁实测矩阵），并直接发起或更新 GitHub PR。
+HELPTXT
+        exit 0
+    fi
+
+    local current_branch
+    current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+    if [[ "$current_branch" == "main" || "$current_branch" == "master" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 严禁在主干分支直接操作 PR。请检出特性分支 (feature/<name>)。${NC}" >&2
+        exit 1
+    fi
+
+    local feature=""
+    local title=""
+    local pr_id=""
+
+    case "$sub" in
+        preview)
+            feature="${1:-}"
+            if [[ -z "$feature" ]]; then
+                if [[ "$current_branch" =~ ^feature/(.+) ]]; then
+                    feature="${BASH_REMATCH[1]}"
+                elif [[ "$current_branch" =~ ^fix/(.+) ]]; then
+                    feature="${BASH_REMATCH[1]}"
+                fi
+            fi
+            if [[ -z "$feature" ]]; then
+                echo -e "${RED}[-] 错误: 请指定特性名称或检出 feature/<name> 分支。${NC}" >&2
+                exit 1
+            fi
+            node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature"
+            ;;
+        create)
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --title)
+                        title="$2"
+                        shift 2
+                        ;;
+                    *)
+                        if [[ -z "$feature" ]]; then
+                            feature="$1"
+                        fi
+                        shift
+                        ;;
+                esac
+            done
+
+            if [[ -z "$feature" ]]; then
+                if [[ "$current_branch" =~ ^feature/(.+) ]]; then
+                    feature="${BASH_REMATCH[1]}"
+                elif [[ "$current_branch" =~ ^fix/(.+) ]]; then
+                    feature="${BASH_REMATCH[1]}"
+                fi
+            fi
+            if [[ -z "$feature" ]]; then
+                echo -e "${RED}[-] 错误: 请指定特性名称或检出 feature/<name> 分支。${NC}" >&2
+                exit 1
+            fi
+
+            if ! command -v gh >/dev/null 2>&1; then
+                echo -e "${RED}[-] 错误: 未安装 gh CLI，无法自动创建 PR。${NC}" >&2
+                exit 1
+            fi
+
+            if [[ -z "$title" ]]; then
+                title="feat(${feature}): implement ${feature} aligned with PR #7545 protocol"
+            fi
+
+            local tmp_body
+            tmp_body="$(mktemp "${TMPDIR:-/tmp}/pr-body-${feature}-XXXXXX.md")"
+            node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature" --output-file "$tmp_body"
+
+            echo -e "${BLUE}==> [PR 提交] 正在通过 GitHub CLI 创建 PR (对齐 PR #7545 双语 4-Part 体系)...${NC}"
+            local pr_url
+            if pr_url="$(gh pr create --title "$title" --body-file "$tmp_body" "$@")"; then
+                rm -f "$tmp_body"
+                echo -e "${GREEN}[✓] PR 创建成功: ${pr_url}${NC}"
+            else
+                rm -f "$tmp_body"
+                echo -e "${RED}[-] PR 创建失败。${NC}" >&2
+                exit 1
+            fi
+            ;;
+        update)
+            pr_id="${1:-}"
+            shift || true
+            feature="${1:-}"
+            if [[ -z "$pr_id" ]]; then
+                echo -e "${RED}[-] 错误: 请指定待更新的 PR 编号，例如: loopx-flow pr update 13${NC}" >&2
+                exit 1
+            fi
+            if [[ -z "$feature" ]]; then
+                if [[ "$current_branch" =~ ^feature/(.+) ]]; then
+                    feature="${BASH_REMATCH[1]}"
+                elif [[ "$current_branch" =~ ^fix/(.+) ]]; then
+                    feature="${BASH_REMATCH[1]}"
+                fi
+            fi
+            if [[ -z "$feature" ]]; then
+                echo -e "${RED}[-] 错误: 请指定特性名称或检出 feature/<name> 分支。${NC}" >&2
+                exit 1
+            fi
+
+            local tmp_body
+            tmp_body="$(mktemp "${TMPDIR:-/tmp}/pr-body-${feature}-XXXXXX.md")"
+            node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature" --output-file "$tmp_body"
+
+            echo -e "${BLUE}==> [PR 更新] 正在更新 PR #${pr_id} 描述 (对齐 PR #7545 双语 4-Part 体系)...${NC}"
+            if gh pr edit "$pr_id" --body-file "$tmp_body"; then
+                rm -f "$tmp_body"
+                echo -e "${GREEN}[✓] PR #${pr_id} 描述已成功更新！${NC}"
+            else
+                rm -f "$tmp_body"
+                echo -e "${RED}[-] PR 更新失败。${NC}" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo -e "${RED}[-] 未知操作: $sub。可用操作: create, preview, update${NC}" >&2
+            exit 1
+            ;;
+    esac
+}
+
 cmd_merge() {
     local pr_id="${1:-}"
     local feature="${2:-}"
@@ -403,6 +710,14 @@ cmd_merge() {
     if [[ -z "$pr_id" ]]; then
         echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow merge 12${NC}" >&2
         exit 1
+    fi
+
+    if [[ -z "$feature" ]]; then
+        local head_ref
+        head_ref="$(gh pr view "$pr_id" --json headRefName --jq .headRefName 2>/dev/null || echo "")"
+        if [[ "$head_ref" =~ ^feature/(.+) ]]; then
+            feature="${BASH_REMATCH[1]}"
+        fi
     fi
 
     echo -e "${BLUE}======================================================================${NC}"
@@ -428,7 +743,11 @@ cmd_merge() {
         echo -e "${RED}[-] [FAIL-CLOSED] LoopX 合入就绪度核验失败: 未检测到 loopx CLI，物理防偷跑锁无法核验，禁止合并。${NC}" >&2
         exit 1
     fi
-    if ! loopx pr-review --check-merge-readiness "${pr_id}@${head_oid}"; then
+    local goal_flag=()
+    if [[ -n "$feature" ]]; then
+        goal_flag=(--goal-id "${feature}-goal")
+    fi
+    if ! loopx pr-review "${goal_flag[@]}" --check-merge-readiness "${pr_id}@${head_oid}"; then
         echo -e "${RED}[-] [FAIL-CLOSED] LoopX 合入就绪度核验失败: PR #$pr_id @ ${head_oid:-<unknown>} 未通过物理防偷跑锁核验。${NC}" >&2
         echo -e "${RED}    禁止合并: 请先完成质量收据 (loopx-flow check) 与契约一致性核验后重试。${NC}" >&2
         exit 1
@@ -456,17 +775,25 @@ cmd_merge() {
         fi
     fi
 
+    # 1. 优先调用 LoopX Goal 停机与全局退役，确保在特性胶囊归档前基于活跃 state_file 完成正常核销
+    if command -v loopx >/dev/null 2>&1 && [[ -n "$feature" ]]; then
+        local goal_id="${feature}-goal"
+        if ! loopx goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "Feature delivered and archived" --execute; then
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX Goal $goal_id 闭环核销失败！${NC}" >&2
+            echo -e "💡 为什么阻断？Goal 核销失败可能导致控制面状态残留或后续同名特性冲突。" >&2
+            echo -e "🛠️ 修复指令: 手动核销 Goal: loopx goal-lifecycle --goal-id $goal_id --operation stop --actor-kind controller --reason \"Manual closure\" --execute" >&2
+            exit 1
+        fi
+        loopx retire-global-goal --goal-id "$goal_id" --execute 2>/dev/null || true
+        loopx sync-global 2>/dev/null || true
+        echo -e "    ${GREEN}[✓] LoopX Goal $goal_id 已闭环核销并退役！${NC}"
+    fi
+
+    # 2. 正常停机完成后，再将特性胶囊原子移动至归档区
     if [[ -n "$feature" && -d "$PROJECT_ROOT/specs/features/$feature" ]]; then
         mkdir -p "$PROJECT_ROOT/specs/archive"
         mv "$PROJECT_ROOT/specs/features/$feature" "$PROJECT_ROOT/specs/archive/$feature"
         echo -e "    ${GREEN}[✓] 资产包已原子迁移至归档区: specs/archive/$feature/${NC}"
-    fi
-
-    if command -v loopx >/dev/null 2>&1 && [[ -n "$feature" ]]; then
-        local goal_id="${feature}-goal"
-        loopx goal-lifecycle --goal-id "$goal_id" --operation stop --execute 2>/dev/null || true
-        loopx sync-global 2>/dev/null || true
-        echo -e "    ${GREEN}[✓] LoopX Goal $goal_id 已闭环核销！${NC}"
     fi
 
     echo -e "\n${GREEN}[✓] PR #$pr_id 交付全流程闭环完成！${NC}"
@@ -490,18 +817,25 @@ cmd_gate() {
     case "$stage" in
         decisions)
             local decision_file="$PROJECT_ROOT/specs/features/$feature/01-decisions.md"
+            if [[ ! -f "$decision_file" && -f "$PROJECT_ROOT/specs/archive/$feature/01-decisions.md" ]]; then
+                decision_file="$PROJECT_ROOT/specs/archive/$feature/01-decisions.md"
+            fi
             if [[ ! -f "$decision_file" ]]; then
                 echo -e "${RED}[-] [GATE FAIL] 未找到决策文件: $decision_file${NC}" >&2
                 exit 1
             fi
-            if ! grep -q -E "APPROVED|Status: APPROVED" "$decision_file"; then
+            if ! grep -Eq '^(status:[[:space:]]*APPROVED([[:space:]]|$)|[-*][[:space:]]*\*\*(Status|方案状态)\*\*(:|：).*APPROVED)' "$decision_file"; then
                 echo -e "${RED}[-] [GATE FAIL] 阶段 1 架构决策未标记 APPROVED: $decision_file${NC}" >&2
+                echo -e "💡 修复指令: 由人类决策者在 decisions frontmatter 落款 'status: APPROVED'（或 '- **Status**: APPROVED'）。" >&2
                 exit 1
             fi
             echo -e "${GREEN}[✓] [GATE PASS] 阶段 1 架构决策签名通过: $decision_file${NC}"
             ;;
         contract)
             local contract_file="$PROJECT_ROOT/specs/features/$feature/04-contract.md"
+            if [[ ! -f "$contract_file" && -f "$PROJECT_ROOT/specs/archive/$feature/04-contract.md" ]]; then
+                contract_file="$PROJECT_ROOT/specs/archive/$feature/04-contract.md"
+            fi
             if [[ ! -f "$contract_file" ]]; then
                 echo -e "${RED}[-] [GATE FAIL] 未找到契约文件: $contract_file${NC}" >&2
                 exit 1
@@ -510,7 +844,74 @@ cmd_gate() {
                 echo -e "${RED}[-] [GATE FAIL] 阶段 4 契约未冻结或未批准: $contract_file${NC}" >&2
                 exit 1
             fi
-            echo -e "${GREEN}[✓] [GATE PASS] 阶段 4 契约冻结签名通过: $contract_file${NC}"
+
+            # Double-anchor SHA256 physical verification against LoopX locked contract revision
+            local current_sha
+            if command -v node >/dev/null 2>&1; then
+                current_sha="$(node -e 'const fs=require("fs"),crypto=require("crypto");console.log(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$contract_file")"
+            elif command -v sha256sum >/dev/null 2>&1; then
+                current_sha="$(sha256sum "$contract_file" | awk '{print $1}')"
+            else
+                current_sha="$(LC_ALL=C shasum -a 256 "$contract_file" | awk '{print $1}')"
+            fi
+
+            local goal_id="${feature}-goal"
+            local locked_sha=""
+            local goal_found="false"
+            local reg_file="$PROJECT_ROOT/.loopx/registry.json"
+            if [[ ! -f "$reg_file" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 本地注册表缺失 ($reg_file)，无法核验控制面契约锁定状态！${NC}" >&2
+                echo -e "💡 为什么阻断？契约标记为已冻结，但本地注册表未就绪，禁止绕过物理指纹核验。" >&2
+                echo -e "🛠️ 修复指令: 运行 loopx bootstrap 初始化或运行 loopx-flow approve contract $feature 重新锁定。" >&2
+                exit 1
+            fi
+
+            local check_info
+            check_info="$(node -e '
+                const fs = require("fs");
+                try {
+                    const reg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+                    const g = reg.goals?.find(item => item.id === process.argv[2] || item.goal_id === process.argv[2] || item.id === process.argv[3] || item.goal_id === process.argv[3]);
+                    if (!g) {
+                        process.stdout.write("NOT_FOUND:");
+                    } else {
+                        const rev = g?.control_plane?.progress_review?.contract_revision || g?.progress_review?.contract_revision || "";
+                        process.stdout.write("FOUND:" + rev);
+                    }
+                } catch (e) {
+                    process.stdout.write("NOT_FOUND:");
+                }
+            ' "$reg_file" "$goal_id" "${feature}-feature" 2>/dev/null || echo "NOT_FOUND:")"
+
+            if [[ "$check_info" =~ ^FOUND:(.*) ]]; then
+                goal_found="true"
+                locked_sha="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ "$goal_found" != "true" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 目标实体未在 LoopX 注册 (GOAL_NOT_FOUND: $goal_id)！${NC}" >&2
+                echo -e "💡 为什么阻断？契约标记为 FROZEN & APPROVED，但注册表中未登记对应 Goal，存在虚假审批或状态脱管风险。" >&2
+                echo -e "🛠️ 修复指令: 由决策者执行审批以锁定指纹: loopx-flow approve contract $feature" >&2
+                exit 1
+            fi
+
+            if [[ -z "$locked_sha" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 契约尚未在 LoopX 控制面锁定指纹 (MISSING_LOCKED_CONTRACT_REVISION)！${NC}" >&2
+                echo -e "    Goal: $goal_id 存在于 .loopx/registry.json 但未设置 progress_review.contract_revision" >&2
+                echo -e "💡 为什么阻断？双重锚定要求契约必须具备控制面物理指纹锁定，缺失物理锁定视为未完成审批。" >&2
+                echo -e "🛠️ 修复指令: 由决策者执行审批以锁定指纹: loopx-flow approve contract $feature" >&2
+                exit 1
+            fi
+
+            if [[ "$locked_sha" != "$current_sha" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 契约已被篡改 (CONTRACT_TAMPERED)! 契约指纹不一致，门禁物理熔断！${NC}" >&2
+                echo -e "    文件当前 SHA256: ${BOLD}$current_sha${NC}" >&2
+                echo -e "    已锁定基线指纹: ${BOLD}$locked_sha${NC}" >&2
+                echo -e "💡 为什么阻断？契约在批准后发生非授权变更，严禁在未重新审批的情况下私自变更接口与断言不变量。" >&2
+                echo -e "🛠️ 修复指令: 还原契约文件修改，或由决策者重新执行: loopx-flow approve contract $feature" >&2
+                exit 1
+            fi
+            echo -e "${GREEN}[✓] [GATE PASS] 阶段 4 契约双重锚定核验通过 (SHA256: $current_sha)${NC}"
             ;;
         *)
             echo -e "${RED}[-] 未知守卫阶段: $stage (可选: decisions, contract)${NC}" >&2
@@ -796,7 +1197,9 @@ case "$ACTION" in
     feature|start) cmd_feature "$@" ;;
     approve) cmd_approve "$@" ;;
     check) cmd_check "$@" ;;
+    pr) cmd_pr "$@" ;;
     review) cmd_review "$@" ;;
+    respond) cmd_respond "$@" ;;
     merge) cmd_merge "$@" ;;
     gate) cmd_gate "$@" ;;
     context) cmd_context "$@" ;;

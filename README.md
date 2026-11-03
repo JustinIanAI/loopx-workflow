@@ -4,8 +4,8 @@
 > 以 **LoopX（https://github.com/loopx-project/loopx） 原生能力引擎** 为内核底座，**Feature 自包含资产胶囊** 为组织单元，配合 **场景化编排器 (`loopx-flow`)** 与 **GitHub 交付流**，提供从需求澄清、方案设计、Specs冻结、TDD 循环、质量控制融合到原子归档的端到端闭环研发管线。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![LoopX: v2.0](https://img.shields.io/badge/LoopX-2.0.0-green.svg)](https://github.com/loopx-project)
-[![Node: >=18](https://img.shields.io/badge/Node-%3E%3D18-brightgreen.svg)](package.json)
+[![LoopX: v2.x](https://img.shields.io/badge/LoopX-2.x-green.svg)](https://github.com/loopx-project)
+[![Node: >=22.22.3](https://img.shields.io/badge/Node-%3E%3D22.22.3-brightgreen.svg)](package.json)
 
 ---
 
@@ -56,7 +56,7 @@
    ├─► 本地四大硬门禁: Typecheck, Lint, Build, Test 全绿
    ├─► 质量收据融合: 默认跨边界审查 (选配 OCR) ➔ 写入不可篡改 LoopX Quality Receipt
    ├─► 本地隔离预集成: loopx integration-branch 检验无分支冲突
-   └─► 发起 GitHub PR 并在页面顶置双语 5-Block 审查报告
+   └─► 发起 GitHub PR 并在页面顶置 LoopX 原生五段式审查报告（复用 pr-review review_template）
    │
  【🛑 关键断点 2：GitHub 交付审批与原子合入】
    │
@@ -92,10 +92,10 @@
 ### 【断点 2】GitHub PR 交付审批与原子合入 (阶段 7 交付后 ➔ 阶段 8 合入)
 - **看什么 (What to inspect)**：
   - **范围与契约**：Diff 行数建议 ≤ 500 行，严格遵守冻结契约，无破坏性变更；
-  - **门禁与收据**：本地四大门禁全绿，PR 顶置 5-Block 报告中 LoopX Quality Receipt 为 PASSING，零未解决 Blocker 缺陷；
+  - **门禁与收据**：本地四大门禁全绿，PR 顶置原生五段式审查报告中 LoopX Quality Receipt 为 PASSING，零未解决 Blocker 缺陷；
   - **反熵增清理**：已践行 `delete-first`，废弃变量与孤儿代码已彻底物理清除。
 - **怎么看 (How to inspect)**：
-  - 访问 GitHub PR 网页，查阅 Files Changed 及顶部置顶的 **5-Block 双语审查报告**（或本地执行 `cat specs/features/<feature>/05-evidence.md`）。
+  - 访问 GitHub PR 网页，查阅 Files Changed 及顶部置顶的 **LoopX 原生五段式审查报告（动机/改动思路/具体改动/对主干的风险/我的整体评价）**（或本地执行 `cat specs/features/<feature>/05-evidence.md`）。
 - **怎么进入下一环节 (How to proceed)**：
   1. 在 GitHub PR 页面核验 8 项事实无误后，点击 **【Approve】** 按钮通过审查；
   2. 在终端执行一键原子合并：

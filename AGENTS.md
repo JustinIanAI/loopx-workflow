@@ -37,6 +37,11 @@
    - 默认执行基于跨边界语义契约的 `code-review` 技能。
    - 审查交付物严禁割裂存放在 `/tmp/`：必须通过 `skills/code-review/scripts/ingest-to-loopx-quality.js` 统一编译为 LoopX `change_quality_agent_result_v2`，写入带有确切 Git Diff SHA 签名的不可篡改 Receipt，并同步沉淀在 `specs/features/<feature>/05-evidence.md`。
    - `loopx change-quality verify` 严格检验：若存在未解决的 Blocker 缺陷或代码偷跑篡改，一票否决阻断交付。
+7. **PR 执行期命令治理 (LoopX-Workflow First & LoopX Fallback Disclosure)**：
+   - 整个 PR 生命周期（`gate` → `check` → `pr` → `review` → `respond` → `merge`）必须优先通过 `bin/loopx-flow` 场景化命令管理；禁止绕过编排器直接用 ad-hoc 脚本拼接状态变更。
+   - 当 loopx-flow 流程尚不完备、命令缺失或暂不支持某项能力时，允许降级使用 LoopX 原生 `loopx` CLI 完成，但必须在交付报告与 PR 评论中**显式披露两点**：(a) 实际执行的命令；(b) 为什么 loopx-flow 未支持该项能力（能力缺口）。
+   - 降级是临时手段而非终点：一旦确认能力缺口，必须在同一次交付中补上 `loopx-flow` 场景化命令或登记该缺口，逐步收敛降级路径（anti-entropy）。
+   - 评审报告格式以 LoopX `pr-review` 返回的 `review_template`（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价）为唯一权威，严禁任何自造 Block 模板；代码类变更必须在「具体改动」下提供 `### 关键代码讲解`。`loopx-flow review` 与 `loopx-flow respond` 均复用该原生格式。
 
 ---
 
@@ -49,7 +54,7 @@
 - **阶段 4：契约冻结与断点 1 审批** ➔ 编写 `specs/features/<feature>/04-contract.md` 顶部固化 TypeScript 签名；生成 `00-INDEX.md` 全景大盘；人类执行 `loopx-flow approve contract <feature>` 锁定契约指纹并放行。
 - **阶段 5：TDD 循环实现与反熵增** ➔ 认领排他租约 `loopx task-lease acquire` ➔ 红绿重构（单测先写先红）➔ 依 `anti-entropy-governance` 清理退役旧逻辑 ➔ 四大门禁全绿。
 - **阶段 6：代码审查与质量收据融合** ➔ 执行 `loopx-flow check`，运行语义审查（选配 OCR）并通过适配器写入 LoopX `change-quality` 严格 Receipt，回写 `specs/features/<feature>/05-evidence.md`。
-- **阶段 7：预集成与交付审查 (L2)** ➔ `loopx integration-branch` 本地预集成 ➔ `gh pr create` 发起 PR ➔ `loopx-flow review <pr_id>` 顶置双语 5-Block 审查报告至 GitHub PR 页面。
+- **阶段 7：预集成与交付审查 (L2)** ➔ `loopx integration-branch` 本地预集成 ➔ `gh pr create` 发起 PR ➔ `loopx-flow review <pr_id>` 顶置 LoopX 原生五段式审查报告（复用 `pr-review` 的 `review_template`）至 GitHub PR 页面。
 - **阶段 8：断点 2 审批、原子合入与归档** ➔ 人类在 GitHub PR 页面核验 8 项事实后点击 Approve ➔ 运行 `loopx-flow merge <pr_id>` ➔ 严格通过 `loopx pr-review --check-merge-readiness` 物理防偷跑核验 ➔ Squash 合入主干 ➔ 资产包整包原子移动至 `specs/archive/<feature>/` ➔ 自动闭环核销 Goal。
 
 ---

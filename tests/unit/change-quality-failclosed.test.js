@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
@@ -40,25 +41,45 @@ test('1. Fail-Closed on Blocker: ingest-to-loopx-quality must exit 1 when defect
 });
 
 test('2. Diff SHA256 Binding: 05-evidence.md must contain exact diff fingerprint', () => {
-  const res = spawnSync(process.execPath, [
-    INGEST_SCRIPT,
-    '--feature', 'change-quality-failclosed'
-  ], {
-    cwd: PROJECT_ROOT,
-    encoding: 'utf8'
-  });
+  const tmpFeature = `cq-isolated-${Date.now()}`;
+  const tmpFeatureDir = path.join(PROJECT_ROOT, 'specs/features', tmpFeature);
+  fs.mkdirSync(tmpFeatureDir, { recursive: true });
+  const evidenceFile = path.join(tmpFeatureDir, '05-evidence.md');
 
-  if (res.status !== 0) {
-    console.error('Test 2 failed stdout:', res.stdout);
-    console.error('Test 2 failed stderr:', res.stderr);
+  // Isolate from host loopx daemon / network using mock binary in temporary PATH
+  const tmpBin = fs.mkdtempSync(path.join(os.tmpdir(), 'mock-loopx-bin-'));
+  const mockLoopx = path.join(tmpBin, 'loopx');
+  fs.writeFileSync(mockLoopx, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+  const env = {
+    ...process.env,
+    PATH: `${tmpBin}:${process.env.PATH || ''}`
+  };
+
+  try {
+    const res = spawnSync(process.execPath, [
+      INGEST_SCRIPT,
+      '--feature', tmpFeature
+    ], {
+      cwd: PROJECT_ROOT,
+      env,
+      encoding: 'utf8'
+    });
+
+    if (res.status !== 0) {
+      console.error('Test 2 failed stdout:', res.stdout);
+      console.error('Test 2 failed stderr:', res.stderr);
+    }
+    assert.strictEqual(res.status, 0, `Clean ingest must exit 0: ${res.stderr}`);
+
+    assert.strictEqual(fs.existsSync(evidenceFile), true, '05-evidence.md must exist in feature capsule');
+    const text = fs.readFileSync(evidenceFile, 'utf8');
+    assert.strictEqual(text.includes('Diff SHA256'), true, 'Evidence must record exact Diff SHA256');
+    assert.strictEqual(text.includes('PASSING'), true);
+  } finally {
+    fs.rmSync(tmpFeatureDir, { recursive: true, force: true });
+    fs.rmSync(tmpBin, { recursive: true, force: true });
   }
-  assert.strictEqual(res.status, 0, `Clean ingest must exit 0: ${res.stderr}`);
-
-  const evidenceFile = path.join(PROJECT_ROOT, 'specs/features/change-quality-failclosed/05-evidence.md');
-  assert.strictEqual(fs.existsSync(evidenceFile), true, '05-evidence.md must exist');
-  const content = fs.readFileSync(evidenceFile, 'utf8');
-  assert.strictEqual(content.includes('Diff SHA256'), true, 'Evidence must record exact Diff SHA256');
-  assert.strictEqual(content.includes('PASSING'), true);
 });
 
 test('3. LoopX-Flow Check Fail-Closed: loopx-flow check must propagate non-zero exit codes', () => {

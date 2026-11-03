@@ -54,7 +54,7 @@ specs/features/<feature-name>/
 5. **阶段 4：契约固化与断点 1 审批** ➔ 编写 `04-contract.md` 顶部固化 TypeScript 接口，生成 `00-INDEX.md`；人类核验后执行 `loopx-flow approve contract <feat>`，锁定契约 SHA256 物理指纹。
 6. **阶段 5：TDD 循环实现与反熵增** ➔ 认领排他租约 `loopx task-lease acquire` ➔ 红绿重构（单测先写先红）➔ 依 `anti-entropy-governance` 清理退役旧逻辑 ➔ 四大门禁全绿。
 7. **阶段 6：代码审查与质量收据融合** ➔ 执行 `loopx-flow check`，运行语义审查（选配 OCR）并通过适配器写入 LoopX `change-quality` 严格 Receipt，回写 `05-evidence.md`。
-8. **阶段 7：预集成与交付审查 (L2)** ➔ `loopx integration-branch` 隔离预集成 ➔ `gh pr create` 发起 PR ➔ `loopx-flow review <pr_id>` 顶置双语 5-Block 审查报告至 GitHub PR 页面。
+8. **阶段 7：预集成与交付审查 (L2)** ➔ `loopx integration-branch` 隔离预集成 ➔ `gh pr create` 发起 PR ➔ `loopx-flow review <pr_id>` 顶置 LoopX 原生五段式审查报告（复用 `pr-review` 的 `review_template`）至 GitHub PR 页面。
 9. **阶段 8：断点 2 审批、原子合入与归档** ➔ 人类在 GitHub PR 页面核验 8 项事实后点击 Approve ➔ 运行 `loopx-flow merge <pr_id>` ➔ 严格通过 `loopx pr-review --check-merge-readiness` 物理防偷跑核验 ➔ Squash 合入主干 ➔ 资产包整包原子移动至 `specs/archive/<feature>/` ➔ 自动闭环核销 Goal。
 
 ---
