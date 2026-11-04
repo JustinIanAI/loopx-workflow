@@ -30,9 +30,7 @@ Use this skill before drafting PRDs or Specs to resolve design ambiguity, preven
    - Stop only when there are no open "it depends" answers remaining.
 
 5. **Emit Decision Record**:
-   - Save decision outcomes to `docs/decisions/<feature>-decisions.md` containing:
-     - Decision points
-     - Considered alternatives & trade-offs
-     - Selected choice & rationale
-     - First-principles minimality justification
-     - Impacted system components & retired paths
+   - 产品级决策写入 `docs/adr/NNNN-title.md`，并修订 `docs/prd/loopx-workflow.md`。命令、失败条件或不变量有变化时，同时修订 `docs/design/loopx-workflow-design.md`。
+   - 不要创建 `docs/decisions/`。该路径已否决，见 `docs/adr/0001-product-source-of-truth.md`。
+   - 胶囊内的实现取舍写入 `specs/features/<feature>/01-decisions.md`，并链接对应 ADR。这里不写第二份产品需求。
+   - 决策记录包含：决策点、否决方案、选定理由、最小复杂度说明、被退役的旧路径。

@@ -4,7 +4,8 @@
 - **Feature Name**: `native-dispatch-deep-integration`
 - **Branch**: `feature/native-dispatch-deep-integration`
 - **LoopX Goal**: `native-dispatch-deep-integration-goal`
-- **Current Status**: `DELIVERED & VERIFIED (Stage 5~6 Gates Green)`
+- **Current Status**: `Verified (PR merged; capsule retained; per ADR-0006)`
+- **Remediation**: none (audit closed)
 - **Contract Status**: `FROZEN & APPROVED`
 
 ## 过程文档索引

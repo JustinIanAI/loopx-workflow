@@ -4,7 +4,8 @@
 - **Feature Name**: `fail-closed-hardening`
 - **Branch**: `feature/fail-closed-hardening`
 - **LoopX Goal**: `fail-closed-hardening-goal`
-- **Current Status**: `READY_FOR_DELIVERY_REVIEW (Stage 6 Passed)`
+- **Current Status**: `Accepted (five-state; gaps tracked in ADR-0002~0004 / issue #15, R1/R2)`
+- **Remediation**: pending R1/R2
 - **Contract Status**: `FROZEN & APPROVED`
 
 ## 过程文档索引

@@ -1,5 +1,7 @@
 # Lean PRD: authentic-review-pipeline
 
+> 历史切片。产品需求以 [docs/prd/loopx-workflow.md](../../../docs/prd/loopx-workflow.md) 为准。本文件只保留当时的验收与假设，不另立产品规格。见 [ADR-0001](../../../docs/adr/0001-product-source-of-truth.md)。
+
 ## 1. 问题陈述
 `loopx-flow review` 当前产出的是"静态拼装"的 5-Block 报告（Block 3/4 为硬编码 `PASSED`/`delete-first applied`），PR body 为临场手写 — 与上游 loopx-project/loopx 的 model_agent 对抗式审查（锚定 head SHA、逐文件 findings、可复现反例、多轮复审）存在代差。用户无法从 loopx-flow 的报告中获得真实审查洞察。
 

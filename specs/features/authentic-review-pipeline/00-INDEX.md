@@ -4,7 +4,8 @@
 - **Feature Name**: `authentic-review-pipeline`
 - **Branch**: `feature/authentic-review-pipeline`
 - **LoopX Goal**: `authentic-review-pipeline-goal`
-- **Current Status**: `IN_PROGRESS (Stage 1~4 Initialized)`
+- **Current Status**: `Accepted (five-state; review pipeline gaps tracked in ADR-0005 / issue #15, R3)`
+- **Remediation**: pending R3
 - **Contract Status**: `DRAFT (Pending Approval)`
 
 ## 过程文档索引

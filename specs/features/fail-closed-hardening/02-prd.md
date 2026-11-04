@@ -1,5 +1,7 @@
 # Lean PRD: fail-closed-hardening
 
+> 历史切片。产品需求以 [docs/prd/loopx-workflow.md](../../../docs/prd/loopx-workflow.md) 为准。本文件只保留当时的验收与假设，不另立产品规格。见 [ADR-0001](../../../docs/adr/0001-product-source-of-truth.md)。
+
 ## 1. 核心目标与背景
 消除 `loopx-workflow` 核心编排器 `bin/loopx-flow` 及相关脚本中存在的 6 处静默忽略错误（`|| true`）隐患，建立 Contract 契约物理 SHA256 双重锚定防偷跑机制，退役虚假 PR 守卫，对齐环境版本契约，使工作流自身达到严格、可信的工程级交付标准。
 

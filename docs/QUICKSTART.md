@@ -8,7 +8,7 @@
 
 开始前，请确保本地具备以下工具：
 - **Git** (`git >= 2.30`)
-- **Node.js & npm** (`node >= 18`)
+- **Node.js & npm** (`node >= 22.22.3`)
 - **GitHub CLI** (`gh` 且已通过 `gh auth login` 认证)
 - **LoopX CLI** (`loopx >= 2.0.0`)
 - *(阿里 OCR CLI 为选配项，使用时由技能内部自主检测与安装，无需手动预装)*
@@ -48,7 +48,7 @@ bin/loopx-flow feature order-checkout
 1. 创建并检出分支 `feature/order-checkout`。
 2. 在 LoopX 中注册 Goal：`order-checkout-goal`。
 3. 初始化完整的自包含资产包：`specs/features/order-checkout/`（包含 `00-INDEX.md` 到 `05-evidence.md`）。
-4. 自动推进阶段 1~4，生成架构决策备忘录、精益 PRD 与初始契约模版。
+4. 生成 `00-INDEX.md` ~ `05-evidence.md` 的占位模板；阶段 1–4 的决策、PRD、故事与契约正文由 Agent/人填写，命令不会自动生成。
 
 ### 第 2 步：审阅并执行断点 1 审批
 打开 `specs/features/order-checkout/00-INDEX.md`，一站式审阅决策权衡、PRD承重假设与 TypeScript 契约：
@@ -96,6 +96,8 @@ bin/loopx-flow review <PR_NUMBER>
 ```bash
 bin/loopx-flow issue <ISSUE_ID>
 ```
+
+> `loopx-flow issue` 只做 LoopX `issue-fix feasibility` 路由并打印下一步，**不提交、不推送、不开 PR**。下两条是 Agent 规程，不是命令已实现的状态机。
 
 - **路径 A：Fast-Path（改动 ≤ 20 行，零外部破坏）**：
   适用于 Typo、错误日志优化、隔离配置调整。单测修复后执行 `./scripts/fast-fix-push.sh <ISSUE_ID> "fix(core): ..."`，遇到分支保护自动无缝升轨为 PR。
