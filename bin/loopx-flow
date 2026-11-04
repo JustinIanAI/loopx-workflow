@@ -65,7 +65,11 @@ cmd_doctor() {
             exit 1
         fi
     else
-        echo -e "${YELLOW}[!] 未安装 loopx CLI，部分控制面特性受限。${NC}"
+        echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，流水线控制面不可用。${NC}" >&2
+        echo -e "    原因: 本机 PATH 中没有 loopx，无法注册 Goal、锁定契约、核验收据或合入锁。" >&2
+        echo -e "    影响: approve/check/merge/issue/integrate/todo 等承重命令将全部阻断。" >&2
+        echo -e "🛠️ 修复指令: python3 -m pip install --upgrade loopx && loopx doctor" >&2
+        exit 1
     fi
 }
 
@@ -80,6 +84,25 @@ cmd_init() {
         fi
     fi
     echo -e "${GREEN}[✓] 初始化完成！建议随后运行: loopx-flow doctor${NC}"
+}
+
+sync_global_required() {
+    local goal_id="${1:-}"
+    local -a args=(sync-global)
+    [[ -n "$goal_id" ]] && args+=(--goal-id "$goal_id")
+    local attempt out status
+    for attempt in 1 2 3; do
+        if out="$(loopx $REGISTRY_FLAG "${args[@]}" 2>&1)"; then
+            return 0
+        fi
+        status=$?
+        echo -e "${YELLOW}[!] loopx sync-global 失败（第 ${attempt}/3 次），1 秒后重试...${NC}" >&2
+        sleep 1
+    done
+    echo -e "${RED}[-] [FAIL-CLOSED] loopx sync-global 重试 3 次仍失败，禁止静默放行。${NC}" >&2
+    echo -e "    实际输出: ${out}" >&2
+    echo -e "🛠️ 修复指令: loopx sync-global${goal_id:+ --goal-id $goal_id}" >&2
+    return 1
 }
 
 cmd_feature() {
@@ -207,23 +230,33 @@ EVIEEOF
 
     echo -e "${BLUE}==> [3/3] 注册 LoopX Goal 实体与持久化状态 (Capsule State Bound)...${NC}"
     local state_file="specs/features/$feature/ACTIVE_STATE.md"
-    if [[ ! -f "$PROJECT_ROOT/$state_file" ]]; then
-        cat << STATEEOF > "$PROJECT_ROOT/$state_file"
-# Active Goal State: $goal_id
-- **Feature**: $feature
-- **Created At**: $(date "+%Y-%m-%d %H:%M:%S")
-- **Status**: active
-STATEEOF
-    fi
 
     if command -v loopx >/dev/null 2>&1; then
+        # LoopX 2.0 只有在 --state-file 不存在时才会创建 canonical authority；
+        # 因此这里严禁在 bootstrap 前预创建 ACTIVE_STATE.md（issue #17）。
         if ! loopx $REGISTRY_FLAG bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" --state-file "specs/features/$feature/ACTIVE_STATE.md"; then
             echo -e "${RED}[-] [FAIL-CLOSED] 注册 LoopX Goal $goal_id 失败，流程已阻断！${NC}" >&2
             echo -e "💡 为什么阻断？目标实体注册失败将导致任务无法被正确追踪与审计。" >&2
             echo -e "🛠️ 修复指令: 运行 loopx doctor 排查本地注册表健康状态。" >&2
             exit 1
         fi
-        loopx sync-global --goal-id "$goal_id" 2>/dev/null || true
+        if [[ ! -f "$PROJECT_ROOT/$state_file" ]]; then
+            echo -e "${YELLOW}[!] loopx bootstrap 成功但未生成 state_file: $state_file${NC}" >&2
+        fi
+        if ! sync_global_required "$goal_id"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal 已注册，但全局 registry 同步失败；修复 sync 后重跑 feature。${NC}" >&2
+            exit 1
+        fi
+    else
+        if [[ ! -f "$PROJECT_ROOT/$state_file" ]]; then
+            cat << STATEEOF > "$PROJECT_ROOT/$state_file"
+# Active Goal State: $goal_id
+- **Feature**: $feature
+- **Created At**: $(date "+%Y-%m-%d %H:%M:%S")
+- **Status**: active
+STATEEOF
+        fi
+        echo -e "${YELLOW}[!] 未安装 loopx：已生成本地模板，未注册 LoopX Goal。${NC}"
     fi
 
     echo -e "\n${BOLD}${GREEN}======================================================================${NC}"
@@ -266,62 +299,101 @@ cmd_approve() {
         exit 1
     fi
 
+    if ! command -v loopx >/dev/null 2>&1; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，禁止在本地写批准标记。${NC}" >&2
+        echo -e "    原因: 契约审批必须由 LoopX configure-goal 物理锁定 SHA256。" >&2
+        echo -e "🛠️ 修复指令: python3 -m pip install --upgrade loopx 后重试。" >&2
+        exit 1
+    fi
+
     echo -e "${BLUE}==> [断点 1 审批] 正在锁定 $feature 契约与方案...${NC}"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
     local operator
     operator="${USER:-$(whoami)}"
 
-    # 1. Update contract file marker via node for cross-platform fidelity
+    # 1. 先在契约同目录生成“带标记的最终内容”，不触碰原文件。
+    # 这样 configure-goal 失败或进程被强杀时，原契约不会出现虚假 APPROVED。
+    local temp_contract
+    temp_contract="$(mktemp "${contract_file}.tmp.XXXXXX")"
     node -e '
 const fs = require("fs");
-const file = process.argv[1];
-const op = process.argv[2];
-const ts = process.argv[3];
-let text = fs.readFileSync(file, "utf8");
+const src = process.argv[1];
+const dst = process.argv[2];
+const op = process.argv[3];
+const ts = process.argv[4];
+let text = fs.readFileSync(src, "utf8");
 if (/Contract-Status/i.test(text)) {
   text = text.replace(/.*Contract-Status.*$/m, `- **Contract-Status**: FROZEN & APPROVED BY ${op}@${ts}`);
 } else {
   text = `- **Contract-Status**: FROZEN & APPROVED BY ${op}@${ts}\n` + text;
 }
-fs.writeFileSync(file, text);
-' "$contract_file" "$operator" "$timestamp"
+fs.writeFileSync(dst, text);
+' "$contract_file" "$temp_contract" "$operator" "$timestamp"
 
-    # 2. Update decision file marker
-    if [[ -f "$decision_file" ]]; then
-        if grep -q "Status:" "$decision_file"; then
-            sed -i.bak -E "s/Status: .*/Status: APPROVED BY HUMAN (${operator}@${timestamp})/" "$decision_file"
-            rm -f "${decision_file}.bak"
-        fi
-    fi
-
-    # 3. Update 00-INDEX.md
-    if [[ -f "$index_file" ]]; then
-        sed -i.bak -E "s/Contract Status:.*/Contract Status: \`FROZEN \& APPROVED\`/g" "$index_file"
-        sed -i.bak -E "s/Current Status:.*/Current Status: \`APPROVED (Stage 5 TDD Ready)\`/g" "$index_file"
-        rm -f "${index_file}.bak"
-    fi
-
-    # 4. Compute SHA256 and lock with LoopX contract revision
+    # 2. Compute SHA256 of the final content that will be written.
     local contract_sha
     if command -v node >/dev/null 2>&1; then
-        contract_sha="$(node -e 'const fs=require("fs"),crypto=require("crypto");console.log(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$contract_file")"
+        contract_sha="$(node -e 'const fs=require("fs"),crypto=require("crypto");console.log(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$temp_contract")"
     elif command -v sha256sum >/dev/null 2>&1; then
-        contract_sha="$(sha256sum "$contract_file" | awk '{print $1}')"
+        contract_sha="$(sha256sum "$temp_contract" | awk '{print $1}')"
     else
-        contract_sha="$(LC_ALL=C shasum -a 256 "$contract_file" | awk '{print $1}')"
+        contract_sha="$(LC_ALL=C shasum -a 256 "$temp_contract" | awk '{print $1}')"
     fi
 
     echo -e "    契约 SHA256 指纹: ${BOLD}$contract_sha${NC}"
-    if command -v loopx >/dev/null 2>&1; then
-        local goal_id="${feature}-goal"
-        if ! loopx configure-goal --goal-id "$goal_id" --progress-review-contract-revision "$contract_sha" --execute 2>/dev/null; then
-            echo -e "${RED}[-] [FAIL-CLOSED] 契约 SHA256 物理锁定失败 (loopx configure-goal 返回非零)！${NC}" >&2
-            echo -e "💡 为什么阻断？契约指纹未能同步锁定至 LoopX 控制面，无法保证后续防偷跑核验。" >&2
-            echo -e "🛠️ 修复指令: 运行 loopx status 确认 Goal 状态，或重新 bootstrap 该 Goal 后重试。" >&2
-            exit 1
-        fi
-        loopx sync-global --goal-id "$goal_id" 2>/dev/null || true
+    local goal_id="${feature}-goal"
+    local configure_out
+    if ! configure_out="$(loopx $REGISTRY_FLAG configure-goal --goal-id "$goal_id" --progress-review-contract-revision "$contract_sha" --execute 2>&1)"; then
+        rm -f "$temp_contract"
+        echo -e "${RED}[-] [FAIL-CLOSED] 契约 SHA256 物理锁定失败 (loopx configure-goal 返回非零)！${NC}" >&2
+        echo -e "    configure-goal 输出: ${configure_out}" >&2
+        echo -e "💡 为什么阻断？契约指纹未能同步锁定至 LoopX 控制面，无法保证后续防偷跑核验。" >&2
+        echo -e "🛠️ 修复指令: 运行 loopx status 确认 Goal 状态，或重新 bootstrap 该 Goal 后重试。" >&2
+        exit 1
+    fi
+
+    # 3. 物理锁定成功后才原子替换契约文件。
+    mv "$temp_contract" "$contract_file"
+
+    # 4. 更新决策与 INDEX 标记（仅文档，不参与契约 SHA）。
+    if [[ -f "$decision_file" ]]; then
+        node -e '
+const fs = require("fs");
+const file = process.argv[1];
+const op = process.argv[2];
+const ts = process.argv[3];
+let text = fs.readFileSync(file, "utf8");
+const line = `- **Status**: APPROVED BY HUMAN (${op}@${ts})`;
+if (/^- \*\*Status\*\*: .*$/m.test(text)) {
+  text = text.replace(/^- \*\*Status\*\*: .*$/m, line);
+} else {
+  text = line + "\n" + text;
+}
+fs.writeFileSync(file, text);
+' "$decision_file" "$operator" "$timestamp"
+    fi
+    if [[ -f "$index_file" ]]; then
+        node -e '
+const fs = require("fs");
+const file = process.argv[1];
+let text = fs.readFileSync(file, "utf8");
+if (/Contract Status:/.test(text)) {
+  text = text.replace(/.*Contract Status:.*$/m, "- **Contract Status**: \`FROZEN & APPROVED\`");
+}
+if (/Current Status:/.test(text)) {
+  text = text.replace(/.*Current Status:.*$/m, "- **Current Status**: \`APPROVED (Stage 5 TDD Ready)\`");
+}
+fs.writeFileSync(file, text);
+' "$index_file"
+    fi
+
+    # 5. 同步全局 registry；失败不回滚已锁定的控制面，但必须非 0 且给出修复指令。
+    if ! sync_global_required "$goal_id"; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 契约已锁定成功，但全局 registry 同步失败。${NC}" >&2
+        echo -e "    本地契约已带 FROZEN & APPROVED 标记且控制面指纹已锁定；这不是本地半状态。" >&2
+        echo -e "🛠️ 修复指令: loopx sync-global --goal-id $goal_id 后重试。" >&2
+        exit 1
     fi
 
     echo -e "\n${GREEN}[✓] 断点 1 方案与契约审批通过！契约已锁定。${NC}"
@@ -331,15 +403,22 @@ fs.writeFileSync(file, text);
 }
 
 cmd_check() {
-    local with_ocr=false
-    local feature=""
-
-    for arg in "$@"; do
-        if [[ "$arg" == "--with-ocr" ]]; then
-            with_ocr=true
-        elif [[ "$arg" != -* && -z "$feature" ]]; then
-            feature="$arg"
-        fi
+    local with_ocr=false feature="" goal_id=""
+    local -a args=("$@")
+    local i arg
+    for ((i=0; i<${#args[@]}; i++)); do
+        arg="${args[$i]}"
+        case "$arg" in
+            --with-ocr) with_ocr=true ;;
+            --goal-id)
+                goal_id="${args[$((i+1))]:-}"
+                i=$((i+1))
+                ;;
+            -*) ;;
+            *)
+                if [[ -z "$feature" ]]; then feature="$arg"; fi
+                ;;
+        esac
     done
 
     if [[ -z "$feature" ]]; then
@@ -350,9 +429,29 @@ cmd_check() {
         fi
     fi
 
+    if [[ -z "$feature" && -z "$goal_id" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] check 无法解析 Goal 身份：既不在 feature/<name> 分支，也没有显式 feature 或 --goal-id。${NC}" >&2
+        echo -e "💡 为什么阻断？没有 Goal 就无法核验 change-quality 严格收据，不能进入交付。${NC}" >&2
+        echo -e "🛠️ 修复指令: 检出 feature/<name> 分支，或执行: loopx-flow check --goal-id <goal-id>${NC}" >&2
+        exit 1
+    fi
+    local resolved_goal="${goal_id:-${feature}-goal}"
+
     echo -e "${BLUE}======================================================================${NC}"
     echo -e "${BLUE}        执行本地四大硬门禁与代码质量一体化自检                          ${NC}"
     echo -e "${BLUE}======================================================================${NC}"
+
+    if [[ -n "$feature" ]]; then
+        local contract_file="$PROJECT_ROOT/specs/features/$feature/04-contract.md"
+        local archive_contract="$PROJECT_ROOT/specs/archive/$feature/04-contract.md"
+        if [[ -f "$contract_file" || -f "$archive_contract" ]]; then
+            echo -e "${BOLD}[0/3] 先验证冻结节契约 (gate verify contract)...${NC}"
+            if ! "$PROJECT_ROOT/bin/loopx-flow" gate verify contract "$feature"; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 契约门禁未通过，禁止进入 check。${NC}" >&2
+                exit 1
+            fi
+        fi
+    fi
 
     echo -e "${BOLD}[1/3] 正在运行本地四大硬门禁 (Typecheck, Lint, Build, Test)...${NC}"
     npm run typecheck
@@ -363,43 +462,48 @@ cmd_check() {
 
     echo -e "\n${BOLD}[2/3] 正在执行代码级审查与质量适配映射...${NC}"
     if [[ "$with_ocr" == "true" ]]; then
+        if [[ -z "$feature" ]]; then
+            echo -e "${RED}[-] [FAIL-CLOSED] --with-ocr 需要 feature 胶囊。${NC}" >&2
+            exit 1
+        fi
         echo -e "    检测到启用阿里 OCR 选配项，调用技能内自闭环脚本..."
         "$PROJECT_ROOT/skills/open-code-review/run-ocr.sh" origin/main "$feature"
     else
         echo -e "    调用默认语义契约审查并送入 LoopX Quality 适配器..."
-        node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" ${feature:+--feature "$feature"}
+        node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" ${feature:+--feature "$feature"} --goal-id "$resolved_goal"
     fi
 
     echo -e "\n${BOLD}[3/3] 正在核验 LoopX change-quality 严格收据凭据 (Fail-Closed)...${NC}"
-    if [[ -n "$feature" ]]; then
-        if ! command -v loopx >/dev/null 2>&1; then
-            echo -e "${RED}[-] [FAIL-CLOSED] 严格收据核验失败: 未检测到 loopx CLI，禁止进入交付阶段。${NC}" >&2
-            echo -e "💡 为什么阻断？质量门禁收据核验是强阻断项，必须依赖 LoopX 校验不可篡改凭据。" >&2
-            echo -e "🛠️ 修复指令: 安装 loopx (python3 -m pip install --upgrade loopx) 后重试。" >&2
-            exit 1
-        fi
-        local cq_json cq_ok
-        cq_json="$(loopx change-quality verify --goal-id "${feature}-goal" --repo-path . --format json 2>/dev/null || echo '{}')"
-        cq_ok="$(node -e '
+    if ! command -v loopx >/dev/null 2>&1; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 严格收据核验失败: 未检测到 loopx CLI，禁止进入交付阶段。${NC}" >&2
+        echo -e "💡 为什么阻断？质量门禁收据核验是强阻断项，必须依赖 LoopX 校验不可篡改凭据。" >&2
+        echo -e "🛠️ 修复指令: 安装 loopx (python3 -m pip install --upgrade loopx) 后重试。" >&2
+        exit 1
+    fi
+    local cq_json cq_ok
+    cq_json="$(loopx $REGISTRY_FLAG change-quality verify --goal-id "$resolved_goal" --repo-path . --format json 2>&1 || echo '{}')"
+    cq_ok="$(node -e '
 const fs = require("fs");
 let d = {};
 try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {}
 process.stdout.write(d.ok === true ? "true" : "false");
 ' <<< "$cq_json")"
-        if [[ "$cq_ok" != "true" ]]; then
-            echo -e "${RED}[-] [FAIL-CLOSED] LoopX change-quality 收据核验未通过 (ok=false)，禁止进入交付阶段。${NC}" >&2
-            echo -e "${RED}    请先运行 prepare/review 并记录与当前 exact-scope 对齐的通过收据。${NC}" >&2
-            exit 1
-        fi
-        echo -e "    ${GREEN}[✓] 严格收据核验通过 (ok=true)。${NC}"
+    if [[ "$cq_ok" != "true" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] LoopX change-quality 收据核验未通过 (ok=false)，禁止进入交付阶段。${NC}" >&2
+        echo -e "${RED}    请先运行 prepare/review 并记录与当前 exact-scope 对齐的通过收据。${NC}" >&2
+        exit 1
     fi
+    echo -e "    ${GREEN}[✓] 严格收据核验通过 (ok=true)。${NC}"
 
     echo -e "${GREEN}======================================================================${NC}"
     echo -e "${GREEN}[✓] 本地门禁、代码审查与质量收据 100% 通过！${NC}"
-    echo -e "${GREEN}    凭据已同步写入: specs/features/${feature:-default}/05-evidence.md${NC}"
+    if [[ -n "$feature" && -d "$PROJECT_ROOT/specs/features/$feature" ]]; then
+        echo -e "${GREEN}    凭据已同步写入: specs/features/$feature/05-evidence.md${NC}"
+    else
+        echo -e "${GREEN}    严格收据已记录到 Goal: $resolved_goal (无 feature 胶囊，未写 05-evidence)${NC}"
+    fi
     echo -e "${GREEN}======================================================================${NC}"
 }
-
 cmd_review() {
     local pr_id="${1:-}"
     shift || true
@@ -732,6 +836,8 @@ cmd_merge() {
     if [[ -z "$feature" && "$head_ref" =~ ^feature/(.+) ]]; then
         feature="${BASH_REMATCH[1]}"
     fi
+    local original_branch
+    original_branch="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null || true)"
 
     echo -e "${BLUE}======================================================================${NC}"
     echo -e "${BLUE}        LoopX 原子 Squash 合并与目标归档核销 (Fail-Closed)            ${NC}"
@@ -857,7 +963,14 @@ cmd_merge() {
 
     if [[ "$failed" -eq 0 && -n "$feature" && "${LOOPX_FLOW_MERGE_SKIP_GIT_SYNC:-0}" != "1" ]]; then
         local base_branch="${base_ref:-main}"
-        if (cd "$PROJECT_ROOT" && git fetch origin "$base_branch" && git checkout "$base_branch" && git pull --ff-only origin "$base_branch") >/dev/null 2>&1; then
+        local dirty
+        dirty="$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=no 2>/dev/null | grep -vE '^(..) (specs/archive/|specs/features/|\.loopx/)' || true)"
+        if [[ -n "$dirty" ]]; then
+            failed=1
+            step_names+=("push"); step_states+=("failed"); step_details+=("dirty worktree; base checkout skipped")
+            echo -e "${RED}[-] 工作区存在 unrelated 未提交文件，跳过 base 切换（不冒险覆盖）:${NC}" >&2
+            echo "$dirty" | sed 's/^/    /' >&2
+        elif (cd "$PROJECT_ROOT" && git fetch origin "$base_branch" && git checkout "$base_branch" && git pull --ff-only origin "$base_branch") >/dev/null 2>&1; then
             if (cd "$PROJECT_ROOT" && git add -A --ignore-unmatch -- "specs/archive/$feature" "specs/features/$feature" >/dev/null 2>&1 && ! git diff --cached --quiet); then
                 if (cd "$PROJECT_ROOT" && git commit -m "chore($feature): archive capsule after merge" >/dev/null 2>&1 && git push origin "$base_branch" >/dev/null 2>&1); then
                     step_names+=("push"); step_states+=("done"); step_details+=("")
@@ -868,6 +981,9 @@ cmd_merge() {
                 fi
             else
                 step_names+=("push"); step_states+=("skipped"); step_details+=("no archive diff")
+            fi
+            if [[ -n "$original_branch" && "$original_branch" != "$base_branch" ]] && git -C "$PROJECT_ROOT" rev-parse --verify "$original_branch" >/dev/null 2>&1; then
+                git -C "$PROJECT_ROOT" checkout "$original_branch" >/dev/null 2>&1 || true
             fi
         else
             failed=1
