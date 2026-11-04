@@ -30,6 +30,11 @@ if [[ "$cmd" == "pr" && "$subcmd" == "comment" ]]; then
 fi
 
 if [[ "$cmd" == "pr" && "$subcmd" == "view" ]]; then
+  # Compound PR state view used by merge compensation
+  if [[ "$*" == *"state,mergedAt,reviewDecision"* ]]; then
+    echo "OPEN%%APPROVED%${currentHeadSha}%feature/e2e-pipeline-demo%main"
+    exit 0
+  fi
   # Check which field was requested
   if [[ "$*" == *"--jq .reviewDecision"* ]]; then
     echo "APPROVED"
@@ -146,7 +151,8 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
 
   const testEnv = {
     ...process.env,
-    PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`
+    PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
+    LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1'
   };
 
   try {
