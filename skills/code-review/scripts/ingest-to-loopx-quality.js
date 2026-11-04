@@ -46,18 +46,16 @@ function parseArgs() {
       const branch = execSync('git rev-parse --abbrev-ref HEAD 2>/dev/null', { encoding: 'utf8' }).trim();
       if (branch.startsWith('feature/')) {
         options.feature = branch.replace('feature/', '');
-      } else {
-        const featDir = path.resolve(process.cwd(), 'specs/features');
-        if (fs.existsSync(featDir)) {
-          const entries = fs.readdirSync(featDir).filter(f => f !== 'archive' && !f.startsWith('.'));
-          if (entries.length > 0) options.feature = entries[0];
-        }
       }
     } catch (_) {}
   }
 
   if (!options.goalId && options.feature) {
     options.goalId = `${options.feature}-goal`;
+  }
+  if (!options.feature && !options.goalId) {
+    console.error('[BLOCKED] 无法解析 feature 或 --goal-id；拒绝在没有交付身份的情况下生成质量收据（防止写错胶囊）。');
+    process.exit(1);
   }
 
   return options;
@@ -360,6 +358,10 @@ ${scope ? `- **LoopX Scope Fingerprint**: \`${scope.fingerprint}\`` : ''}
     }
   }
 
+  if (!receiptVerified) {
+    console.error('[BLOCKED] 严格收据未验证（loopx 缺失或 record/verify 未完成），禁止打印 PASSED。');
+    process.exit(1);
+  }
   console.log(`\n[PASSED] Code Review and LoopX Quality Ingestion 100% Passed.`);
 }
 

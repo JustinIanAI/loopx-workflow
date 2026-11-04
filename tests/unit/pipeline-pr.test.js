@@ -3,10 +3,28 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync, execSync } = require('node:child_process');
+const crypto = require('node:crypto');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const MOCK_BIN_DIR = path.join(PROJECT_ROOT, '.tmp-mock-bin');
+const REG_PATH = path.join(PROJECT_ROOT, '.loopx/registry.json');
+
+function registerE2eGoal(featureDir) {
+  const contract = path.join(featureDir, '04-contract.md');
+  const sha = crypto.createHash('sha256').update(fs.readFileSync(contract)).digest('hex');
+  let reg = { schema_version: '0.1', goals: [] };
+  try { reg = JSON.parse(fs.readFileSync(REG_PATH, 'utf8')); } catch (_) {}
+  if (!Array.isArray(reg.goals)) reg.goals = [];
+  let g = reg.goals.find(x => (x.id || x.goal_id) === 'e2e-pipeline-demo-goal');
+  if (!g) { g = { id: 'e2e-pipeline-demo-goal', control_plane: {} }; reg.goals.push(g); }
+  if (!g.control_plane) g.control_plane = {};
+  if (!g.control_plane.progress_review) g.control_plane.progress_review = {};
+  g.control_plane.progress_review.contract_revision = sha;
+  fs.mkdirSync(path.dirname(REG_PATH), { recursive: true });
+  fs.writeFileSync(REG_PATH, JSON.stringify(reg, null, 2));
+}
+
 
 // Set up mock gh binary to simulate GitHub PR responses
 function setupMockGh(currentHeadSha) {
@@ -139,6 +157,8 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
   const featureDir = path.join(PROJECT_ROOT, 'specs/features', featureName);
   const archiveDir = path.join(PROJECT_ROOT, 'specs/archive', featureName);
   const originalBranch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8' }).trim();
+  const hadReg = fs.existsSync(REG_PATH);
+  const originalReg = hadReg ? fs.readFileSync(REG_PATH, 'utf8') : null;
 
   // Clean before test
   if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
@@ -177,6 +197,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
     assert.strictEqual(contractContent.includes('FROZEN & APPROVED'), true);
 
     // 3. Step 3: Run Quality Gate Check and Review Ingestion
+    registerE2eGoal(featureDir);
     console.log('[Test E2E] 3. Running loopx-flow check...');
     const checkRes = spawnSync(LOOPX_FLOW, ['check', featureName], {
       encoding: 'utf8',
@@ -212,6 +233,8 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
     console.log('[Test E2E] 6. End-to-end PR Review & Merge pipeline simulation completed successfully!');
   } finally {
     cleanupMockGh();
+    if (hadReg && originalReg !== null) fs.writeFileSync(REG_PATH, originalReg);
+    else if (!hadReg && fs.existsSync(REG_PATH)) fs.unlinkSync(REG_PATH);
     if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
     if (fs.existsSync(archiveDir)) fs.rmSync(archiveDir, { recursive: true, force: true });
     // Restore the developer's original branch: `loopx-flow feature` switches branches as a side effect
