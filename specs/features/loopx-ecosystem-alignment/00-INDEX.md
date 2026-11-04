@@ -4,7 +4,8 @@
 - **Feature Name**: `loopx-ecosystem-alignment`
 - **Branch**: `feature/loopx-ecosystem-alignment`
 - **LoopX Goal**: `loopx-ecosystem-alignment-goal`
-- **Current Status**: `STAGE_6_CHECK_PASSED`
+- **Current Status**: `Accepted (five-state; gaps tracked in ADR-0002/0004 / issue #15, R2/R4)`
+- **Remediation**: pending R2/R4
 - **Contract Status**: `FROZEN & APPROVED (SHA: 8312f55b333b19dd85faf15161587b1fbf4c7bab542c88295158b52a0afd1231)`
 
 ## 过程文档索引

@@ -12,14 +12,17 @@
 1. **先思考后写代码 (Think Before Coding)**：
    - 严禁隐瞒模糊需求。进入编码前必须通过 `design-grill` 消除所有“it depends”。
    - 严禁向用户询问可通过读代码库（`rg`/`read`）解答的事实性问题。
-2. **以 Feature 为单元自包含组织资产 (Feature Capsule First)**：
-   - 彻底摒弃跨阶段割裂分散放置文档的旧模式。所有特性的决策、PRD、故事、契约与验证凭证，统一自包含在 `specs/features/<feature>/` 目录下：
+2. **产品正文唯一，Feature 胶囊只承载一次交付 (Product Source of Truth)**：
+   - 产品需求只写在 `docs/prd/loopx-workflow.md`（`REQ-*`）。命令、阶段、失败条件与资产路径只写在 `docs/design/loopx-workflow-design.md`。
+   - 改变产品行为或失败条件时，先写 `docs/adr/NNNN-*.md` 并回写上述正文，再冻结契约。禁止为同一行为再写一份产品级 PRD。
+   - `specs/features/<feature>/` 只保留这一次交付的执行资产：
      - `00-INDEX.md`（审阅总览看板）
-     - `01-decisions.md`（阶段 1 架构决策备忘录）
-     - `02-prd.md`（阶段 2 精益 PRD 与承重假设）
+     - `01-decisions.md`（本胶囊的实现取舍，并链接相关 ADR；不是产品决策正文）
+     - `02-prd.md`（本胶囊覆盖的 `REQ-*` 或 ADR 编号、切片验收与承重假设；不是第二份产品 PRD）
      - `03-stories.md`（阶段 3 故事拆分与排期）
      - `04-contract.md`（阶段 4 TypeScript 契约与任务图）
      - `05-evidence.md`（阶段 5/6 门禁实测与 LoopX 质量凭据）
+   - 规则来源是 `docs/adr/0001-product-source-of-truth.md`。`approve` / `gate` 尚未检查胶囊是否引用了 `REQ-*`（见 PRD `REQ-TRACE-2`）。
 3. **断点 1 契约冻结与审批先行 (Contract Freeze & Checkpoint 1 Approval)**：
    - 在 `specs/features/<feature>/04-contract.md` 顶部必须冻结不可变 TypeScript 接口签名与断言不变量。
    - 必须通过 `loopx-flow approve contract <feature>` 由人类决策者执行审批放行，系统自动将状态标记为 `Contract-Status: FROZEN & APPROVED` 并通过 `loopx configure-goal --progress-review-contract-revision <sha256>` 物理锁定契约指纹后，方可进入编码实现。
@@ -48,8 +51,8 @@
 ## 管线 A: Feature 研发管线 (8 阶段场景化闭环)
 
 - **阶段 0：前置体检** ➔ 运行 `loopx-flow doctor` 确保 Git、CLI、认证、四大门禁与目录就绪。
-- **阶段 1：方案研讨** ➔ 调用 `design-grill` 排除事实疑问，收敛核心决策分支，产出 `specs/features/<feature>/01-decisions.md`。
-- **阶段 2：精益 PRD** ➔ `create-prd` 显式读取决策备忘录 + `strategy-red-team` 攻击承重假设，产出 `specs/features/<feature>/02-prd.md`。
+- **阶段 1：方案研讨** ➔ 调用 `design-grill` 排除事实疑问。产品级取舍写入 `docs/adr/` 并修订 `docs/prd/loopx-workflow.md` 与必要时的详细设计。`specs/features/<feature>/01-decisions.md` 只记录本胶囊的实现取舍并链接该 ADR。
+- **阶段 2：需求切片** ➔ 对照产品 PRD 列出本胶囊要满足的 `REQ-*`。行为不在 PRD 中则先完成阶段 1 的 ADR，禁止在 `02-prd.md` 另立产品需求。`strategy-red-team` 只攻击本切片的承重假设。
 - **阶段 3：特性拆分** ➔ `user-stories` / `prioritize-features`，控制单 Feature Diff ≤ 500 行，产出 `specs/features/<feature>/03-stories.md`。
 - **阶段 4：契约冻结与断点 1 审批** ➔ 编写 `specs/features/<feature>/04-contract.md` 顶部固化 TypeScript 签名；生成 `00-INDEX.md` 全景大盘；人类执行 `loopx-flow approve contract <feature>` 锁定契约指纹并放行。
 - **阶段 5：TDD 循环实现与反熵增** ➔ 认领排他租约 `loopx task-lease acquire` ➔ 红绿重构（单测先写先红）➔ 依 `anti-entropy-governance` 清理退役旧逻辑 ➔ 四大门禁全绿。
@@ -81,3 +84,19 @@
   4. 实施外科手术修复与代码退役（`delete-first`），验证用例变绿。
   5. 运行 `loopx-flow check` 固化质量收据。
   6. 创建 GitHub PR 并在页面呈现修复对比证据，人类 Approve 后由 `loopx-flow merge <pr_id>` 合并核销。
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues (`JustinIan-AI/loopx-workflow`) via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage state roles map 1:1 to their label strings: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.

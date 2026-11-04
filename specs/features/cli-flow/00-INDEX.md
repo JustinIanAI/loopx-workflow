@@ -8,7 +8,8 @@
 - **Feature Name**: `cli-flow`
 - **Target Branch**: `feature/cli-flow-orchestrator`
 - **LoopX Goal**: `cli-flow-goal`
-- **Current Status**: `DELIVERED & VERIFIED`
+- **Current Status**: `Verified (PR merged; capsule retained; per ADR-0006)`
+- **Remediation**: none (audit closed)
 - **Contract Status**: `FROZEN & APPROVED`
 
 ---

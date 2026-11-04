@@ -1,5 +1,7 @@
 # 精益 PRD：CLI 与脚本硬熔断守卫体系 (Hard Enforcement Guard)
 
+> 历史切片。产品需求以 [docs/prd/loopx-workflow.md](../../../docs/prd/loopx-workflow.md) 为准。本文件只保留当时的验收与假设，不另立产品规格。见 [ADR-0001](../../../docs/adr/0001-product-source-of-truth.md)。文中的 `docs/decisions/` 与 `.feat/specs/` 不是当前路径。
+
 - **特性代号**：`hard-guard`
 - **对应架构决策**：`docs/decisions/hard-guard-decisions.md`
 - **当前状态**：`Status: READY FOR HUMAN REVIEW`

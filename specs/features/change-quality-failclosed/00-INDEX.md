@@ -4,7 +4,8 @@
 - **Feature Name**: `change-quality-failclosed`
 - **Branch**: `feature/change-quality-failclosed`
 - **LoopX Goal**: `change-quality-failclosed-goal`
-- **Current Status**: `DELIVERED & VERIFIED (Stage 5/6 Passed)`
+- **Current Status**: `Accepted (five-state; gaps tracked in ADR-0005 / issue #15, R4)`
+- **Remediation**: pending R4
 - **Contract Status**: `FROZEN & APPROVED`
 
 ## 过程文档索引

@@ -8,7 +8,8 @@
 - **Feature Name**: `hard-guard`
 - **Target Branch**: `feature/hard-enforcement-guard`
 - **LoopX Goal**: `hard-guard-goal`
-- **Current Status**: `DELIVERED & VERIFIED`
+- **Current Status**: `Accepted (five-state; gaps tracked in ADR-0002~0005 / issue #15, R1/R2)`
+- **Remediation**: pending R1/R2
 - **Contract Status**: `FROZEN & APPROVED`
 
 ---

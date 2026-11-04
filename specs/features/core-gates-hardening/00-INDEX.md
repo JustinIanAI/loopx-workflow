@@ -4,7 +4,8 @@
 - **Feature Name**: `core-gates-hardening`
 - **Branch**: `feature/core-gates-hardening`
 - **LoopX Goal**: `core-gates-hardening-goal`
-- **Current Status**: `DELIVERED & VERIFIED (Stage 5/6 Passed)`
+- **Current Status**: `Accepted (five-state; gaps tracked in ADR-0002~0005 / issue #15, R2/R4)`
+- **Remediation**: pending R2/R4
 - **Contract Status**: `FROZEN & APPROVED`
 
 ## 过程文档索引
