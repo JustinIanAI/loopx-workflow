@@ -3,6 +3,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
@@ -23,6 +24,30 @@ test('1. Stage Signature Gate: decisions check in specs/features/<feat>/01-decis
 });
 
 test('2. Stage Signature Gate: contract check in specs/features/<feat>/04-contract.md', () => {
+  const contractPath = fs.existsSync(path.join(PROJECT_ROOT, 'specs/features/hard-guard/04-contract.md'))
+    ? path.join(PROJECT_ROOT, 'specs/features/hard-guard/04-contract.md')
+    : path.join(PROJECT_ROOT, 'specs/archive/hard-guard/04-contract.md');
+  const contractSha = crypto.createHash('sha256').update(fs.readFileSync(contractPath)).digest('hex');
+  const regPath = path.join(PROJECT_ROOT, '.loopx/registry.json');
+  fs.mkdirSync(path.dirname(regPath), { recursive: true });
+  let reg = { goals: [] };
+  if (fs.existsSync(regPath)) {
+    try { reg = JSON.parse(fs.readFileSync(regPath, 'utf8')); } catch (_) {}
+  }
+  if (!Array.isArray(reg.goals)) reg.goals = [];
+  let g = reg.goals.find(item => item.id === 'hard-guard-goal' || item.goal_id === 'hard-guard-goal');
+  if (!g) {
+    reg.goals.push({
+      id: 'hard-guard-goal',
+      control_plane: { progress_review: { contract_revision: contractSha } }
+    });
+  } else {
+    g.control_plane = g.control_plane || {};
+    g.control_plane.progress_review = g.control_plane.progress_review || {};
+    g.control_plane.progress_review.contract_revision = contractSha;
+  }
+  fs.writeFileSync(regPath, JSON.stringify(reg, null, 2));
+
   // Test feature with FROZEN & APPROVED marker in 04-contract.md
   const resApproved = spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'hard-guard'], {
     encoding: 'utf8'

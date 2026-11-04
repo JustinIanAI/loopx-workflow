@@ -573,7 +573,7 @@ cmd_pr() {
     if [[ "$sub" == "--help" || "$sub" == "-h" || -z "$sub" ]]; then
         cat << 'HELPTXT'
 用法:
-  loopx-flow pr create [feature] [--title "feat(...)"]
+  loopx-flow pr create [feature] [--title "feat(...)"] [--base "main"]
   loopx-flow pr preview [feature]
   loopx-flow pr update <pr_id> [feature]
 
@@ -611,17 +611,26 @@ HELPTXT
             node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature"
             ;;
         create)
+            local base="main"
+            local passthru_args=()
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --title)
                         title="$2"
                         shift 2
                         ;;
+                    --base)
+                        base="$2"
+                        shift 2
+                        ;;
                     *)
                         if [[ -z "$feature" ]]; then
                             feature="$1"
+                            shift
+                        else
+                            passthru_args+=("$1")
+                            shift
                         fi
-                        shift
                         ;;
                 esac
             done
@@ -712,93 +721,174 @@ cmd_merge() {
         exit 1
     fi
 
-    if [[ -z "$feature" ]]; then
-        local head_ref
-        head_ref="$(gh pr view "$pr_id" --json headRefName --jq .headRefName 2>/dev/null || echo "")"
-        if [[ "$head_ref" =~ ^feature/(.+) ]]; then
-            feature="${BASH_REMATCH[1]}"
-        fi
+    local pr_view state merged_at decision head_oid head_ref base_ref
+    pr_view="$(gh pr view "$pr_id" --json state,mergedAt,reviewDecision,headRefOid,headRefName,baseRefName --jq '[.state, (.mergedAt // ""), (.reviewDecision // ""), .headRefOid, .headRefName, .baseRefName] | join("%")' 2>/dev/null || echo "")"
+    if [[ -z "$pr_view" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 PR #$pr_id 状态，禁止合入。${NC}" >&2
+        exit 1
+    fi
+    IFS="%" read -r state merged_at decision head_oid head_ref base_ref <<< "$pr_view"
+
+    if [[ -z "$feature" && "$head_ref" =~ ^feature/(.+) ]]; then
+        feature="${BASH_REMATCH[1]}"
     fi
 
     echo -e "${BLUE}======================================================================${NC}"
     echo -e "${BLUE}        LoopX 原子 Squash 合并与目标归档核销 (Fail-Closed)            ${NC}"
     echo -e "${BLUE}======================================================================${NC}"
 
-    echo -e "${BOLD}[1/4] 正在校验 GitHub PR 决议与 HEAD SHA...${NC}"
-    local decision
-    decision="$(gh pr view "$pr_id" --json reviewDecision --jq .reviewDecision 2>/dev/null || echo "")"
-    if [[ "$decision" != "APPROVED" ]]; then
-        echo -e "${RED}[-] [FAIL-CLOSED] 阻断: PR #$pr_id 尚未在 GitHub 获得人类 APPROVED 审批！(当前状态: '$decision')${NC}" >&2
-        echo -e "${RED}    请人类决策者在 GitHub PR 页面核验 8 项事实后点击 Approve，方可执行合并。${NC}" >&2
-        exit 1
-    fi
-    echo -e "    ${GREEN}[✓] GitHub 审查决议确认: APPROVED${NC}"
-
-    local head_oid
-    head_oid="$(gh pr view "$pr_id" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")"
-    echo -e "    当前 PR 最新 HEAD SHA: ${BOLD}$head_oid${NC}"
-
-    echo -e "\n${BOLD}[2/4] 调用 LoopX 原生合入就绪度物理锁核验 (Fail-Closed)...${NC}"
-    if ! command -v loopx >/dev/null 2>&1; then
-        echo -e "${RED}[-] [FAIL-CLOSED] LoopX 合入就绪度核验失败: 未检测到 loopx CLI，物理防偷跑锁无法核验，禁止合并。${NC}" >&2
-        exit 1
-    fi
-    local goal_flag=()
-    if [[ -n "$feature" ]]; then
-        goal_flag=(--goal-id "${feature}-goal")
-    fi
-    if ! loopx pr-review "${goal_flag[@]}" --check-merge-readiness "${pr_id}@${head_oid}"; then
-        echo -e "${RED}[-] [FAIL-CLOSED] LoopX 合入就绪度核验失败: PR #$pr_id @ ${head_oid:-<unknown>} 未通过物理防偷跑锁核验。${NC}" >&2
-        echo -e "${RED}    禁止合并: 请先完成质量收据 (loopx-flow check) 与契约一致性核验后重试。${NC}" >&2
-        exit 1
-    fi
-
-    # Inv-3: HEAD SHA 漂移二次校验，杜绝审批后偷跑新提交
-    local head_oid_now
-    head_oid_now="$(gh pr view "$pr_id" --json headRefOid --jq .headRefOid 2>/dev/null || echo "$head_oid")"
-    if [[ "$head_oid_now" != "$head_oid" ]]; then
-        echo -e "${RED}[-] [FAIL-CLOSED] LoopX 合入就绪度核验失败: HEAD SHA 发生漂移 ($head_oid -> $head_oid_now)，禁止合并。${NC}" >&2
-        exit 1
-    fi
-    echo -e "    ${GREEN}[✓] 物理防偷跑核验通过 (Lock: UNLOCKED @ $head_oid)。${NC}"
-
-    echo -e "\n${BOLD}[3/4] 执行原子 Squash 合并并删除特性分支...${NC}"
-    gh pr merge "$pr_id" --squash --delete-branch
-    echo -e "    ${GREEN}[✓] GitHub PR 已成功 Squash 合入主干！${NC}"
-
-    echo -e "\n${BOLD}[4/4] 特性资产胶囊原子归档与 Goal 核销...${NC}"
-    if [[ -z "$feature" ]]; then
-        local head_ref
-        head_ref="$(gh pr view "$pr_id" --json headRefName --jq .headRefName 2>/dev/null || echo "")"
-        if [[ "$head_ref" =~ ^feature/(.+) ]]; then
-            feature="${BASH_REMATCH[1]}"
+    local already_merged="false"
+    if [[ "$state" == "MERGED" || -n "$merged_at" ]]; then
+        already_merged="true"
+        echo -e "${YELLOW}[i] PR #$pr_id 已处于 MERGED，跳过重复合并与 readiness，进入补偿模式。${NC}"
+        if [[ -z "$head_oid" ]]; then
+            head_oid="$(gh pr view "$pr_id" --json headRefOid --jq .headRefOid 2>/dev/null || echo "")"
         fi
-    fi
-
-    # 1. 优先调用 LoopX Goal 停机与全局退役，确保在特性胶囊归档前基于活跃 state_file 完成正常核销
-    if command -v loopx >/dev/null 2>&1 && [[ -n "$feature" ]]; then
-        local goal_id="${feature}-goal"
-        if ! loopx goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "Feature delivered and archived" --execute; then
-            echo -e "${RED}[-] [FAIL-CLOSED] LoopX Goal $goal_id 闭环核销失败！${NC}" >&2
-            echo -e "💡 为什么阻断？Goal 核销失败可能导致控制面状态残留或后续同名特性冲突。" >&2
-            echo -e "🛠️ 修复指令: 手动核销 Goal: loopx goal-lifecycle --goal-id $goal_id --operation stop --actor-kind controller --reason \"Manual closure\" --execute" >&2
+    else
+        echo -e "${BOLD}[1/4] 正在校验 GitHub PR 决议与 HEAD SHA...${NC}"
+        if [[ "$decision" != "APPROVED" ]]; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 阻断: PR #$pr_id 尚未在 GitHub 获得人类 APPROVED 审批！(当前状态: ${decision:-<empty>})${NC}" >&2
+            echo -e "${RED}    请人类决策者在 GitHub PR 页面核验 8 项事实后点击 Approve，方可执行合并。${NC}" >&2
             exit 1
         fi
-        loopx retire-global-goal --goal-id "$goal_id" --execute 2>/dev/null || true
-        loopx sync-global 2>/dev/null || true
-        echo -e "    ${GREEN}[✓] LoopX Goal $goal_id 已闭环核销并退役！${NC}"
+        echo -e "    ${GREEN}[✓] GitHub 审查决议确认: APPROVED${NC}"
+        echo -e "    当前 PR 最新 HEAD SHA: ${BOLD}$head_oid${NC}"
+
+        echo -e "\n${BOLD}[2/4] 调用 LoopX 原生合入就绪度物理锁核验 (Fail-Closed)...${NC}"
+        if ! command -v loopx >/dev/null 2>&1; then
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 合入就绪度核验失败: 未检测到 loopx CLI，物理防偷跑锁无法核验，禁止合并。${NC}" >&2
+            exit 1
+        fi
+        local goal_flag=()
+        if [[ -n "$feature" ]]; then
+            goal_flag=(--goal-id "${feature}-goal")
+        fi
+        if ! loopx pr-review "${goal_flag[@]}" --check-merge-readiness "${pr_id}@${head_oid}"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 合入就绪度核验失败: PR #$pr_id @ ${head_oid:-<unknown>} 未通过物理防偷跑锁核验。${NC}" >&2
+            echo -e "${RED}    禁止合并: 请先完成质量收据 (loopx-flow check) 与契约一致性核验后重试。${NC}" >&2
+            exit 1
+        fi
+        local head_oid_now
+        head_oid_now="$(gh pr view "$pr_id" --json headRefOid --jq .headRefOid 2>/dev/null || echo "$head_oid")"
+        if [[ "$head_oid_now" != "$head_oid" ]]; then
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 合入就绪度核验失败: HEAD SHA 发生漂移 ($head_oid -> $head_oid_now)，禁止合并。${NC}" >&2
+            exit 1
+        fi
+        echo -e "    ${GREEN}[✓] 物理防偷跑核验通过 (Lock: UNLOCKED @ $head_oid)。${NC}"
+        echo -e "\n${BOLD}[3/4] 执行原子 Squash 合并并删除特性分支...${NC}"
+        if ! gh pr merge "$pr_id" --squash --delete-branch; then
+            echo -e "${RED}[-] [FAIL-CLOSED] gh pr merge 失败，禁止继续补偿。${NC}" >&2
+            exit 1
+        fi
+        echo -e "    ${GREEN}[✓] GitHub PR 已成功 Squash 合入主干！${NC}"
     fi
 
-    # 2. 正常停机完成后，再将特性胶囊原子移动至归档区
-    if [[ -n "$feature" && -d "$PROJECT_ROOT/specs/features/$feature" ]]; then
-        mkdir -p "$PROJECT_ROOT/specs/archive"
-        mv "$PROJECT_ROOT/specs/features/$feature" "$PROJECT_ROOT/specs/archive/$feature"
-        echo -e "    ${GREEN}[✓] 资产包已原子迁移至归档区: specs/archive/$feature/${NC}"
+    echo -e "\n${BOLD}[4/4] 特性资产胶囊归档与 Goal 生命周期补偿...${NC}"
+    local -a step_names=() step_states=() step_details=()
+    local failed=0
+    local goal_id=""
+    [[ -n "$feature" ]] && goal_id="${feature}-goal"
+
+    if [[ -n "$feature" ]]; then
+        if ! command -v loopx >/dev/null 2>&1; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，无法完成 Goal 停机/退役/同步补偿。${NC}" >&2
+            exit 1
+        fi
+
+        local out status
+        if out="$(loopx $REGISTRY_FLAG goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "Feature delivered and archived" --execute 2>&1)"; then
+            step_names+=("stop"); step_states+=("done"); step_details+=("")
+            echo -e "    ${GREEN}[✓] Goal $goal_id 已停机。${NC}"
+        else
+            status=$?
+            if grep -Eiq "not found in (the )?registry|already stopped|already inactive|no .*transition|unchanged" <<< "$out"; then
+                step_names+=("stop"); step_states+=("skipped"); step_details+=("already stopped")
+                echo -e "    ${YELLOW}[i] Goal $goal_id 已停机，跳过。${NC}"
+            else
+                failed=1
+                step_names+=("stop"); step_states+=("failed"); step_details+=("$out")
+                echo -e "${RED}[-] Goal $goal_id 停机失败: $out${NC}" >&2
+            fi
+        fi
+
+        if out="$(loopx $REGISTRY_FLAG retire-global-goal --goal-id "$goal_id" --execute 2>&1)"; then
+            step_names+=("retire"); step_states+=("done"); step_details+=("")
+            echo -e "    ${GREEN}[✓] 全局 Goal $goal_id 已退役。${NC}"
+        else
+            status=$?
+            if grep -Eiq "not found in global registry|already retired|live source_registry|refusing to retire" <<< "$out"; then
+                step_names+=("retire"); step_states+=("skipped"); step_details+=("live source registry / already retired")
+                echo -e "    ${YELLOW}[i] 全局退役跳过（source registry 仍存活或已退役）。${NC}"
+            else
+                failed=1
+                step_names+=("retire"); step_states+=("failed"); step_details+=("$out")
+                echo -e "${RED}[-] 全局 Goal 退役失败: $out${NC}" >&2
+            fi
+        fi
+
+        if out="$(loopx $REGISTRY_FLAG sync-global --goal-id "$goal_id" 2>&1)"; then
+            step_names+=("sync"); step_states+=("done"); step_details+=("")
+            echo -e "    ${GREEN}[✓] 全局 registry 已同步 ${goal_id}。${NC}"
+        else
+            status=$?
+            failed=1
+            step_names+=("sync"); step_states+=("failed"); step_details+=("$out")
+            echo -e "${RED}[-] sync-global 失败: $out${NC}" >&2
+        fi
+    fi
+
+    if [[ "$failed" -eq 0 && -n "$feature" ]]; then
+        if [[ -d "$PROJECT_ROOT/specs/features/$feature" ]]; then
+            mkdir -p "$PROJECT_ROOT/specs/archive"
+            if mv "$PROJECT_ROOT/specs/features/$feature" "$PROJECT_ROOT/specs/archive/$feature"; then
+                step_names+=("archive"); step_states+=("done"); step_details+=("")
+                echo -e "    ${GREEN}[✓] 资产包已原子迁移至归档区: specs/archive/$feature/${NC}"
+            else
+                failed=1
+                step_names+=("archive"); step_states+=("failed"); step_details+=("mv failed")
+            fi
+        elif [[ -d "$PROJECT_ROOT/specs/archive/$feature" ]]; then
+            step_names+=("archive"); step_states+=("skipped"); step_details+=("already archived")
+            echo -e "    ${YELLOW}[i] 资产包已在归档区，跳过。${NC}"
+        else
+            step_names+=("archive"); step_states+=("skipped"); step_details+=("no capsule")
+        fi
+    fi
+
+    if [[ "$failed" -eq 0 && -n "$feature" && "${LOOPX_FLOW_MERGE_SKIP_GIT_SYNC:-0}" != "1" ]]; then
+        local base_branch="${base_ref:-main}"
+        if (cd "$PROJECT_ROOT" && git fetch origin "$base_branch" && git checkout "$base_branch" && git pull --ff-only origin "$base_branch") >/dev/null 2>&1; then
+            if (cd "$PROJECT_ROOT" && git add -A --ignore-unmatch -- "specs/archive/$feature" "specs/features/$feature" >/dev/null 2>&1 && ! git diff --cached --quiet); then
+                if (cd "$PROJECT_ROOT" && git commit -m "chore($feature): archive capsule after merge" >/dev/null 2>&1 && git push origin "$base_branch" >/dev/null 2>&1); then
+                    step_names+=("push"); step_states+=("done"); step_details+=("")
+                    echo -e "    ${GREEN}[✓] 本地 $base_branch 已同步并推送 archive 移动。${NC}"
+                else
+                    failed=1
+                    step_names+=("push"); step_states+=("failed"); step_details+=("commit/push failed")
+                fi
+            else
+                step_names+=("push"); step_states+=("skipped"); step_details+=("no archive diff")
+            fi
+        else
+            failed=1
+            step_names+=("push"); step_states+=("failed"); step_details+=("base refresh failed")
+        fi
+    fi
+
+    echo -e "\n${BOLD}补偿步骤汇总:${NC}"
+    local i
+    for i in "${!step_names[@]}"; do
+        echo -e "    - ${step_names[$i]}: ${step_states[$i]}${step_details[$i]:+ (${step_details[$i]})}"
+    done
+
+    if [[ "$failed" -ne 0 ]]; then
+        echo -e "\n${RED}[-] [FAIL-CLOSED] PR #$pr_id 已合入，但 archive/stop/retire/sync 未闭环。${NC}" >&2
+        echo -e "🛠️ 修复后重跑: loopx-flow merge $pr_id${feature:+ $feature}" >&2
+        exit 1
     fi
 
     echo -e "\n${GREEN}[✓] PR #$pr_id 交付全流程闭环完成！${NC}"
 }
-
 cmd_gate() {
     local subaction="${1:-}"
     local stage="${2:-}"
