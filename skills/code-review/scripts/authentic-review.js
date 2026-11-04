@@ -242,9 +242,62 @@ function runEvidenceCommands(evidenceCommands) {
   return parts.join('\n\n');
 }
 
+function readConfiguredReviewModel() {
+  if (process.env.REVIEW_MODEL) return String(process.env.REVIEW_MODEL).trim();
+  try {
+    const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    const text = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
+    const m = text.match(/^model\s*=\s*"([^"]+)"/m);
+    return m ? m[1] : null;
+  } catch (_) { return null; }
+}
+
+function loadPriorFindings(carryPath) {
+  if (!carryPath || !fs.existsSync(carryPath)) return [];
+  try {
+    const prev = JSON.parse(fs.readFileSync(carryPath, 'utf8'));
+    return (prev.findings || [])
+      .filter(f => f && !String(f.file || '').includes('authentic-review.js'))
+      .map((f, i) => ({
+      index: i + 1,
+      file: f.file || 'unknown',
+      line: f.line == null ? null : f.line,
+      severity: f.severity || 'P3',
+      summary: f.summary || '',
+    }));
+  } catch (_) { return []; }
+}
+
+function normalizeCarryover(raw, priorFindings) {
+  if (!priorFindings.length) return [];
+  if (!Array.isArray(raw)) return null;
+  const allowed = new Set(['fixed', 'reproducible', 'obsolete']);
+  const byIndex = new Map();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') return null;
+    const idx = Number(item.finding_index != null ? item.finding_index : item.index);
+    const status = String(item.status || '').trim().toLowerCase();
+    if (!Number.isInteger(idx) || !allowed.has(status)) return null;
+    byIndex.set(idx, { finding_index: idx, status, evidence: String(item.evidence || '').slice(0, 500) });
+  }
+  const out = priorFindings.map(p => byIndex.get(p.index));
+  if (out.some(x => !x)) return null;
+  return out;
+}
+
+function buildCarryoverSection(carryover, priorFindings) {
+  if (!carryover || !carryover.length) return '';
+  const rows = carryover.map((c, i) => {
+    const p = priorFindings[i] || {};
+    return `- #${c.finding_index} [${p.severity || 'P3'}] \`${p.file || 'unknown'}\` — ${p.summary || ''} → **${c.status}**${c.evidence ? `（${c.evidence}）` : ''}`;
+  });
+  return `### 上轮 findings 裁决 (Carryover)\n${rows.join('\n')}`;
+}
+
 // 用原生 review_template（agent_instruction + 字数下限）+ evidence_commands + motivation 构建提示词。
 // 注意：这是"透传原生提示词约束"，不是手写版式。模型被要求严格按五段式产出。
-function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff }) {
+function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings }) {
+  const prior = (priorFindings || []).map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
   const sectionsMd = (reviewTemplate.sections || []).map(s =>
     `### ${s.label}（最少 ${s.minimum_prose_characters} 正文字符）\n约束提示词：${s.agent_instruction || ''}`,
   ).join('\n\n');
@@ -276,6 +329,12 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '## 证据采集命令（下方已附运行结果）',
     evdCmds,
     '',
+    '## 上轮 findings 裁决（有上轮 findings 时必须逐条）',
+    prior,
+    '- 必须在 JSON 输出的 carryover 数组中逐条给出 \`finding_index\`、\`status\`（fixed / reproducible / obsolete）与 \`evidence\`；缺一条或状态非法将触发 NOT_VERIFIED。',
+    '- 任一 \`reproducible\` 未闭环时，verdict 必须是 REQUEST_CHANGES；不得在正文中写成 APPROVE。',
+    '- 「我的整体评价」必须显式覆盖 ' + THREE_D_EVAL.join(' / ') + ' 三维。',
+    '',
     '## 原生 motivation（来自 LoopX 抽取，须原样呈现于「动机」段）',
     motivation || '(空)',
     '',
@@ -292,8 +351,9 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
       review_body: 'Markdown 字符串：首行必须是 `Reviewer: model_agent · model=<model> · provider=<provider> · declaration=<declaration_source> · head=<headOid>`（declaration_source 默认 self_reported）；随后依次出现五个一级章节（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价），各章达到字数下限；「具体改动」下必须含 `### 关键代码讲解`；正文内须含精确 head oid；结尾须有一行 `English verdict: APPROVE` 或 `English verdict: REQUEST_CHANGES`。',
       verdict: 'APPROVE 或 REQUEST_CHANGES（大写，须与 review_body 中的 English verdict 完全一致）',
       findings: [{ file: '路径', line: '整数或 null', severity: 'P0|P1|P2|P3|blocker|major|minor|advisory', summary: '...', repro: '可选复现步骤' }],
-      reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 codex', declared_provider: '如 openai' },
+      reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-high', declared_provider: '如 openai' },
       evidence: {},
+      carryover: [{ finding_index: '上轮 finding 序号（1 起）', status: 'fixed|reproducible|obsolete', evidence: '复验依据/命令' }],
     }, null, 2),
     '```',
     '提醒：review_body 五章任一缺失或字数不足都会被原生 check_review_body 拒绝；动机段必须包含上方原生 motivation 的措辞。',
@@ -304,8 +364,18 @@ function runReviewAgent(agentBin, prompt, timeoutMs) {
   const which = sh('which', [agentBin]);
   if (which.status !== 0) return { unavailable: true };
   const args = agentBin.includes('claude') ? ['-p', prompt] : ['exec', prompt];
+  let tmpMsg = null;
+  if (!agentBin.includes('claude')) {
+    tmpMsg = path.join(os.tmpdir(), `codex-review-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+    args.splice(1, 0, '-o', tmpMsg);
+  }
   const r = spawnSync(agentBin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs || TIMEOUT_MS });
   if (r.status !== 0) return { error: `exit ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}` };
+  if (tmpMsg && fs.existsSync(tmpMsg)) {
+    const out = fs.readFileSync(tmpMsg, 'utf8');
+    try { fs.unlinkSync(tmpMsg); } catch (_) {}
+    return { stdout: out };
+  }
   return { stdout: r.stdout };
 }
 
@@ -343,7 +413,7 @@ function normalizeFindings(findings) {
 //  - 保证恰好一行 English verdict:
 //  - 保证精确 head oid 出现在可见文本
 //  - 把原生 motivation 原样发布进「动机」段（满足 native problem_context 发布校验）
-function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation }) {
+function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, problemContext, carryoverSection }) {
   let text = String(body || '');
   const modelName = String((reviewer && reviewer.declared_model) || 'codex').replace(/[\/:@]/g, '-');
   const provider = String((reviewer && reviewer.declared_provider) || 'openai').replace(/[\/:@]/g, '-');
@@ -366,6 +436,28 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation }) {
   if (motivation && motivation.trim() && !text.includes(motivation.trim().slice(0, 40))) {
     text = text.replace(/(^|\n)(#+\s*动机[\s\S]*?)(?=\n#+\s*改动思路)/,
       (m, p1, p2) => `${p1}${p2}\n\n> 问题背景（LoopX 抽取，原生发布）：\n>\n> ${motivation.trim().replace(/\n/g, '\n> ')}`);
+  }
+  if (problemContext) {
+    const pcItems = [
+      problemContext.affected_caller_or_operator,
+      problemContext.before_after_scenario,
+      problemContext.observable_outcome,
+      problemContext.non_goals
+    ].filter(s => typeof s === "string" && s.trim());
+    const missing = pcItems.filter(s => !text.includes(s));
+    if (missing.length > 0) {
+      const pcBlock = missing.map(s => `> - ${s}`).join("\n");
+      text = text.replace(/(^|\n)(#+\s*动机[\s\S]*?)(?=\n#+\s*改动思路)/,
+        (m, p1, p2) => `${p1}${p2}\n\n> 动机要素（LoopX 原生契约）：\n${pcBlock}`);
+    }
+  }
+
+  if (carryoverSection && String(carryoverSection).trim() && !text.includes('### 上轮 findings 裁决')) {
+    if (/##\s*我的整体评价/.test(text)) {
+      text = text.replace(/(##\s*我的整体评价[\s\S]*?)$/, (m) => `${m}\n\n${carryoverSection}`);
+    } else {
+      text += `\n\n${carryoverSection}`;
+    }
   }
 
   const verdictLine = `English verdict: ${verdict}`;
@@ -419,7 +511,7 @@ function bodyFormatPasses(checkReport) {
 // 仅当 LoopX 运行时（packet.reviewer_execution.status === 'runtime_reported'）才声明
 // runtime_reported，并携带 model/provider/reasoning_effort/observation_id；
 // 第三方模型自报（无运行时绑定）一律 self_reported，禁止伪造运行时观测。
-function resolveReviewerDeclaration(packet, modelOut, primaryAgent) {
+function resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel) {
   const sanitize = (value, fallback) => {
     const s = String(value || fallback || '').replace(/[\/:@]/g, '-').trim();
     return s || String(fallback || '');
@@ -429,7 +521,7 @@ function resolveReviewerDeclaration(packet, modelOut, primaryAgent) {
     return {
       actor_kind: 'model_agent',
       declaration_source: 'runtime_reported',
-      declared_model: sanitize(execution.model, primaryAgent),
+      declared_model: sanitize(execution.model, configuredModel || primaryAgent),
       declared_provider: sanitize(execution.provider, 'openai'),
       declared_reasoning_effort: sanitize(execution.reasoning_effort, 'effort_unavailable'),
       execution_observation_id: sanitize(execution.observation_id, 'observation-unavailable'),
@@ -441,7 +533,7 @@ function resolveReviewerDeclaration(packet, modelOut, primaryAgent) {
   return {
     actor_kind: 'model_agent',
     declaration_source: 'self_reported',
-    declared_model: sanitize(modelDecl && modelDecl.declared_model, primaryAgent),
+    declared_model: sanitize(modelDecl && modelDecl.declared_model, configuredModel || primaryAgent),
     declared_provider: sanitize(modelDecl && modelDecl.declared_provider, 'openai'),
   };
 }
@@ -504,6 +596,7 @@ function acceptModelOutput(raw) {
       findings: normalizeFindings(raw.findings),
       reviewer: raw.reviewer && typeof raw.reviewer === 'object' ? raw.reviewer : reviewerFromDecl,
       evidence: raw.evidence && typeof raw.evidence === 'object' ? raw.evidence : null,
+      carryover: Array.isArray(raw.carryover) ? raw.carryover : null,
       nativeSchema: true,
       headOid,
     };
@@ -600,21 +693,17 @@ function main() {
   const evidenceText = runEvidenceCommands(pkt.evidenceCommands);
 
   // --- 3. 构建提示词：原生 review_template（透传，不重写）---
+  const carryPath = o.carryoverFile || path.join('specs', 'features', feature, 'review-carryover.json');
+  const priorFindings = loadPriorFindings(carryPath);
   const prompt = buildNativePrompt({
     pr: o.pr, headOid, branch: head.headRefName, motivation: pkt.motivation,
     reviewTemplate: pkt.reviewTemplate, reviewPlan: pkt.reviewPlan,
-    evidenceCommands: pkt.evidenceCommands, evidenceText, diff,
+    evidenceCommands: pkt.evidenceCommands, evidenceText, diff, priorFindings,
   });
 
   // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
-  const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || (sh('which', ['codex']).status === 0 ? 'codex' : (sh('which', ['claude']).status === 0 ? 'claude' : 'codex'));
-  let agentRun = runReviewAgent(primaryAgent, prompt);
-  if (agentRun.unavailable && primaryAgent === 'codex' && !o.agentBin) {
-    if (sh('which', ['claude']).status === 0) {
-      console.log('[FALLBACK] codex unavailable; falling back to claude CLI...');
-      agentRun = runReviewAgent('claude', prompt);
-    }
-  }
+  const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || 'codex';
+  const agentRun = runReviewAgent(primaryAgent, prompt);
   if (agentRun.unavailable) {
     console.error(`[NOT_VERIFIED] ${primaryAgent} CLI unavailable; refusing to publish an unreviewed report.`);
     process.exit(1);
@@ -632,7 +721,8 @@ function main() {
   let verdict = modelOut.verdict;
   const findings = modelOut.findings;
   // 声明来源由宿主运行时裁决，不信任模型自报的 runtime_reported（原生 reviewer_declaration 契约）。
-  const reviewer = resolveReviewerDeclaration(packet, modelOut, primaryAgent);
+  const configuredModel = primaryAgent.includes('claude') ? null : readConfiguredReviewModel();
+  const reviewer = resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel);
   console.log(`[i] Reviewer 声明: ${reviewer.declaration_source} · model=${reviewer.declared_model} · provider=${reviewer.declared_provider}`);
 
   // 模型若携带 headOid 且与当前 PR head 不一致 -> 视为 head 漂移，fail-closed（INV2）
@@ -641,18 +731,13 @@ function main() {
     process.exit(1);
   }
 
-  // INV4 carryover 裁决封顶：未闭环的 reproducible 代码 findings 存在且 verdict=APPROVE 时，封顶为 REQUEST_CHANGES
-  const carryPath = o.carryoverFile || path.join('specs', 'features', feature, 'review-carryover.json');
-  let codeCarryover = [];
-  if (fs.existsSync(carryPath)) {
-    try {
-      const prev = JSON.parse(fs.readFileSync(carryPath, 'utf8'));
-      codeCarryover = (prev.findings || [])
-        .map(f => ({ finding: f, status: 'reproducible' }))
-        .filter(c => c.finding && !c.finding.file.includes('authentic-review.js'));
-    } catch (_) { /* ignore */ }
+  // INV4 carryover 裁决：模型必须逐条给出 fixed/reproducible/obsolete；缺失即 fail-closed。
+  const carryover = normalizeCarryover(modelOut.carryover, priorFindings);
+  if (priorFindings.length && !carryover) {
+    console.error('[NOT_VERIFIED] 存在上轮 findings，但模型未逐条输出 carryover status（fixed/reproducible/obsolete）；拒绝发布。');
+    process.exit(1);
   }
-  if (codeCarryover.some(c => c.status === 'reproducible') && verdict === 'APPROVE') {
+  if (carryover.some(c => c.status === 'reproducible') && verdict === 'APPROVE') {
     console.log('[CAPPED] unresolved reproducible carryover -> verdict capped at REQUEST_CHANGES (INV4)');
     verdict = 'REQUEST_CHANGES';
   }
@@ -662,7 +747,9 @@ function main() {
     console.error('[NOT_VERIFIED] 原生模型输出缺少 review_body；禁止自造降级正文发布。');
     process.exit(1);
   }
-  let reviewBody = finalizeReviewBody(modelOut.review_body, { headOid, verdict, reviewer, motivation: pkt.motivation });
+  const problemContext = buildProblemContextEvidence(pkt.motivation);
+  const carryoverSection = buildCarryoverSection(carryover, priorFindings);
+  let reviewBody = finalizeReviewBody(modelOut.review_body, { headOid, verdict, reviewer, motivation: pkt.motivation, problemContext, carryoverSection });
   const walkthrough = assertKeyCodeWalkthrough(reviewBody, pkt.behaviorBearing);
   if (!walkthrough.pass) {
     console.error(`[NOT_VERIFIED] ${walkthrough.reason}`);
@@ -709,10 +796,10 @@ function main() {
     const packetPath = o.packetFile && fs.existsSync(o.packetFile)
       ? o.packetFile
       : path.join(os.tmpdir(), `loopx-pr-review-packet-${o.pr}.json`);
-    if (!fs.existsSync(packetPath)) fs.writeFileSync(packetPath, JSON.stringify(packet, null, 2));
+    if (!o.packetFile) fs.writeFileSync(packetPath, JSON.stringify(packet, null, 2));
 
     const evidence = Object.assign({}, (modelOut.evidence && typeof modelOut.evidence === 'object' ? modelOut.evidence : {}));
-    evidence.problem_context = buildProblemContextEvidence(pkt.motivation);
+    evidence.problem_context = problemContext;
     const resultPath = path.join(os.tmpdir(), `authentic-review-result-${o.pr}.json`);
     const buildResultFile = () => ({
       schema_version: 'pull_request_review_result_v1',
@@ -774,13 +861,6 @@ function main() {
       pr: o.pr, headOid, verdict, reviewBody, findings, reviewer,
       nativeCheck: check.parsed || null,
     });
-  }
-
-  // --- 7b. 将未闭环的 carryover findings 纳入评审报告（透明、不隐瞒）---
-  if (codeCarryover.length) {
-    const lines = codeCarryover.map((c, i) =>
-      `${i + 1}. [${c.finding.severity || 'blocker'}] \`${c.finding.file}\` — ${c.finding.summary} [${c.status}]`).join('\n');
-    reviewBody += `\n\n## 待闭环项 (Carryover)\n${lines}\n`;
   }
 
   // --- 9. 发布原生五段式评审报告到 PR ---
