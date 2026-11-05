@@ -152,6 +152,19 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 
 - **REQ-GATE-1** `check` 按顺序执行 `npm run typecheck`、`npm run lint`、`npm run build`、`npm run test`。前一个失败则不继续。
 - **REQ-QUALITY-1** 默认审查由 `skills/code-review/scripts/ingest-to-loopx-quality.js` 写入 LoopX `change-quality` 收据，并回写 `05-evidence.md`。`--with-ocr` 才调用阿里 OCR。OCR 不是默认阻断项。收据的 `validation` 必须来自实际门禁结果；没有 feature 且没有 `--goal-id` 时非 0，不写任何胶囊。
+- **REQ-ENV-1** `loopx-flow doctor` 必须前置暴露控制面路由问题：runtime root 与项目 `common_runtime_root`
+  不一致、`~/.loopx` 半迁移残留、registry 中缺失 `state_file` 的 goal、运行时工件仍被 Git 跟踪。
+  发现问题时给出“原因 / 影响 / 修复指令”，不因此阻断本地门禁，但必须可见。路由收敛只允许通过
+  `loopx migrate-local-state` 执行，不得手改 registry。写 registry 的测试必须用 `LOOPX_REGISTRY`
+  隔离到临时文件，禁止污染真实项目控制面。见 ADR-0007。
+- **REQ-ENV-2** GitHub API 预算以官方上限的 50% 作为安全基线：core REST 2500 req/h、
+  secondary 450 points/min、content-generating 40/min 与 250/h。`doctor` 通过
+  `gh api rate_limit` 展示当前额度并在低于基线时告警；评审管线必须遵守 head-oid 幂等、
+  comment upsert、合流窗口与 429/503 指数退避。见 ADR-0007。
+- **REQ-ENV-3** 运行时工件（`.codex/**`、`.loopx/**/*.lock`、`.loopx/goals/**`）不得进入 Git 跟踪面；
+  质量收据的 `reuse`/`simplification` 证据 refs 只能引用已提交 exact scope 文件并过滤运行时工件，
+  缺陷扫描范围仍覆盖工作区 diff（`REQ-QUALITY-2`）。见 ADR-0007。
+
 - **REQ-QUALITY-2** 质量扫描的范围是 `git merge-base origin/main HEAD` 或 LoopX scope base 到工作区的已提交+未提交 diff。高信号规则（`debugger`、硬编码密钥、关键路径 `|| true`、契约文件改动）为 blocker；不把“未声明变量”做成 diff 文本正则，交给 lint/类型检查。存在 blocker 时在 record 前非 0。
 - **REQ-GATE-DECISIONS-1** `gate verify decisions <feature>` 要求 `specs/features/<feature>/01-decisions.md`（或已归档副本）存在，且带有可识别的 `APPROVED` 状态行。
 

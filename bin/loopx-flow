@@ -52,11 +52,101 @@ usage() {
 USAGETXT
 }
 
+# 控制面一致性 + GitHub API 预算基线检查（环境治理，见 ADR-0007）
+# 只做「诊断 + 可执行修复指令」，不在此处硬阻断（doctor 是阶段 0 体检，不是交付门禁）。
+cmd_doctor_control_plane() {
+    local fail=0
+    echo -e "\n${BLUE}==> [2/3] 控制面一致性检查 (runtime route / registry / 运行时工件)...${NC}"
+
+    # 1. runtime root 路由与项目 registry 声明是否一致
+    local route_json runtime_root declared_root
+    route_json="$(loopx --format json status 2>/dev/null || echo '{}')"
+    runtime_root="$(node -e '
+const firstJson=(s)=>{let depth=0,inStr=false,esc=false;for(let i=0;i<s.length;i++){const c=s[i];if(inStr){if(esc){esc=false}else if(c==="\\"){esc=true}else if(c==="\""){inStr=false}continue}if(c==="\""){inStr=true;continue}if(c==="{"){depth++}else if(c==="}"){depth--;if(depth===0)return s.slice(0,i+1)}}return null};
+let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let out="";try{out=JSON.parse(d).runtime_root||""}catch(_){const j=firstJson(d);if(j){try{out=JSON.parse(j).runtime_root||""}catch(__){}}}process.stdout.write(out)})' <<< "$route_json")"
+    declared_root="$(node -e '
+const fs=require("fs");
+try{const r=JSON.parse(fs.readFileSync(".loopx/registry.json","utf8"));process.stdout.write(r.common_runtime_root||"")}catch(_){}
+' 2>/dev/null)"
+    if [[ -n "$runtime_root" && -n "$declared_root" && "$runtime_root" != "$declared_root" ]]; then
+        echo -e "${YELLOW}[WARN] runtime root 不一致: 生效=$runtime_root 项目声明=$declared_root${NC}"
+        echo -e "       🛠️ 修复: loopx bootstrap --project . --goal-id <goal> 重新同步，或统一 registry 的 common_runtime_root"
+        fail=1
+    elif [[ -n "$runtime_root" ]]; then
+        echo -e "${GREEN}[✓] runtime root 路由一致: $runtime_root${NC}"
+    fi
+
+    # 2. 目标路由 ~/.loopx 是否被半迁移残留占用（会阻塞 migrate-local-state）
+    if [[ -d "$HOME/.loopx" ]]; then
+        local residue_count
+        residue_count="$(find "$HOME/.loopx" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+        if [[ ! -f "$HOME/.loopx/registry.global.json" && "$residue_count" -gt 0 ]]; then
+            echo -e "${YELLOW}[WARN] ~/.loopx 存在半迁移残留（$residue_count 项，无 registry.global.json）→ 会阻塞 loopx migrate-local-state${NC}"
+            echo -e "       🛠️ 修复: 先备份后移除残留（示例）: mkdir -p ~/.loopx-backup && mv ~/.loopx/* ~/.loopx-backup/ && rmdir ~/.loopx"
+            fail=1
+        fi
+    fi
+
+    # 3. registry 中缺 state_file 的畸形 goal 记录
+    local bad_goals
+    bad_goals="$(node -e '
+const fs=require("fs"),os=require("os"),path=require("path");
+const files=[".loopx/registry.json",path.join(os.homedir(),".loopx","registry.global.json"),path.join(os.homedir(),".codex","loopx","registry.global.json")];
+const bad=[];
+for(const f of files){try{const d=JSON.parse(fs.readFileSync(f,"utf8"));for(const g of (d.goals||[])){if(g&&g.id&&!g.state_file)bad.push(f+"#"+g.id)}}catch(_){}}
+process.stdout.write([...new Set(bad)].join(" "))
+' 2>/dev/null)"
+    if [[ -n "$bad_goals" ]]; then
+        echo -e "${YELLOW}[WARN] registry 存在缺 state_file 的 goal（会阻塞迁移/审批）: $bad_goals${NC}"
+        echo -e "       🛠️ 修复: 补 state_file 指向 <project>/.codex/goals/<goal>/ACTIVE_GOAL_STATE.md，或 retire 该 goal"
+        fail=1
+    else
+        echo -e "${GREEN}[✓] registry goal 记录完整（state_file 无缺失）${NC}"
+    fi
+
+    # 4. 运行时工件不得进入 Git 跟踪面（会污染 exact scope / 收据证据）
+    local tracked_runtime
+    tracked_runtime="$(git ls-files 2>/dev/null | grep -E '(\.codex/|\.loopx/[^/]*\.lock$|\.loopx/.*\.lock$)' | head -5 || true)"
+    if [[ -n "$tracked_runtime" ]]; then
+        echo -e "${YELLOW}[WARN] 运行时工件仍被 Git 跟踪（会进入 exact scope）:${NC}"
+        echo "$tracked_runtime" | sed 's/^/         /'
+        echo -e "       🛠️ 修复: git rm --cached <path> 并确认 .gitignore 覆盖"
+        fail=1
+    else
+        echo -e "${GREEN}[✓] 运行时工件未被 Git 跟踪${NC}"
+    fi
+
+    echo -e "\n${BLUE}==> [3/3] GitHub API 预算基线检查 (官方上限 50% 安全基线)...${NC}"
+    if ! command -v gh >/dev/null 2>&1; then
+        echo -e "${YELLOW}[WARN] 未检测到 gh CLI，跳过 API 预算检查${NC}"
+        return "$fail"
+    fi
+    local rl core_limit core_remaining content_hint
+    rl="$(gh api rate_limit 2>/dev/null || echo '{}')"
+    core_limit="$(node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).resources.core.limit||0))}catch(_){}})' <<< "$rl")"
+    core_remaining="$(node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(String(JSON.parse(d).resources.core.remaining||0))}catch(_){}})' <<< "$rl")"
+    if [[ -z "$core_limit" || "$core_limit" == "0" ]]; then
+        echo -e "${YELLOW}[WARN] gh api rate_limit 不可用（令牌失效/网络），无法评估 API 预算${NC}"
+        return "$fail"
+    fi
+    local baseline=$(( core_limit / 2 ))
+    echo -e "    core REST: limit=${core_limit}/h  remaining=${core_remaining}  → 50% 安全基线=${baseline}/h"
+    echo -e "    secondary: ≤ 900 points/min（GET=1, POST/PATCH=5）、≤ 80 content/min、≤ 500 content/h"
+    echo -e "    → 安全基线建议: ${baseline} req/h、450 points/min、40 content/min、250 content/h"
+    if (( core_remaining < baseline )); then
+        echo -e "${YELLOW}[WARN] 当前剩余额度已低于 50% 基线（remaining=${core_remaining} < ${baseline}），请降低评审频次或等待窗口重置${NC}"
+        fail=1
+    else
+        echo -e "${GREEN}[✓] 当前额度高于 50% 安全基线${NC}"
+    fi
+    return "$fail"
+}
+
 cmd_doctor() {
-    echo -e "${BLUE}==> [1/2] 运行流水线前置哨兵体检 (Preflight Sentinel)...${NC}"
+    echo -e "${BLUE}==> [1/3] 运行流水线前置哨兵体检 (Preflight Sentinel)...${NC}"
     "$PROJECT_ROOT/scripts/preflight-check.sh"
 
-    echo -e "\n${BLUE}==> [2/2] 运行 LoopX 原生健康自检 (LoopX Doctor)...${NC}"
+    echo -e "\n${BLUE}==> [2/3] 运行 LoopX 原生健康自检 (LoopX Doctor)...${NC}"
     if command -v loopx >/dev/null 2>&1; then
         if ! loopx doctor; then
             echo -e "\n${RED}[-] [FAIL-CLOSED] LoopX 原生健康自检失败！${NC}" >&2
@@ -70,6 +160,11 @@ cmd_doctor() {
         echo -e "    影响: approve/check/merge/issue/integrate/todo 等承重命令将全部阻断。" >&2
         echo -e "🛠️ 修复指令: python3 -m pip install --upgrade loopx && loopx doctor" >&2
         exit 1
+    fi
+
+    # 环境治理：路由/registry 一致性 + API 预算基线（WARN 不阻断，但给出可执行修复指令）
+    if ! cmd_doctor_control_plane; then
+        echo -e "\n${YELLOW}[i] 控制面一致性检查存在告警：不影响本地门禁，但会影响 approve/check/迁移的稳定性。${NC}"
     fi
 }
 
@@ -1109,7 +1204,8 @@ cmd_gate() {
             local goal_id="${feature}-goal"
             local locked_sha=""
             local goal_found="false"
-            local reg_file="$PROJECT_ROOT/.loopx/registry.json"
+            # 允许测试/CI 用独立 registry 隔离（避免污染真实项目控制面状态，见 ADR-0007 INV-ENV-6）
+            local reg_file="${LOOPX_REGISTRY:-$PROJECT_ROOT/.loopx/registry.json}"
             if [[ ! -f "$reg_file" ]]; then
                 echo -e "${RED}[-] [FAIL-CLOSED] 本地注册表缺失 ($reg_file)，无法核验控制面契约锁定状态！${NC}" >&2
                 echo -e "💡 为什么阻断？契约标记为已冻结，但本地注册表未就绪，禁止绕过物理指纹核验。" >&2

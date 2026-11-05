@@ -100,6 +100,34 @@ function getScopeDiff(baseCommit) {
   }
 }
 
+// 运行时工件：LoopX/宿主私有状态与锁文件，永不作为收据 reuse 证据。
+// 收据只允许引用「本次交付已提交」的源码/文档文件，否则 loopx change-quality record
+// 会以 `reuse references unknown evidence: path:<x>` fail-closed（见 ADR-0007）。
+function isRuntimeArtifact(relPath) {
+  const posix = String(relPath || '').replace(/\\/g, '/');
+  if (!posix) return true;
+  if (/(^|\/)\.codex(\/|$)/.test(posix)) return true;
+  if (/(^|\/)\.loopx(\/|$)/.test(posix)) return true;
+  if (/\.lock$/.test(posix)) return true;
+  if (/(^|\/)\.DS_Store$/.test(posix)) return true;
+  if (/(^|\/)node_modules(\/|$)/.test(posix)) return true;
+  return false;
+}
+
+// 仅取「已提交」的 exact-scope 变更文件（origin/main...HEAD），并过滤运行时工件。
+// 与 getScopeDiff() 的差别：后者含工作区改动，会把锁文件/反向前进的分支基线算进证据。
+function committedScopeFiles(baseCommit) {
+  if (!baseCommit) return [];
+  try {
+    const out = execSync(`git diff --name-only ${baseCommit}...HEAD`, {
+      encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+    });
+    return out.split('\n').map((line) => line.trim()).filter(Boolean).filter((f) => !isRuntimeArtifact(f));
+  } catch (_) {
+    return [];
+  }
+}
+
 function scanDiffForDefects(diffText) {
   const defects = [];
   try {
@@ -226,9 +254,14 @@ function main() {
   const fallbackRefs = opts.feature
     ? [`path:specs/features/${opts.feature}/05-evidence.md`]
     : [`path:package.json`];
-  const groundedRefs = changedFiles.length > 0
-    ? changedFiles.slice(0, 3).map(f => `path:${f}`)
-    : fallbackRefs;
+  // 证据 refs 必须落在「已提交 exact scope」内；工作区 diff 里的运行时锁文件与
+  // 落后基线的反向改动都在此被过滤（否则 record 会 fail-closed）。
+  const committedFiles = scope && scope.baseCommit ? committedScopeFiles(scope.baseCommit) : [];
+  const groundedRefs = committedFiles.length > 0
+    ? committedFiles.slice(0, 3).map(f => `path:${f}`)
+    : (changedFiles.length > 0
+      ? changedFiles.map(f => String(f).trim()).filter(f => !isRuntimeArtifact(f)).slice(0, 3).map(f => `path:${f}`)
+      : fallbackRefs);
 
   const qualityResult = {
     schema_version: 'change_quality_agent_result_v2',
@@ -365,4 +398,6 @@ ${scope ? `- **LoopX Scope Fingerprint**: \`${scope.fingerprint}\`` : ''}
   console.log(`\n[PASSED] Code Review and LoopX Quality Ingestion 100% Passed.`);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { isRuntimeArtifact, committedScopeFiles };
