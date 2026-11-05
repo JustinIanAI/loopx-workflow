@@ -52,7 +52,7 @@ flowchart LR
 |---|---|---|---|
 | `doctor` | `cmd_doctor`、`cmd_doctor_control_plane` | 环境哨兵、`REQ-ENV-1`、`REQ-ENV-2` | preflight 失败、`loopx doctor` 失败、或本机没有 `loopx` 均非 0。诊断卡含原因/影响/修复命令。控制面路由/registry 一致性、`~/.loopx` 半迁移残留、运行时工件被跟踪、GitHub API 50% 预算基线为 WARN 级检查（见 ADR-0007） |
 | `init` | `cmd_init` | `REQ-MAIN-1` | 安装 pre-commit；有 `loopx` 时 `bootstrap` 失败则退出 |
-| `feature <name>` | `cmd_feature` | `REQ-FAILCLOSED-2`、`REQ-CAPSULE-1` | 分支创建或切换失败则退出，不写胶囊 |
+| `feature <name>` | `cmd_feature` | `REQ-FAILCLOSED-2`、`REQ-CAPSULE-1`、`REQ-GOAL-1` | 分支创建或切换失败则退出，不写胶囊；注册前把未注册 Goal 的残留 `ACTIVE_STATE.md` 隔离为 `.stale-<UTC>`，隔离失败非 0（ADR-0008） |
 | `approve contract <feature>` | `cmd_approve` | `REQ-CHECKPOINT-1` | 缺契约文件、缺 `loopx`、`configure-goal` 失败均非 0；先锁最终内容 SHA256，成功后才原子写入批准标记 |
 | `gate verify decisions\|contract` | `cmd_gate` | `REQ-GATE-DECISIONS-1`、`REQ-CONTRACT-LOCK-1` | 见第 5 节。没有 `pr` 这个 stage |
 | `check [feature] [--goal-id] [--with-ocr]` | `cmd_check` | `REQ-GATE-1`、`REQ-QUALITY-1`、`REQ-CHECK-IDENTITY-1`、`REQ-FAILCLOSED-1` | 无 feature 且无 `--goal-id` 则非 0；有胶囊时先 `gate verify contract`；四门禁后必须收据 `ok=true` 才打印成功 |
@@ -67,7 +67,7 @@ flowchart LR
 | `archive <feature>` | `cmd_archive` | 手动归档 | 有目录则移动。正常合入由 `merge` 移动 |
 | `status` | `cmd_status` | 观察 | 没有失败即停承诺 |
 
-`feature` 在分支成功后创建尚不存在的胶囊文件。它不代替阶段 1–4 的正文，也不检查正文是否引用了 `REQ-*`（`REQ-TRACE-2`）。
+`feature` 在分支成功后创建尚不存在的胶囊文件。它不代替阶段 1–4 的正文，也不检查正文是否引用了 `REQ-*`（`REQ-TRACE-2`）。状态文件的首次创建权属于 `loopx bootstrap`；编排器在注册前只能隔离未注册 Goal 的残留文件，不能预创建或改写（ADR-0008）。
 
 ### 3.1 环境治理与 API 预算前置检查 (ADR-0007)
 
@@ -229,6 +229,7 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | 无 `loopx` | `approve` | 非 0，且不写批准标记 |
 | `configure-goal` 失败 | `approve` | 非 0，契约保持未批准 |
 | `sync-global` 重试后仍失败 | `feature` / `approve` | 非 0 |
+| 未注册 Goal 的残留状态文件无法隔离 | `feature` | 非 0，不注册 Goal |
 | 质量扫描存在 blocker | `ingest` / `check` | record 前非 0 |
 | PR 已 MERGED 且仍有未完成步骤 | `merge` | 不重复合并，补步骤；全部完成才成功 |
 | `goal-lifecycle stop` 失败 | `merge` | 非 0；GitHub squash 可能已完成 |

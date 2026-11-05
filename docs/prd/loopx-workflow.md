@@ -177,7 +177,7 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 #### 控制面边界
 
 - **REQ-NATIVE-1** `todo claim` / `todo done` 的租约、`issue` 的 `route`、`integrate` 的 sync/status，以 LoopX 输出为准。编排器不在这三个结果上做第二套判断。
-- **REQ-GOAL-1** 新特性的 LoopX 状态文件放在该特性胶囊内。`merge` 以可观测状态做幂等：已 `MERGED` 时跳过合并与 readiness，只补未完成步骤；stop/retire 的“已执行”识别为成功；stop/retire/sync/archive 任一失败非 0，并打印“已合入、未闭环”与重跑命令；只有全部步骤完成才打印完成。合入后刷新本地 base 分支并提交/推送 archive 移动，push 失败同样非 0。
+- **REQ-GOAL-1** 新特性的 LoopX 状态文件放在该特性胶囊内。`merge` 以可观测状态做幂等：已 `MERGED` 时跳过合并与 readiness，只补未完成步骤；stop/retire 的“已执行”识别为成功；stop/retire/sync/archive 任一失败非 0，并打印“已合入、未闭环”与重跑命令；只有全部步骤完成才打印完成。合入后刷新本地 base 分支并提交/推送 archive 移动，push 失败同样非 0。 状态文件的首次创建只允许由 `loopx bootstrap` 权威执行；注册前若 Goal 未注册但状态文件已存在（旧版预创建残留），`feature` 必须将其隔离为 `ACTIVE_STATE.md.stale-<UTC>` 并保留原内容后再 bootstrap；隔离失败非 0，禁止静默删除或伪造 frontmatter。见 ADR-0008。
 
 #### 明确不在本基线里的行为
 

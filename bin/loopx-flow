@@ -200,6 +200,50 @@ sync_global_required() {
     return 1
 }
 
+# 读取项目 registry 路径：允许 LOOPX_REGISTRY 覆盖，与 ADR-0007 的测试隔离口径一致。
+flow_registry_path() {
+    if [[ -n "${LOOPX_REGISTRY:-}" ]]; then
+        printf '%s' "$LOOPX_REGISTRY"
+    else
+        printf '%s' "$PROJECT_ROOT/.loopx/registry.json"
+    fi
+}
+
+# 判断 Goal 是否已在项目 registry 中注册。
+# 仅用于区分「已注册 Goal 的权威状态文件」与「旧版编排器残留的裸状态文件」。
+goal_is_registered() {
+    local goal_id="$1" registry
+    registry="$(flow_registry_path)"
+    [[ -f "$registry" ]] || return 1
+    node -e '
+const fs = require("fs");
+try {
+  const reg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const goals = Array.isArray(reg.goals) ? reg.goals : [];
+  process.exit(goals.some((g) => g && g.id === process.argv[2]) ? 0 : 1);
+} catch (_) { process.exit(1); }
+' "$registry" "$goal_id"
+}
+
+# 隔离未注册 Goal 的残留状态文件（旧版 loopx-flow 预创建后 bootstrap 失败留下的裸文件）。
+# 不删除用户数据：改名为 *.stale-<UTC 时间戳>，随后由 loopx bootstrap 权威重建 canonical 状态。
+quarantine_stale_state_file() {
+    local state_file="$1"
+    local stamp backup
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="${state_file}.stale-${stamp}"
+    if [[ -e "$PROJECT_ROOT/$backup" ]]; then
+        backup="${backup}-$$"
+    fi
+    if ! mv "$PROJECT_ROOT/$state_file" "$PROJECT_ROOT/$backup"; then
+        return 1
+    fi
+    echo -e "${YELLOW}[!] 检测到未注册 Goal 的残留状态文件，已隔离为: ${backup}${NC}" >&2
+    echo -e "    原因: LoopX 2.0 只允许 loopx bootstrap 权威创建 state_file；旧版编排器预创建的裸文件会让新 Goal 触发 canonical_authority_required。" >&2
+    echo -e "    旧内容已保留，可人工 diff 核查；确认无用后删除该 .stale-* 备份即可。" >&2
+    return 0
+}
+
 cmd_feature() {
     local feature="${1:-}"
     if [[ -z "$feature" ]]; then
@@ -327,6 +371,16 @@ EVIEEOF
     local state_file="specs/features/$feature/ACTIVE_STATE.md"
 
     if command -v loopx >/dev/null 2>&1; then
+        # 旧版 loopx-flow 曾在 bootstrap 前裸写 ACTIVE_STATE.md，该预创建逻辑已移除(issue #17)；
+        # 但受影响环境的残留文件仍会让新 Goal 持续触发 canonical_authority_required。
+        # 因此注册前必须先隔离「未注册 Goal」的残留状态文件，再交给 bootstrap 权威初始化(issue #7)。
+        if [[ -f "$PROJECT_ROOT/$state_file" ]] && ! goal_is_registered "$goal_id"; then
+            if ! quarantine_stale_state_file "$state_file"; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 无法隔离残留状态文件 $state_file，流程已阻断！${NC}" >&2
+                echo -e "🛠️ 修复指令: 检查文件权限后重试，或将 specs/features/$feature/ACTIVE_STATE.md 移出胶囊目录后再执行。" >&2
+                exit 1
+            fi
+        fi
         # LoopX 2.0 只有在 --state-file 不存在时才会创建 canonical authority；
         # 因此这里严禁在 bootstrap 前预创建 ACTIVE_STATE.md（issue #17）。
         if ! loopx $REGISTRY_FLAG bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" --state-file "specs/features/$feature/ACTIVE_STATE.md"; then
