@@ -14,6 +14,21 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync, spawnSync } = require('child_process');
 
+// 项目本地临时沙箱：临时工件必须写入项目内已 gitignore 的 .loopx/tmp/，
+// 禁止硬编码系统 /tmp 固定文件名（多 Agent/多进程会互相覆写、重启或清理后证据丢失、
+// macOS /private/tmp 与 Windows %TEMP% 不可移植）。LOOPX_TMP_DIR 可覆盖该目录（CI/隔离测试）。
+function resolveTmpDir() {
+  const override = process.env.LOOPX_TMP_DIR;
+  return override ? path.resolve(override) : path.join(process.cwd(), '.loopx/tmp');
+}
+
+// 唯一临时工件路径：<tmpDir>/<prefix>-<pid>-<rand>.json，保证并行进程零覆写。
+function allocateTempArtifactPath(prefix = 'change-quality-agent-result', ext = 'json') {
+  const tmpDir = resolveTmpDir();
+  fs.mkdirSync(tmpDir, { recursive: true });
+  return path.join(tmpDir, `${prefix}-${process.pid}-${crypto.randomBytes(6).toString('hex')}.${ext}`);
+}
+
 function parseArgs() {
   const args = process.argv.slice(2);
   const options = {
@@ -289,7 +304,12 @@ function main() {
     qualityResult.scope_fingerprint = scope.fingerprint;
   }
 
-  const tempResultPath = '/tmp/change-quality-agent-result.json';
+  const tempResultPath = allocateTempArtifactPath();
+  // 注意：process.exit() 不会展开 finally 块，因此用 exit 钩子保证沙箱临时工件
+  // 在成功/失败/异常等所有退出路径上都被清理（record/verify 期间文件必须存活）。
+  process.on('exit', () => {
+    try { fs.rmSync(tempResultPath, { force: true }); } catch (_) {}
+  });
   fs.writeFileSync(tempResultPath, JSON.stringify(qualityResult, null, 2));
   console.log(`[✓] Generated standardized quality payload: ${tempResultPath}`);
 
@@ -400,4 +420,4 @@ ${scope ? `- **LoopX Scope Fingerprint**: \`${scope.fingerprint}\`` : ''}
 
 if (require.main === module) main();
 
-module.exports = { isRuntimeArtifact, committedScopeFiles };
+module.exports = { isRuntimeArtifact, committedScopeFiles, allocateTempArtifactPath };

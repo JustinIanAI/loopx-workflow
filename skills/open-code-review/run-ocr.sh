@@ -10,7 +10,14 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 BASE_REF="${1:-origin/main}"
 FEATURE="${2:-}"
-OUTPUT_JSON="/tmp/ocr-audit-report.json"
+
+# 项目本地临时沙箱（issue #8）：临时工件禁止硬编码系统 /tmp 固定文件名；
+# 默认写入项目内已 gitignore 的 .loopx/tmp/，文件名带 PID 保证多进程零覆写。
+# LOOPX_TMP_DIR 可覆盖沙箱目录（CI/隔离测试）。
+LOOPX_TMP_DIR="${LOOPX_TMP_DIR:-$PROJECT_ROOT/.loopx/tmp}"
+mkdir -p "$LOOPX_TMP_DIR"
+OUTPUT_JSON="$LOOPX_TMP_DIR/ocr-audit-report-$$.json"
+trap 'rm -f "$OUTPUT_JSON"' EXIT
 
 echo "==> [OCR 选配闭环] [1/3] 执行环境自检 (Self-Check)..."
 export PATH="$PATH:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin"

@@ -5,6 +5,17 @@
 # ==============================================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# 项目本地临时沙箱（issue #8）：push stderr 日志禁止硬编码系统 /tmp 固定文件名，
+# 否则多 Agent/多进程互相覆写。默认写入已 gitignore 的 .loopx/tmp/，mktemp 保证唯一，
+# trap 在任意退出路径清理。CI/隔离测试可用 LOOPX_TMP_DIR 覆盖沙箱目录。
+LOOPX_TMP_DIR="${LOOPX_TMP_DIR:-$PROJECT_ROOT/.loopx/tmp}"
+mkdir -p "$LOOPX_TMP_DIR"
+PUSH_ERR_LOG="$(mktemp "$LOOPX_TMP_DIR/git-push-err-XXXXXX.log")"
+trap 'rm -f "$PUSH_ERR_LOG"' EXIT
+
 ISSUE_ID="${1:-}"
 COMMIT_MSG="${2:-}"
 
@@ -29,7 +40,7 @@ git commit -m "$COMMIT_MSG"
 
 # 2. 尝试直推 main
 echo "==> [Fast-Path] 尝试推送主干 origin/main..."
-if git push origin main 2>/tmp/git-push-err.log; then
+if git push origin main 2>"$PUSH_ERR_LOG"; then
     echo "[✓] 直推成功！已合入主干，GitHub 将通过 commit 消息自动核销 Issue #${ISSUE_ID}。"
     # 调用 LoopX 审计归档
     if command -v loopx >/dev/null 2>&1; then
@@ -44,7 +55,7 @@ if git push origin main 2>/tmp/git-push-err.log; then
 fi
 
 # 3. 直推失败，触发自适应降级逻辑
-PUSH_ERR=$(cat /tmp/git-push-err.log || true)
+PUSH_ERR=$(cat "$PUSH_ERR_LOG" || true)
 echo "[!] 直推 main 失败 (可能命中分支保护或权限限制):"
 echo "    $PUSH_ERR"
 echo "==> [自适应降级] 自动切换至专用 PR 快速合并通道..."

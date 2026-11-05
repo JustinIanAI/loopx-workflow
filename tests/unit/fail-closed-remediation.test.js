@@ -157,7 +157,14 @@ exit 0
   } finally { cleanupCapsule(feature); }
 });
 
-test('7. approve passes --registry to configure-goal', () => {
+const PROJECT_REGISTRY = path.join(PROJECT_ROOT, '.loopx/registry.json');
+// 隔离 worktree / fresh clone 尚未 bootstrap 出控制面 registry 时，REGISTRY_FLAG 为空；
+// 该用例依赖真实 registry 存在，显式前置跳过而不是在环境缺失下假失败（issue #8 可移植性）。
+const REGISTRY_PRECONDITION = fs.existsSync(PROJECT_REGISTRY)
+  ? false
+  : '项目未 bootstrap 出 .loopx/registry.json（隔离 worktree / fresh clone）';
+
+test('7. approve passes --registry to configure-goal', { skip: REGISTRY_PRECONDITION }, () => {
   const feature = 'fc-approve-registry';
   makeCapsule(feature);
   resetMock();
@@ -172,9 +179,10 @@ test('7. approve passes --registry to configure-goal', () => {
 });
 
 test('8. approve feature name cannot inject shell through cleanup trap', () => {
-  const feature = "fc-trap'inject; touch /tmp/loopx-pwn; '";
-  const payload = '/tmp/loopx-pwn';
-  try { fs.unlinkSync(payload); } catch (_) {}
+  // issue #8：注入 canary 隔离在 os.tmpdir()+mkdtemp，禁止共享 /tmp 固定文件名。
+  const pwnDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-pwn-'));
+  const payload = path.join(pwnDir, 'pwned');
+  const feature = `fc-trap'inject; touch ${payload}; '`;
   makeCapsule(feature);
   resetMock();
   writeScript('loopx', '#!/usr/bin/env bash\nexit 0\n');
@@ -184,6 +192,8 @@ test('8. approve feature name cannot inject shell through cleanup trap', () => {
     assert.strictEqual(fs.existsSync(payload), false, 'trap must not execute injected shell');
   } finally {
     cleanupCapsule(feature);
-    try { fs.unlinkSync(payload); } catch (_) {}
+    // feature 内嵌绝对 payload 路径会形成嵌套目录，需连顶层注入片段一起清理。
+    fs.rmSync(path.join(PROJECT_ROOT, 'specs/features', feature.split('/')[0]), { recursive: true, force: true });
+    fs.rmSync(pwnDir, { recursive: true, force: true });
   }
 });
