@@ -498,3 +498,18 @@ describe('R3 agent policy and model declaration', () => {
     assert.ok(calls.includes('delivery / long_horizon / user_experience'));
   });
 });
+
+describe('R3 carryover integrity', () => {
+  test('fixed/obsolete without evidence -> NOT_VERIFIED', () => {
+    const f = path.join(os.tmpdir(), 'codex-carry-noev-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', findings: [], carryover: [
+      { finding_index: 1, status: 'fixed', evidence: '' },
+    ] }));
+    const sbx = makeSandbox({ codexStdoutFile: f, verdict: 'approve' });
+    const carry = path.join(sbx.dir, 'carryover.json');
+    fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/a.js', severity: 'P1', summary: 'still here' }] }));
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
+    assert.notStrictEqual(r.code, 0);
+    assert.ok(r.out.includes('NOT_VERIFIED') || r.out.includes('carryover status'));
+  });
+});

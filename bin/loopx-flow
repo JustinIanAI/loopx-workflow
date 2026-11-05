@@ -316,7 +316,13 @@ cmd_approve() {
     # 这样 configure-goal 失败或进程被强杀时，原契约不会出现虚假 APPROVED。
     local temp_contract
     temp_contract="$(mktemp "${contract_file}.tmp.XXXXXX")"
-    trap "rm -f '$temp_contract'" EXIT INT TERM
+    APPROVE_TEMP_CONTRACT="$temp_contract"
+    cleanup_approve_temp_contract() {
+        if [[ -n "${APPROVE_TEMP_CONTRACT:-}" ]]; then
+            rm -f -- "$APPROVE_TEMP_CONTRACT"
+        fi
+    }
+    trap cleanup_approve_temp_contract EXIT INT TERM
     node -e '
 const fs = require("fs");
 const src = process.argv[1];
@@ -356,6 +362,7 @@ fs.writeFileSync(dst, text);
 
     # 3. 物理锁定成功后才原子替换契约文件。
     mv "$temp_contract" "$contract_file"
+    APPROVE_TEMP_CONTRACT=""
     trap - EXIT INT TERM
 
     # 4. 更新决策与 INDEX 标记（仅文档，不参与契约 SHA）。

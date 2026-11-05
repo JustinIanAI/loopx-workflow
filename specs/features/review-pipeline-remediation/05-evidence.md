@@ -3,9 +3,9 @@
 ## 1. LoopX 质量凭据 (Change Quality Receipt)
 - **Status**: `PASSING (Strict Mode Verified)`
 - **Review Engine**: `Default Semantic Review`
-- **Diff SHA256 (scan scope)**: `0b6cf77985e758cf1799e7a3ee8399fc5ab4ee0855d826d95d703547a1ab2797`
+- **Diff SHA256 (scan scope)**: `783453cbda639cc7092ea8afcdd4c98a46b644f60969ec2175153bbacc3f9a34`
 - **Receipt Chain**: `Fail-Closed (prepare -> record -> verify, gate re-verified in check [3/3])`
-- **LoopX Scope Fingerprint**: `78887cd977aaed0665864d1f85d576493f6cef9b3c5e5def96450fa1dc221a50`
+- **LoopX Scope Fingerprint**: `1effb9483ceee8601d65284d107cc2e82e1dcf9b6edef8fd7fd263a18b890e71`
 
 ## 2. 代码审查结论 (Code Review Insights)
 - **Reviewer**: `Default Semantic Review`
