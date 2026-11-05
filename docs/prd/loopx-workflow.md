@@ -155,7 +155,8 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 - **REQ-ENV-1** `loopx-flow doctor` 必须前置暴露控制面路由问题：runtime root 与项目 `common_runtime_root`
   不一致、`~/.loopx` 半迁移残留、registry 中缺失 `state_file` 的 goal、运行时工件仍被 Git 跟踪。
   发现问题时给出“原因 / 影响 / 修复指令”，不因此阻断本地门禁，但必须可见。路由收敛只允许通过
-  `loopx migrate-local-state` 执行，不得手改 registry。见 ADR-0007。
+  `loopx migrate-local-state` 执行，不得手改 registry。写 registry 的测试必须用 `LOOPX_REGISTRY`
+  隔离到临时文件，禁止污染真实项目控制面。见 ADR-0007。
 - **REQ-ENV-2** GitHub API 预算以官方上限的 50% 作为安全基线：core REST 2500 req/h、
   secondary 450 points/min、content-generating 40/min 与 250/h。`doctor` 通过
   `gh api rate_limit` 展示当前额度并在低于基线时告警；评审管线必须遵守 head-oid 幂等、

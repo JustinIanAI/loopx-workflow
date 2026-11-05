@@ -44,6 +44,17 @@
   半迁移残留、缺 `state_file`、运行时工件跟踪四类检查；API 预算以 `core_limit / 2` 为基线；
   缺 `gh`/`loopx` 时降级 WARN（INV-ENV-4/5）。
 
+## INV-ENV-6：测试不再污染真实 registry
+
+- 根因：`tests/unit/guard.test.js` 直接写真实 `.loopx/registry.json` 并造出无 `state_file` 的
+  `hard-guard-goal`，该 orphan 记录使 `loopx migrate-local-state` 以
+  `goal hard-guard-goal has no state_file` 失败。
+- 修复：`cmd_gate` 读取 `${LOOPX_REGISTRY:-<project>/.loopx/registry.json}`；guard 测试改为写
+  临时 registry（`mkdtemp` + `LOOPX_REGISTRY`），并附带 `state_file`。
+- 回归：新增 `env-governance.test.js` 用例「项目 registry 中不存在缺 state_file 的 goal」；
+  实测跑完 guard 测试后 `.loopx/registry.json` 的 md5 不变。
+- 一次性清理：删除历史 orphan `hard-guard-goal` 条目（备份于 `/tmp/registry.json.bak-*`）。
+
 ## doctor 实跑结果（本机，2026-11-05）
 
 ```

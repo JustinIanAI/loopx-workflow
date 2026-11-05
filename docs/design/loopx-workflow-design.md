@@ -79,9 +79,12 @@ flowchart LR
 2. **迁移可行性**：`~/.loopx` 若存在半迁移残留（有内容但无 `registry.global.json`）则告警，
    因为 `loopx migrate-local-state` 会以 `target runtime root already exists` 失败；
    registry 中缺 `state_file` 的 goal 单独列出（迁移校验会拒绝）。
-3. **运行时工件隔离**：`git ls-files` 中不得出现 `.codex/` 或 `.loopx/**/*.lock`；
+3. **测试隔离**：写 registry 的测试必须用 `LOOPX_REGISTRY` 指向临时 registry；
+   `cmd_gate` 指纹核验读 `${LOOPX_REGISTRY:-<project>/.loopx/registry.json}`，真实 registry 不得被造出
+   缺 `state_file` 的 orphan goal（会阻塞迁移）。
+4. **运行时工件隔离**：`git ls-files` 中不得出现 `.codex/` 或 `.loopx/**/*.lock`；
    出现则提示 `git rm --cached` 并确认 `.gitignore`（收据证据污染源，见 `REQ-ENV-3`）。
-4. **API 预算**：`gh api rate_limit` 展示 core limit/remaining 与 50% 基线对比；
+5. **API 预算**：`gh api rate_limit` 展示 core limit/remaining 与 50% 基线对比；
    固定打印 secondary 与 content-generating 的官方上限和基线值。
 
 收据证据 refs 只取已提交 scope：`ingest-to-loopx-quality.js` 的 `committedScopeFiles(baseCommit)`

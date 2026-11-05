@@ -39,6 +39,9 @@
 ### 2. 运行时工件与 Git / 收据隔离（`REQ-ENV-3`）
 
 - `.codex/**`、`.loopx/**/*.lock`、`.loopx/goals/**` 一律不入 Git（`git rm --cached` + `.gitignore`）。
+- **测试不得污染真实控制面**：任何写 registry 的测试必须通过 `LOOPX_REGISTRY` 指向临时 registry；
+  `cmd_gate` 的指纹核验读取 `${LOOPX_REGISTRY:-<project>/.loopx/registry.json}`。
+  否则测试会造出缺 `state_file` 的 orphan goal，直接阻塞 `loopx migrate-local-state`（本项目实际发生过）。
 - 收据 `reuse` / `simplification` 的 `evidence_refs` 只允许取
   **已提交 exact scope**（`git diff --name-only <base>...HEAD`）并过滤运行时工件；
   缺陷扫描仍保留工作区 diff（`REQ-QUALITY-2` 不变），二者职责分离。

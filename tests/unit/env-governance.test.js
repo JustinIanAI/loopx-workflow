@@ -129,3 +129,17 @@ describe('doctor 控制面与 API 预算检查契约（REQ-ENV-1/2）', () => {
     assert.match(script, /无法评估 API 预算/);
   });
 });
+
+describe('真实项目 registry 完整性（INV-ENV-6：测试不得污染控制面）', () => {
+  test('项目 registry 中不存在缺 state_file 的 goal 记录', () => {
+    const regPath = path.join(PROJECT_ROOT, '.loopx/registry.json');
+    if (!fs.existsSync(regPath)) return; // 未 bootstrap 的干净仓库
+    const reg = JSON.parse(fs.readFileSync(regPath, 'utf8'));
+    const bad = (reg.goals || [])
+      .filter((g) => g && g.id && !g.state_file)
+      .map((g) => g.id);
+    assert.deepStrictEqual(bad, [],
+      `registry 存在缺 state_file 的 orphan goal（会阻塞 loopx migrate-local-state；` +
+      `测试必须用 LOOPX_REGISTRY 隔离）：${bad.join(', ')}`);
+  });
+});

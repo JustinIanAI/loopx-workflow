@@ -1159,7 +1159,8 @@ cmd_gate() {
             local goal_id="${feature}-goal"
             local locked_sha=""
             local goal_found="false"
-            local reg_file="$PROJECT_ROOT/.loopx/registry.json"
+            # 允许测试/CI 用独立 registry 隔离（避免污染真实项目控制面状态，见 ADR-0007 INV-ENV-6）
+            local reg_file="${LOOPX_REGISTRY:-$PROJECT_ROOT/.loopx/registry.json}"
             if [[ ! -f "$reg_file" ]]; then
                 echo -e "${RED}[-] [FAIL-CLOSED] 本地注册表缺失 ($reg_file)，无法核验控制面契约锁定状态！${NC}" >&2
                 echo -e "💡 为什么阻断？契约标记为已冻结，但本地注册表未就绪，禁止绕过物理指纹核验。" >&2

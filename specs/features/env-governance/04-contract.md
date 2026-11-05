@@ -36,6 +36,9 @@ declare function cmd_doctor_control_plane(): number;
 - INV-ENV-2: `committedScopeFiles()` 只读取已提交范围（`...HEAD`），不得包含工作区未提交文件。
 - INV-ENV-3: 仓库 `git ls-files` 中不得出现 `.codex/` 或 `.loopx/**/*.lock`。
 - INV-ENV-4: `doctor` 的控制面检查缺失 `loopx` / `gh` 时必须降级为 WARN 并继续，不得因环境缺失崩溃。
+- INV-ENV-6: 写 registry 的测试必须用 `LOOPX_REGISTRY` 隔离；`cmd_gate` 必须读
+  `${LOOPX_REGISTRY:-<project>/.loopx/registry.json}`；真实项目 registry 中不得存在缺 `state_file`
+  的 goal 记录（该状态会阻塞 `loopx migrate-local-state`）。
 - INV-ENV-5: API 预算基线固定为官方上限的 50%（core 2500/h、points 450/min、
   content 40/min 与 250/h），代码中不得写死成 100%。
 
