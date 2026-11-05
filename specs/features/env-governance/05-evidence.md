@@ -3,9 +3,9 @@
 ## 1. LoopX 质量凭据 (Change Quality Receipt)
 - **Status**: `PASSING (Strict Mode Verified)`
 - **Review Engine**: `Default Semantic Review`
-- **Diff SHA256 (scan scope)**: `9719e7712cd29a6e975f5a416faf58ee30f0779437f765142bc2d317732e791a`
+- **Diff SHA256 (scan scope)**: `abcbe37bf359fa61ae128105d2d47b0687f5c4f0a596d84cf7549daf05975c44`
 - **Receipt Chain**: `Fail-Closed (prepare -> record -> verify, gate re-verified in check [3/3])`
-- **LoopX Scope Fingerprint**: `0310f496baad07f8061ef6b1e9fea9c1a100a4aa72e40b21feafe96178542b04`
+- **LoopX Scope Fingerprint**: `e2b5b3f6740394e2c704ba7a032159aef3b1c6508687342ad691b3f6cf8566d7`
 
 ## 2. 代码审查结论 (Code Review Insights)
 - **Reviewer**: `Default Semantic Review`
@@ -23,26 +23,22 @@
 
 ---
 
-## 附录 A：实现方实测与 API 频次基线（人工核对口径）
+## B 阶段：控制面迁移到 ~/.loopx（已执行）
 
-| 门禁 | 命令 | 结果 |
-|------|------|------|
-| Typecheck | `npm run typecheck` | PASS |
-| Lint | `npm run lint` | PASS |
-| Build | `npm run build` | PASS |
-| Test | `npm run test` | PASS（**89/89**，15 suites；新增 `env-governance.test.js` 11 个子用例已纳入门禁清单） |
-
-## 新增测试（tests/unit/env-governance.test.js，11/11）
-
-- `isRuntimeArtifact()`：`.codex/**`、`.loopx/**`、`*.lock`、`node_modules/**`、`.DS_Store` 判为运行时工件；
-  源码/文档/配置判为非工件；反斜杠路径归一化。
-- `committedScopeFiles()`：只返回 `git diff --name-only <base>...HEAD` 的已提交文件；
-  不含工作区专属改动（INV-ENV-2）；非法 baseCommit 安全返回 `[]`。
-- 运行时工件隔离：`.gitignore` 覆盖 `.loopx/**/*.lock`、`.loopx/goals/`、`.codex/`；
-  `git ls-files` 无 `.codex/`、无 `.loopx` 锁文件（INV-ENV-3）。
-- doctor 契约：`cmd_doctor_control_plane` 定义并被 `cmd_doctor` 调用；含 route 一致性、
-  半迁移残留、缺 `state_file`、运行时工件跟踪四类检查；API 预算以 `core_limit / 2` 为基线；
-  缺 `gh`/`loopx` 时降级 WARN（INV-ENV-4/5）。
+- 预演 plan_id：`3f1aff52a97c3f84cff627673a44f36ab8dbba11dbca2d129ca6685676a88909`
+- 执行结果：`status: migrated`，source `~/.codex/loopx` → target `~/.loopx`，
+  projects=3、Goal directories=17，备份 `~/.codex/loopx-local-state-backups/3f1aff52a97c3f84`
+- 迁移前一次性修复（均已备份，记录于 `/tmp/registry.project.*.json`、`/tmp/registry.global.*.json`）：
+  1. 移除 `~/.loopx` 半迁移残留（备份至 `~/.loopx-backup-20261105-145953`）
+  2. 清理项目 registry 中 9 条 stale goal 登记（state_file 已随胶囊归档/删除）
+  3. 清理全局 registry 中对应 9 条登记（`retire-global-goal` 因 live state_file 拒绝，改为备份后移除）
+  4. 归档 `e2e-pipeline-demo-goal` 运行时目录（`loopx archive-runtime --allow-registered --execute`）
+- 迁移后校验：
+  - `loopx status` → `runtime_root: /Users/freecisco_yan/.loopx`
+  - 项目 `.loopx/registry.json` → `common_runtime_root: /Users/freecisco_yan/.loopx`
+  - `loopx-flow doctor` 控制面段 **三绿无告警**
+  - `loopx-flow gate verify contract env-governance` 重新审批后通过
+  - `loopx-flow check env-governance` 3/3 收据 `ok=true`，收据文件落在 `~/.loopx/goals/...`
 
 ## INV-ENV-6：测试不再污染真实 registry
 
