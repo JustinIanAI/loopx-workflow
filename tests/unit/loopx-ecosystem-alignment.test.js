@@ -100,7 +100,7 @@ test("10. Native Formatting & Verdict Visibility: review report is driven by Loo
 
 test("11. Carryover Isolation: authentic-review filters out review script from code carryover", () => {
   const scriptContent = fs.readFileSync(AUTHENTIC_REVIEW_SCRIPT, "utf8");
-  assert.strictEqual(scriptContent.includes("!c.finding.file.includes('authentic-review.js')"), true, "Must isolate authentic-review.js toolchain checks from code carryover");
+  assert.strictEqual(scriptContent.includes("!String(f.file || '').includes('authentic-review.js')"), true, "Must isolate authentic-review.js toolchain checks from code carryover");
 });
 
 test("12. Multi-Severity Native Response: respond-report recognizes P0-P3 severities from native review artifacts", () => {
