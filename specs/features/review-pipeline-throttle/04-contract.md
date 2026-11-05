@@ -1,6 +1,6 @@
 # Review Pipeline Throttle 契约（阶段 4 · 断点 1）
 
-Contract-Status: DRAFT → PENDING-APPROVAL (check 门禁实测已全绿；收据回写受 LoopX 控制面锁环境阻断，见 05-evidence.md)
+- **Contract-Status**: FROZEN & APPROVED BY freecisco_yan@2026-11-05 14:39:52
 
 ## 目标
 

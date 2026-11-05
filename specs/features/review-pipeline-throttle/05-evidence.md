@@ -76,3 +76,29 @@
 - `tests/unit/review-pipeline-throttle.test.js`：7 个子用例（新增）
 - `package.json`：`test:unit` 纳入新测试文件（用例只增不减）
 - `specs/features/review-pipeline-throttle/{01-decisions,04-contract,05-evidence}.md`
+
+## 断点 1 审批与 check 实测（2026-11-05）
+
+- 契约冻结指纹（`sha256`）：`a46a85b8d8eb4af0b9dd7a45220ededd0c6baeb98d58bdbd0402ab8ffaacc61d`
+- `loopx-flow approve contract review-pipeline-throttle`：**通过**（Contract-Status: FROZEN & APPROVED）
+- `loopx-flow check review-pipeline-throttle`：
+  - `[1/3]` 四大硬门禁：**全绿**（96/96 tests，17 suites）
+  - `[2/3]` 语义契约审查 + LoopX Quality 适配器：**通过**（0 blocker，evidence 已回写）
+  - `[3/3]` `loopx change-quality record`：**BLOCKED** —
+    `reuse references unknown evidence: path:AGENTS.md`
+
+### 3/3 阻断根因（属环境治理范畴）
+
+`skills/code-review/scripts/ingest-to-loopx-quality.js` 用 `git diff <base_commit>`（含**工作区**改动）
+取证据文件列表，因此把两类非本 PR 提交面内容写进 `reuse/simplification.evidence_refs`：
+
+1. `.loopx/registry.json.lock` —— LoopX 运行时锁文件，被 Git 跟踪且每次 loopx 调用都会改动；
+2. `AGENTS.md` —— 分支落后于 `origin/main` 的仓库迁移提交，形成反向 diff。
+
+`loopx change-quality record` 要求 reuse 证据必须落在本次 exact scope 内，故 fail-closed。
+修复归属 **环境治理 PR**：① 停止跟踪 `.loopx/registry.json.lock` 并加入 `.gitignore`；
+② evidence refs 仅取 `origin/main...HEAD` 的**已提交**文件并过滤运行时工件；
+③ `loopx-flow doctor` 增加路由/状态一致性前置校验。
+
+> 注意：`ingest` 在 record 失败前已写入带 “PASSING” 字样的自动段落，属乐观写入；
+> 本文件已恢复为实测口径（record 未通过），避免凭据夸大。
