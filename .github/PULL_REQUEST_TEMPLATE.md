@@ -25,7 +25,7 @@ Fixes #<!-- 可选：关联的 GitHub Issue 编号，例如 Fixes #123 -->
 ## L1 代码级审查凭据 (L1 Review Evidence)
 - **审查工具**：`code-review` 技能 (默认) / `./scripts/run-ocr-audit.sh` (高危提升)
 - **审查结论**：`0 Actionable Defects`
-- **证据文件**：`/tmp/l1-review-evidence.md`
+- **证据文件**：`specs/features/<feature>/05-evidence.md`（已合入归档到 `specs/archive/<feature>/`；严禁落在系统 `/tmp`）
 
 ---
 
