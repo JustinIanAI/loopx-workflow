@@ -411,6 +411,13 @@ cmd_approve() {
     # 这样 configure-goal 失败或进程被强杀时，原契约不会出现虚假 APPROVED。
     local temp_contract
     temp_contract="$(mktemp "${contract_file}.tmp.XXXXXX")"
+    APPROVE_TEMP_CONTRACT="$temp_contract"
+    cleanup_approve_temp_contract() {
+        if [[ -n "${APPROVE_TEMP_CONTRACT:-}" ]]; then
+            rm -f -- "$APPROVE_TEMP_CONTRACT"
+        fi
+    }
+    trap cleanup_approve_temp_contract EXIT INT TERM
     node -e '
 const fs = require("fs");
 const src = process.argv[1];
@@ -450,6 +457,8 @@ fs.writeFileSync(dst, text);
 
     # 3. 物理锁定成功后才原子替换契约文件。
     mv "$temp_contract" "$contract_file"
+    APPROVE_TEMP_CONTRACT=""
+    trap - EXIT INT TERM
 
     # 4. 更新决策与 INDEX 标记（仅文档，不参与契约 SHA）。
     if [[ -f "$decision_file" ]]; then
@@ -632,7 +641,7 @@ cmd_review() {
     [[ -n "$feature" ]] && args+=(--feature "$feature")
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --cross-validate|--rebuild-body)
+            --cross-validate|--rebuild-body|--force-recheck)
                 args+=("$1")
                 shift
                 ;;
@@ -645,6 +654,13 @@ cmd_review() {
                 ;;
         esac
     done
+
+    # 编排器场景显式开启降载三件套（head-oid 幂等短路 + 节流 + comment upsert），
+    # 避免同一 head 在 CI/自动化会话中反复打爆 GitHub 限流阈值。
+    # 人工本地裸跑 node authentic-review.js 时不注入这些 env，行为与改造前一致。
+    export REVIEW_SHORTCIRCUIT="${REVIEW_SHORTCIRCUIT:-1}"
+    export REVIEW_DEBOUNCE_SECONDS="${REVIEW_DEBOUNCE_SECONDS:-60}"
+    export REVIEW_UPSERT_PUBLISH="${REVIEW_UPSERT_PUBLISH:-1}"
 
     if ! node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" "${args[@]}"; then
         echo -e "${RED}[-] [FAIL-CLOSED] 真实审查管线未通过 (NOT_VERIFIED / HEAD 漂移 / 门禁失败 / check-result 拒绝)。${NC}" >&2
@@ -760,8 +776,37 @@ HELPTXT
         exit 1
     fi
 
-    gh pr comment "$pr_id" --repo "$repo" --body-file "$report_file"
-    rm -f "$report_file"
+    # T2 comment upsert: 编排器场景检索既有 respond 标记 comment；命中 → PATCH，未命中 → POST
+    # 标记行置于正文尾部（HTML 注释，页面不可见），与 review 侧 upsert 保持一致，不破坏首行结构
+    local marker="<!-- loopx-flow:respond:${pr_id}@${short_sha} -->"
+    local posted_body
+    posted_body="$(cat "$report_file")
+
+${marker}"
+    local posted_file
+    posted_file="$(mktemp)"
+    printf '%s' "$posted_body" > "$posted_file"
+    local existing_comment_id=""
+    if [[ "${REVIEW_UPSERT_PUBLISH:-1}" == "1" ]]; then
+        if existing_comment_id="$(gh api "repos/${repo}/issues/${pr_id}/comments?per_page=100" 2>/dev/null \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const a=JSON.parse(d);const m=a.find(c=>c.body&&c.body.includes(process.argv[1]));process.stdout.write(m?String(m.id):'')}catch(_){process.stdout.write('')}}") "$marker" 2>/dev/null || true)"; then
+            if [[ -n "$existing_comment_id" ]]; then
+                echo -e "${YELLOW}[THROTTLE-UPSERT] 复用既有 respond comment id=${existing_comment_id}（PATCH 更新，不再新增）${NC}"
+                if gh api -X PATCH "repos/${repo}/issues/comments/${existing_comment_id}" -F body=@"$posted_file" >/dev/null 2>&1; then
+                    rm -f "$posted_file" "$report_file"
+                    echo -e "${GREEN}[✓] 已更新既有 respond 汇报（comment ${existing_comment_id}，head $short_sha）！${NC}"
+                    exit 0
+                fi
+                echo -e "${YELLOW}[i] PATCH 失败，回退 POST 新建${NC}"
+            fi
+        fi
+    fi
+    if ! gh pr comment "$pr_id" --repo "$repo" --body-file "$posted_file"; then
+        rm -f "$posted_file"
+        echo -e "${RED}[-] [FAIL-CLOSED] gh pr comment 失败，回复未发布。${NC}" >&2
+        exit 1
+    fi
+    rm -f "$posted_file" "$report_file"
     echo -e "${GREEN}[✓] 已发布 LoopX 原生五段式更新汇报至 PR #${pr_id}（head $short_sha）！${NC}"
 }
 
@@ -1059,7 +1104,7 @@ cmd_merge() {
     if [[ "$failed" -eq 0 && -n "$feature" && "${LOOPX_FLOW_MERGE_SKIP_GIT_SYNC:-0}" != "1" ]]; then
         local base_branch="${base_ref:-main}"
         local dirty
-        dirty="$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=no 2>/dev/null | grep -vE '^(..) (specs/archive/|specs/features/|\.loopx/)' || true)"
+        dirty="$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=no 2>/dev/null | grep -vE "^(..) (specs/archive/$feature/|specs/features/$feature/|\.loopx/)" || true)"
         if [[ -n "$dirty" ]]; then
             failed=1
             step_names+=("push"); step_states+=("failed"); step_details+=("dirty worktree; base checkout skipped")

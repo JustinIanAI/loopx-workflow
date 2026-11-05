@@ -170,3 +170,20 @@ test('7. approve passes --registry to configure-goal', () => {
     assert.match(log, /--registry .*configure-goal/);
   } finally { cleanupCapsule(feature); }
 });
+
+test('8. approve feature name cannot inject shell through cleanup trap', () => {
+  const feature = "fc-trap'inject; touch /tmp/loopx-pwn; '";
+  const payload = '/tmp/loopx-pwn';
+  try { fs.unlinkSync(payload); } catch (_) {}
+  makeCapsule(feature);
+  resetMock();
+  writeScript('loopx', '#!/usr/bin/env bash\nexit 0\n');
+  try {
+    const r = runFlow(['approve', 'contract', feature]);
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.strictEqual(fs.existsSync(payload), false, 'trap must not execute injected shell');
+  } finally {
+    cleanupCapsule(feature);
+    try { fs.unlinkSync(payload); } catch (_) {}
+  }
+});

@@ -44,14 +44,16 @@ function nativeReviewBody(verdict, extra = '') {
   ].join('\n');
 }
 
-function nativeModelOut({ verdict = 'request_changes', headOid = HEAD, findings = [{ file: 'src/app.js', line: 1, severity: 'blocker', summary: 'hardcoded credential pattern', repro: 'grep token src/app.js' }], extra = '' } = {}) {
-  return '```json\n' + JSON.stringify({
+function nativeModelOut({ verdict = 'request_changes', headOid = HEAD, findings = [{ file: 'src/app.js', line: 1, severity: 'blocker', summary: 'hardcoded credential pattern', repro: 'grep token src/app.js' }], extra = '', carryover } = {}) {
+  const payload = {
     review_body: nativeReviewBody(verdict, extra),
     verdict,
     findings,
     reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: 'codex', declared_provider: 'openai' },
     headOid,
-  }) + '\n```';
+  };
+  if (carryover) payload.carryover = carryover;
+  return '```json\n' + JSON.stringify(payload) + '\n```';
 }
 
 function makeSandbox(opts = {}) {
@@ -62,6 +64,7 @@ function makeSandbox(opts = {}) {
   fs.mkdirSync(logs, { recursive: true });
 
   const legits = { gh: 1, codex: 1, loopx: 1, npm: 1, claude: 1 };
+  if (opts.omitCodex) delete legits.codex;
   let {
     mockHeadOid = HEAD,
     codexExit = 0, codexStdoutFile = '', verdict = 'request_changes',
@@ -165,7 +168,7 @@ exit 0
 `);
   }
   fs.chmodSync(path.join(bin, 'gh'), 0o755);
-  fs.chmodSync(path.join(bin, 'codex'), 0o755);
+  if (fs.existsSync(path.join(bin, 'codex'))) fs.chmodSync(path.join(bin, 'codex'), 0o755);
   fs.chmodSync(path.join(bin, 'loopx'), 0o755);
   fs.chmodSync(path.join(bin, 'npm'), 0o755);
   fs.chmodSync(path.join(bin, 'claude'), 0o755);
@@ -177,6 +180,7 @@ function run(sbx, args, envExtra) {
     ...process.env,
     PATH: `${sbx.bin}:${process.env.PATH}`,
     AUTHENTIC_REVIEW_HEAD_OID: HEAD,
+    REVIEW_MODEL: 'codex',
   };
   if (envExtra) Object.assign(env, envExtra);
   try {
@@ -312,7 +316,7 @@ describe('INV2 head drift', () => {
 describe('S4 carryover verdict capping', () => {
   test('unresolved reproducible finding caps verdict at request_changes', () => {
     const f = path.join(os.tmpdir(), `codex-ok-${Date.now()}.json`);
-    fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', headOid: HEAD, findings: [] }));
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', headOid: HEAD, findings: [], carryover: [{ finding_index: 1, status: 'reproducible', evidence: 'still present in diff' }] }));
     const sbx = makeSandbox({ codexStdoutFile: f, verdict: 'approve' });
     const carry = path.join(sbx.dir, 'carryover.json');
     fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/app.js', line: 9, severity: 'blocker', summary: 'injected injection' }] }));
@@ -376,5 +380,136 @@ describe('S5 cross validation', () => {
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--cross-validate']);
     assert.strictEqual(r.code, 0, r.out);
     assert.match(r.out, /DISPUTED|cross|CROSS/i);
+  });
+});
+describe('R3 carryover adjudication', () => {
+  test('fixed/obsolete carryover allows APPROVE and publishes per-item status', () => {
+    const f = path.join(os.tmpdir(), 'codex-carry-ok-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', findings: [], carryover: [
+      { finding_index: 1, status: 'fixed', evidence: 'grep no longer matches' },
+      { finding_index: 2, status: 'obsolete', evidence: 'code path removed' },
+    ] }));
+    const sbx = makeSandbox({ codexStdoutFile: f, verdict: 'approve' });
+    const carry = path.join(sbx.dir, 'carryover.json');
+    fs.writeFileSync(carry, JSON.stringify({ findings: [
+      { file: 'src/a.js', severity: 'P1', summary: 'first' },
+      { file: 'src/b.js', severity: 'P2', summary: 'second' },
+    ] }));
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
+    assert.strictEqual(r.code, 0, r.out);
+    assert.ok(r.out.includes('上轮 findings 裁决'));
+    assert.ok(r.out.includes('fixed'));
+    assert.ok(r.out.includes('obsolete'));
+  });
+
+  test('missing carryover status with prior findings -> NOT_VERIFIED', () => {
+    const f = path.join(os.tmpdir(), 'codex-carry-missing-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', findings: [] }));
+    const sbx = makeSandbox({ codexStdoutFile: f, verdict: 'approve' });
+    const carry = path.join(sbx.dir, 'carryover.json');
+    fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/a.js', severity: 'P1', summary: 'still here' }] }));
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
+    assert.notStrictEqual(r.code, 0);
+    assert.ok(r.out.includes('NOT_VERIFIED') || r.out.includes('carryover status'));
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.ok(!calls.includes('gh pr comment'));
+  });
+
+  test('invalid carryover status -> NOT_VERIFIED', () => {
+    const f = path.join(os.tmpdir(), 'codex-carry-invalid-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'request_changes', findings: [], carryover: [
+      { finding_index: 1, status: 'wontfix', evidence: 'bad status' },
+    ] }));
+    const sbx = makeSandbox({ codexStdoutFile: f, verdict: 'request_changes' });
+    const carry = path.join(sbx.dir, 'carryover.json');
+    fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/a.js', severity: 'P1', summary: 'still here' }] }));
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
+    assert.notStrictEqual(r.code, 0);
+    assert.ok(r.out.includes('NOT_VERIFIED') || r.out.includes('carryover status'));
+  });
+
+  test('carryover section is present in the checked result body before English verdict', () => {
+    const f = path.join(os.tmpdir(), 'codex-carry-result-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'request_changes', findings: [], carryover: [
+      { finding_index: 1, status: 'reproducible', evidence: 'still present' },
+    ] }));
+    const sbx = makeSandbox({ codexStdoutFile: f, verdict: 'request_changes' });
+    const carry = path.join(sbx.dir, 'carryover.json');
+    fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/a.js', severity: 'P1', summary: 'still here' }] }));
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
+    assert.strictEqual(r.code, 0, r.out);
+    const result = JSON.parse(fs.readFileSync(path.join(os.tmpdir(), 'authentic-review-result-7.json'), 'utf8'));
+    assert.ok(result.review_body.includes('上轮 findings 裁决'));
+    assert.ok(result.review_body.indexOf('上轮 findings 裁决') < result.review_body.indexOf('English verdict'));
+  });
+
+  test('no prior findings does not require carryover adjudication', () => {
+    const sbx = makeSandbox();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    assert.ok(!r.out.includes('上轮 findings 裁决'));
+  });
+});
+
+describe('R3 agent policy and model declaration', () => {
+  test('codex unavailable does not fall back to claude', () => {
+    const f = path.join(os.tmpdir(), 'codex-unused-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', findings: [] }));
+    const sbx = makeSandbox({ omitCodex: true, codexStdoutFile: f, verdict: 'approve' });
+    const nodeDir = path.dirname(process.execPath);
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { PATH: `${sbx.bin}:${nodeDir}:/usr/bin:/bin` });
+    assert.notStrictEqual(r.code, 0);
+    assert.ok(r.out.includes('NOT_VERIFIED') || r.out.includes('codex CLI unavailable'));
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.ok(!calls.includes('claude'));
+  });
+
+  test('explicit --agent-bin claude is allowed', () => {
+    const f = path.join(os.tmpdir(), 'claude-explicit-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'request_changes', findings: [] }));
+    const sbx = makeSandbox({ omitCodex: true, claudeStdoutFile: f, verdict: 'request_changes' });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--agent-bin', 'claude']);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.ok(calls.includes('claude -p'));
+  });
+
+  test('Reviewer line records configured default model instead of codex', () => {
+    const f = path.join(os.tmpdir(), 'model-decl-' + Date.now() + '.json');
+    const payload = {
+      review_body: nativeReviewBody('request_changes'),
+      verdict: 'request_changes',
+      findings: [],
+      reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_provider: 'openai' },
+      headOid: HEAD,
+    };
+    fs.writeFileSync(f, '```json' + JSON.stringify(payload) + '```');
+    const sbx = makeSandbox({ codexStdoutFile: f, verdict: 'request_changes' });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { REVIEW_MODEL: 'gemini-3.8-flash-high' });
+    assert.strictEqual(r.code, 0, r.out);
+    assert.ok(r.out.includes('model=gemini-3.8-flash-high'));
+  });
+
+  test('3D evaluation is injected into the native prompt', () => {
+    const sbx = makeSandbox();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.ok(calls.includes('delivery / long_horizon / user_experience'));
+  });
+});
+
+describe('R3 carryover integrity', () => {
+  test('fixed/obsolete without evidence -> NOT_VERIFIED', () => {
+    const f = path.join(os.tmpdir(), 'codex-carry-noev-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', findings: [], carryover: [
+      { finding_index: 1, status: 'fixed', evidence: '' },
+    ] }));
+    const sbx = makeSandbox({ codexStdoutFile: f, verdict: 'approve' });
+    const carry = path.join(sbx.dir, 'carryover.json');
+    fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/a.js', severity: 'P1', summary: 'still here' }] }));
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
+    assert.notStrictEqual(r.code, 0);
+    assert.ok(r.out.includes('NOT_VERIFIED') || r.out.includes('carryover status'));
   });
 });
