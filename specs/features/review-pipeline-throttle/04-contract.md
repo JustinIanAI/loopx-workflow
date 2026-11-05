@@ -9,29 +9,32 @@ Contract-Status: DRAFT → PENDING-APPROVAL (check 门禁实测已全绿；收�
 
 三项承重改动：
 
-1. **head-oid 幂等**：同一 `pr@head_oid` 若已存在有效评审 artifact（`.loopx/reviews/<pr>@<head>.json`）
-   且其 `native_check.ok === true`，则 `authentic-review.js` 直接复用既有 artifact 并短路到发布阶段，
-   不再重跑 `gh pr view` / `gh pr diff` / `loopx pr-review` 模型执行。
-   **短路仅在编排器显式开启 `REVIEW_SHORTCIRCUIT=1` 时生效**（避免本地残留 artifact 误触发、保持默认行为不变），
-   `--force-recheck` 始终强制绕过。
+1. **head-oid 幂等**：先以 1 次 `gh pr view` 取当前 head；若 `.loopx/reviews/<pr>@<当前head>.json`
+   存在且 `native_check.ok === true`，则复用该 artifact 并短路到发布阶段，
+   **不再取 `gh pr diff`、不再跑 `loopx pr-review` 模型执行、不再堆叠新评论**。
+   只认同 head：**跨 head 绝不复用**（否则会把旧 head 的结论当作新 head 发布，属 fail-open）。
+   该路径仅在编排器显式开启 `REVIEW_SHORTCIRCUIT=1` 时生效（避免本地残留 artifact 误触发、
+   保持默认行为与改造前完全一致），`--force-recheck` 始终强制绕过。
 
 2. **comment upsert**：发布评审报告时，先通过 `gh api` 按唯一标记行检索本管线已发布的 comment；
    命中则 `PATCH`（edit）该 comment，未命中才 `POST`（新增）comment。
-   标记行格式：`<!-- loopx-flow:review:<pr>@<headOid> -->`，置于报告正文首行（HTML 注释，页面不可见）。
-   该路径**始终生效**（不受短路开关影响）：短路发布与完整管线发布共用同一 upsert 逻辑。
+   标记行格式：`<!-- loopx-flow:review:<pr>@<headOid> -->`，置于正文**尾部**（HTML 注释，页面不可见），
+   避免破坏正文首行结构与既有断言。幂等复用路径始终走 upsert；完整管线发布受
+   `REVIEW_UPSERT_PUBLISH=1` 控制（默认关闭 → 与改造前一致的 `gh pr comment`）。
+   `loopx-flow respond` 侧同理，标记行 `<!-- loopx-flow:respond:<pr>@<shortSha> -->`。
 
-3. **客户端节流**：管线进程级限流——同一 `pr@head` 两次完整执行间隔不足
-   `REVIEW_DEBOUNCE_SECONDS`（默认 60s）时，短路路径直接复用第一次的 artifact；
-   `gh api` 调用收到 429/503 时按 `Retry-After` 指数退避（上限 120s），最多 3 次重试。
+3. **客户端节流**：同一 PR 的完整管线执行间隔不足 `REVIEW_DEBOUNCE_SECONDS`（默认 60s）时，
+   **有界等待**（最多 debounce 秒）合并突发，而不是拒绝执行——避免 push→评审热循环打爆限流；
+   `gh api` 收到 429/503 时按 `Retry-After` 指数退避（上限 120s），最多 `REVIEW_MAX_RETRIES`（默认 3）次重试。
 
 ## TypeScript 契约（签名冻结）
 
 ```ts
 interface ReviewThrottleConfig {
-  shortCircuit: boolean;         // 短路开关（REVIEW_SHORTCIRCUIT=1），默认 false
-  debounceSeconds: number;       // 默认 60（短路窗口）
-  maxRetries: number;            // 429/503 退避次数，默认 3
-  backoffBaseMs: number;        // 默认 1000
+  shortCircuit: boolean;         // REVIEW_SHORTCIRCUIT=1，默认 false
+  debounceSeconds: number;       // REVIEW_DEBOUNCE_SECONDS，默认 60
+  maxRetries: number;            // REVIEW_MAX_RETRIES，默认 3
+  backoffBaseMs: number;         // REVIEW_BACKOFF_BASE_MS，默认 1000
 }
 
 interface ReviewArtifactRef {
@@ -40,23 +43,27 @@ interface ReviewArtifactRef {
   artifactPath: string;          // .loopx/reviews/<pr>@<head>.json
 }
 
-declare function headIdempotentShortCircuit(pr: number):
-  ReviewArtifact | null;   // 最近一次 native_check.ok 的 artifact；短路仅在 config.shortCircuit 时生效
+declare function loadReviewArtifact(pr: number, headOid: string): ReviewArtifact | null;
+  // 仅 schema_version === 'loopx_flow_review_artifact_v0' 且 native_check.ok === true 时返回
 
-declare function withinDebounceWindow(artifact: ReviewArtifact, cfg: ReviewThrottleConfig):
-  boolean;                  // reviewed_at 距 now < debounceSeconds 且在 shortCircuit 开启时
+declare function listReviewArtifactsForPr(pr: number): ReviewArtifact[];
+  // 仅供节流计算上次完整执行时间；禁止用于跨 head 复用
+
+declare function throttleRemainingMs(pr: number): number;
+  // 距上次完整执行还需等待的毫秒数；窗口外/无记录/禁用时返回 0
 
 declare function publishReviewCommentUpsert(opts: {
   repo: string;
   pr: number;
   headOid: string;
-  body: string;                  // 已含标记行
-}): Promise<{ mode: 'updated' | 'created'; commentId: number | null }>;  // 短路/完整管线共用，始终生效
+  body: string;
+  useUpsert: boolean;            // false → 直接 gh pr comment（改造前行为）
+}): { mode: 'updated' | 'created'; commentId: number | null };
 
-declare function ghApiWithBackoff(path: string, opts: {
-  method?: 'GET' | 'PATCH';
-  retries?: number;
-}): Promise<unknown>;
+declare function ghApiWithBackoff(apiArgs: string[], opts?: { repo?: string }):
+  { ok: boolean; out: string };  // 429/503 指数退避；非重试类错误立即返回 ok:false
+
+declare function sleepSync(ms: number): void;
 ```
 
 ## 不变量
@@ -67,6 +74,10 @@ declare function ghApiWithBackoff(path: string, opts: {
 
 ## 验收
 
-- 单测：同一 head 连续执行 2 次，第二次走短路且 `gh pr view/diff/loopx pr-review` 调用次数为 0；
-  comment 第二次为 `updated` 模式。
-- 既有 `authentic-review-pipeline.test.js` 全绿不回归。
+- T1：同一 head 连续执行 2 次 → 第 2 次仅 1 次 `gh pr view`，`gh pr diff` / 模型执行次数不增加，
+  发布走 upsert（`updated` 或 `created`，不新增堆叠 comment）。
+- T1b：head 已漂移时**不得**命中幂等，必须重新执行评审。
+- T2：`REVIEW_UPSERT_PUBLISH=1` 下无标记 → `POST`；有标记 → `PATCH`，且不再 `gh pr comment`。
+- T3：同 PR 上次完整执行 < debounce 且 head 已漂移 → 有界等待后再执行；debounce=0 → 不等待。
+- T3b：`gh api` 首次 429 → 退避重试后成功，不中断发布。
+- 既有 `authentic-review-pipeline.test.js` 26/26 全绿不回归；`npm run test` 96/96 全绿。
