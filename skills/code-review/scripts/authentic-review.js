@@ -37,6 +37,14 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
+const {
+  buildEvidenceGraph,
+  buildValidationMatrix,
+  buildProblemContextFull,
+  splitFileDiffs,
+  describeFileFromDiff,
+  scanDiff,
+} = require('./evidence-builder');
 
 const TIMEOUT_MS = 600000;
 const LOOPX_POLICY_REVISION = 22; // loopx review_contract.REVIEW_POLICY_REVISION
@@ -245,19 +253,9 @@ function capsuleSection(feature, file, maxChars) {
 // ---------------------------------------------------------------------------
 // PR 提交版式生成器（对齐 PR #7545 双语 4-Part）——保持原生 PR 描述结构
 // ---------------------------------------------------------------------------
-function describeFile(f) {
-  if (f.includes('loopx-flow')) return '命令编排器：增强门禁实测、响应格式安全、状态同频与全生命周期治理';
-  if (f.includes('authentic-review.js')) return '交付审查引擎：改为 LoopX 原生 pr-review 能力驱动，移除手写 5-Block 模板';
-  if (f.includes('01-decisions.md')) return '架构决策备忘录：确立生态对齐 4 项核心决策 (ADR-001 ~ ADR-004)';
-  if (f.includes('02-prd.md')) return '精益 PRD：定义核心痛点、用户旅程及承重假设红队攻击防御矩阵';
-  if (f.includes('03-stories.md')) return '用户故事拆分：划定验收准则并确保单 Feature Diff 聚合可控';
-  if (f.includes('04-contract.md')) return 'TypeScript 契约：固化数据模型签名与核心断言不变量';
-  if (f.includes('05-evidence.md')) return '门禁实测凭据：同步 LoopX 物理防篡改质量门禁收据';
-  if (f.includes('00-INDEX.md')) return '特性资产全景总览看板';
-  if (f.includes('package.json')) return '工程依赖管理与测试脚本注册';
-  if (f.includes('.gitignore')) return '私有注册表与状态文件边界合规治理';
-  if (f.includes('test')) return '端到端单元测试回归套件，保证架构不变量 100% 覆盖';
-  return '核心业务实现与生态对齐规范代码';
+function describeFile(f, fileDiff) {
+  if (fileDiff) return describeFileFromDiff(f, fileDiff);
+  return 'NOT_PROVIDED（diff 中无该文件明细，禁止套用固定模板）';
 }
 
 function extractMotivation(feature) {
@@ -296,8 +294,9 @@ function extractRisks(feature) {
 
 function buildBody(feature, diff) {
   const files = [...new Set([...diff.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)].map(m => m[2]))];
+  const fileDiffs = splitFileDiffs(diff);
   const changes = files.length
-    ? files.map(f => `- **\`${f}\`**:\n  - ${describeFile(f)}`).join('\n')
+    ? files.map(f => `- **\`${f}\`**:\n  - ${describeFile(f, fileDiffs.get(f))}`).join('\n')
     : 'NOT_PROVIDED';
 
   let body = '';
@@ -314,18 +313,21 @@ function buildBody(feature, diff) {
     if (mMatch) matrix = mMatch[0];
   }
   if (!matrix) {
-    const g = gates();
+    const items = buildValidationMatrix(gates());
     matrix = '### 验证矩阵\n\n| Check | Result | Details |\n|---|---|---|\n' +
-      `| \`npm run typecheck\` | ${g.typecheck} | TypeScript strict noEmit |\n` +
-      `| \`npm run lint\` | ${g.lint} | Shell syntax & JS AST clean |\n` +
-      `| \`npm run build\` | ${g.build} | Binaries and permissions verified |\n` +
-      `| \`npm test\` | ${g.test} | All unit suites passed 100% green |\n`;
+      items.map(i => `| \`${i.command_or_check}\` | ${i.status.toUpperCase()} | ${i.result} |`).join('\n');
   }
   body += matrix + '\n';
+  const scan = scanDiff(diff);
+  if (scan.length) {
+    body += '\n### 质量扫描\n\n' + scan.map(s => `- \`${s.rule}\`: ${s.line}`).join('\n') + '\n';
+  }
   return body;
 }
 
+let GATES_CACHE = null;
 function gates() {
+  if (GATES_CACHE) return GATES_CACHE;
   const bin = process.env.AUTHENTIC_REVIEW_GATES_BIN || 'npm';
   const names = ['typecheck', 'lint', 'build', 'test'];
   const out = {};
@@ -333,6 +335,7 @@ function gates() {
     const r = sh(bin, ['run', g], 300000);
     out[g] = r.status === 0 ? 'PASSED' : `FAILED (exit ${r.status})`;
   }
+  GATES_CACHE = out;
   return out;
 }
 
@@ -372,6 +375,9 @@ function extractPacketReview(packet, pr, headOid) {
     hasNativeTemplate,
     reviewTemplate: rt,
     reviewPlan: plan,
+    evidenceContract: packet.agent_response_contract && packet.agent_response_contract.review_execution_contract
+      ? packet.agent_response_contract.review_execution_contract
+      : {},
     evidenceCommands: match && Array.isArray(match.evidence_commands) ? match.evidence_commands : [],
     motivation: match && typeof match.motivation === 'string' ? match.motivation : '',
     behaviorBearing: !!(plan.applicability && plan.applicability.behavior_bearing_change),
@@ -453,7 +459,7 @@ function buildCarryoverSection(carryover, priorFindings) {
 
 // 用原生 review_template（agent_instruction + 字数下限）+ evidence_commands + motivation 构建提示词。
 // 注意：这是"透传原生提示词约束"，不是手写版式。模型被要求严格按五段式产出。
-function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings }) {
+function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract }) {
   const prior = (priorFindings || []).map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
   const sectionsMd = (reviewTemplate.sections || []).map(s =>
     `### ${s.label}（最少 ${s.minimum_prose_characters} 正文字符）\n约束提示词：${s.agent_instruction || ''}`,
@@ -461,6 +467,10 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
 
   const evdCmds = (evidenceCommands || []).map(c => `- \`${c}\``).join('\n');
   const requiredIds = (reviewPlan.required_evidence_ids || []).join(', ');
+  const evidenceRequirements = (evidenceContract && evidenceContract.evidence_requirements || [])
+    .filter(r => (reviewPlan.required_evidence_ids || []).includes(r.evidence_id))
+    .map(r => `- \`${r.evidence_id}\`: fields=${(r.fields || []).join(', ') || '(none)'}${r.items_field ? `; items_field=${r.items_field}; item_fields=${(r.item_fields || []).join(', ')}` : ''}${r.verdict_values ? `; verdict_values=${r.verdict_values.join('|')}` : ''}`)
+    .join('\n');
   const head10 = headOid.slice(0, 10);
 
   return [
@@ -482,6 +492,11 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '',
     '## 评审范围 evidence（required_evidence_ids）',
     requiredIds,
+    '',
+    '## 结构化证据图（必须输出）',
+    '你必须同时输出 evidence 字典，覆盖上面每个 required id，并满足以下字段；status 必须为 verified 或 not_applicable。',
+    '本地脚本会以真实门禁结果覆盖 validation_matrix、changed_line_classification、code_volume；模型负责 architecture_flow、change_proportionality、walkthroughs、failure_analysis 等语义证据。',
+    evidenceRequirements || '(本 PR 无额外 evidence requirements)',
     '',
     '## 证据采集命令（下方已附运行结果）',
     evdCmds,
@@ -510,7 +525,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
       verdict: 'APPROVE 或 REQUEST_CHANGES（大写，须与 review_body 中的 English verdict 完全一致）',
       findings: [{ file: '路径', line: '整数或 null', severity: 'P0|P1|P2|P3|blocker|major|minor|advisory', summary: '...', repro: '可选复现步骤' }],
       reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-high', declared_provider: '如 openai' },
-      evidence: {},
+      evidence: '按 required_evidence_ids 输出：{ "<evidence_id>": { "status": "verified", ...requirement fields } }。validation_matrix 由脚本覆盖。',
       carryover: [{ finding_index: '上轮 finding 序号（1 起）', status: 'fixed|reproducible|obsolete', evidence: '复验依据/命令' }],
     }, null, 2),
     '```',
@@ -624,21 +639,10 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, prob
 
 // 用原生 motivation 构造最小合规 problem_context 证据，使 --check-result 的
 // problem_explanation 发布校验通过（证据完整度之外的五段式格式校验才是本脚本硬门禁）。
-function buildProblemContextEvidence(motivation) {
-  const mot = (motivation || '').trim();
-  const sentences = mot ? mot.split(/(?<=[。.!?])\s*/).map(s => s.trim()).filter(Boolean) : [];
-  const pick = (i, fallback) => sentences[i] || fallback;
+function buildProblemContextEvidence(motivation, feature, headOid) {
   return {
     status: 'verified',
-    affected_caller_or_operator: pick(0, 'LoopX 生态对齐推进者与 PR 作者'),
-    before_after_scenario: pick(1, '改进前评审报告缺失动机深度与主干风险量化；改进后按 PR #7545 原生五段式呈现。'),
-    observable_outcome: pick(2, '第三方评审报告现含动机/思路/具体改动/风险/评价五维，可被原生 check_review_body 校验。'),
-    non_goals: pick(3, '本评审不改写 LoopX 原生版式，仅驱动模型遵循原生 review_template。'),
-    outcome_impact: {
-      long_horizon: { decision: 'not_applicable', reason: '评价详见「我的整体评价」段', inspected_path: 'specs/features' },
-      user_experience: { decision: 'not_applicable', reason: '评价详见「我的整体评价」段', inspected_path: 'PR 评论' },
-    },
-    spec_basis: { decision: 'no_spec', spec_source: 'none' },
+    ...buildProblemContextFull(motivation, { feature: feature || '', headOid: headOid || '' }),
   };
 }
 
@@ -887,6 +891,10 @@ function main() {
 
   // --- 2. 执行原生 evidence_commands，收集证据（nativeMode 下驱动模型）---
   const evidenceText = runEvidenceCommands(pkt.evidenceCommands);
+  let validation = [];
+  if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
+    try { validation = buildValidationMatrix(gates()); } catch (e) { validation = []; }
+  }
 
   // --- 3. 构建提示词：原生 review_template（透传，不重写）---
   const carryPath = o.carryoverFile || path.join('specs', 'features', feature, 'review-carryover.json');
@@ -899,6 +907,7 @@ function main() {
     pr: o.pr, headOid, branch: head.headRefName, motivation: pkt.motivation,
     reviewTemplate: pkt.reviewTemplate, reviewPlan: pkt.reviewPlan,
     evidenceCommands: pkt.evidenceCommands, evidenceText, diff, priorFindings,
+    evidenceContract: pkt.evidenceContract || {},
   });
 
   // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
@@ -947,9 +956,23 @@ function main() {
     console.error('[NOT_VERIFIED] 原生模型输出缺少 review_body；禁止自造降级正文发布。');
     process.exit(1);
   }
-  const problemContext = buildProblemContextEvidence(pkt.motivation);
+  const autoEvidence = buildEvidenceGraph({
+    contract: pkt.evidenceContract || {},
+    plan: pkt.reviewPlan || {},
+    diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
+    modelEvidence: modelOut.evidence && typeof modelOut.evidence === 'object' ? modelOut.evidence : null,
+  });
+  const problemContext = autoEvidence.problem_context || buildProblemContextEvidence(pkt.motivation, feature, headOid);
   const carryoverSection = buildCarryoverSection(carryover, priorFindings);
   let reviewBody = finalizeReviewBody(modelOut.review_body, { headOid, verdict, reviewer, motivation: pkt.motivation, problemContext, carryoverSection });
+  // 发布 architecture_assessment 的 reason/current_pr_boundary（原生 check-result 要求可读）
+  const archAssessment = autoEvidence.change_proportionality && autoEvidence.change_proportionality.architecture_assessment;
+  if (archAssessment && archAssessment.reason && !reviewBody.includes(archAssessment.reason)) {
+    reviewBody = reviewBody.replace(/(##\s*改动思路[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 架构边界：${archAssessment.reason}`);
+  }
+  if (archAssessment && archAssessment.current_pr_boundary && !reviewBody.includes(archAssessment.current_pr_boundary)) {
+    reviewBody = reviewBody.replace(/(##\s*我的整体评价[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 当前 PR 边界：${archAssessment.current_pr_boundary}`);
+  }
   const walkthrough = assertKeyCodeWalkthrough(reviewBody, pkt.behaviorBearing);
   if (!walkthrough.pass) {
     console.error(`[NOT_VERIFIED] ${walkthrough.reason}`);
@@ -998,12 +1021,11 @@ function main() {
       : path.join(os.tmpdir(), `loopx-pr-review-packet-${o.pr}.json`);
     if (!o.packetFile) fs.writeFileSync(packetPath, JSON.stringify(packet, null, 2));
 
-    const evidence = Object.assign({}, (modelOut.evidence && typeof modelOut.evidence === 'object' ? modelOut.evidence : {}));
-    evidence.problem_context = problemContext;
+    const evidence = Object.keys(autoEvidence).length ? autoEvidence : { problem_context: problemContext };
     const resultPath = path.join(os.tmpdir(), `authentic-review-result-${o.pr}.json`);
     const buildResultFile = () => ({
       schema_version: 'pull_request_review_result_v1',
-      review_policy_revision: LOOPX_POLICY_REVISION,
+      review_policy_revision: (pkt.evidenceContract && pkt.evidenceContract.policy_revision) || LOOPX_POLICY_REVISION,
       target_exact_head: `${o.pr}@${headOid.toLowerCase()}`,
       evidence, findings, verdict, review_body: reviewBody,
       reviewer: {
