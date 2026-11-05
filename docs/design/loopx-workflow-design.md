@@ -50,7 +50,7 @@ flowchart LR
 
 | 命令 | 实现函数 | 满足的需求 | 失败即停的要点 |
 |---|---|---|---|
-| `doctor` | `cmd_doctor` | 环境哨兵 | preflight 失败、`loopx doctor` 失败、或本机没有 `loopx` 均非 0。诊断卡含原因/影响/修复命令 |
+| `doctor` | `cmd_doctor`、`cmd_doctor_control_plane` | 环境哨兵、`REQ-ENV-1`、`REQ-ENV-2` | preflight 失败、`loopx doctor` 失败、或本机没有 `loopx` 均非 0。诊断卡含原因/影响/修复命令。控制面路由/registry 一致性、`~/.loopx` 半迁移残留、运行时工件被跟踪、GitHub API 50% 预算基线为 WARN 级检查（见 ADR-0007） |
 | `init` | `cmd_init` | `REQ-MAIN-1` | 安装 pre-commit；有 `loopx` 时 `bootstrap` 失败则退出 |
 | `feature <name>` | `cmd_feature` | `REQ-FAILCLOSED-2`、`REQ-CAPSULE-1` | 分支创建或切换失败则退出，不写胶囊 |
 | `approve contract <feature>` | `cmd_approve` | `REQ-CHECKPOINT-1` | 缺契约文件、缺 `loopx`、`configure-goal` 失败均非 0；先锁最终内容 SHA256，成功后才原子写入批准标记 |
@@ -68,6 +68,25 @@ flowchart LR
 | `status` | `cmd_status` | 观察 | 没有失败即停承诺 |
 
 `feature` 在分支成功后创建尚不存在的胶囊文件。它不代替阶段 1–4 的正文，也不检查正文是否引用了 `REQ-*`（`REQ-TRACE-2`）。
+
+### 3.1 环境治理与 API 预算前置检查 (ADR-0007)
+
+`doctor` 在原生 `loopx doctor` 之后追加 3 段检查，输出统一为“状态 + 原因 + 影响 + 修复指令”，
+非阻断但必须可见：
+
+1. **控制面一致性**：`loopx status` 的 `runtime_root` 对比项目 `.loopx/registry.json` 的
+   `common_runtime_root`；不一致时提示重新 bootstrap 或统一声明。
+2. **迁移可行性**：`~/.loopx` 若存在半迁移残留（有内容但无 `registry.global.json`）则告警，
+   因为 `loopx migrate-local-state` 会以 `target runtime root already exists` 失败；
+   registry 中缺 `state_file` 的 goal 单独列出（迁移校验会拒绝）。
+3. **运行时工件隔离**：`git ls-files` 中不得出现 `.codex/` 或 `.loopx/**/*.lock`；
+   出现则提示 `git rm --cached` 并确认 `.gitignore`（收据证据污染源，见 `REQ-ENV-3`）。
+4. **API 预算**：`gh api rate_limit` 展示 core limit/remaining 与 50% 基线对比；
+   固定打印 secondary 与 content-generating 的官方上限和基线值。
+
+收据证据 refs 只取已提交 scope：`ingest-to-loopx-quality.js` 的 `committedScopeFiles(baseCommit)`
+使用 `git diff --name-only <base>...HEAD`，并用 `isRuntimeArtifact()` 过滤
+`.codex/**`、`.loopx/**`、`*.lock`、`node_modules/**`、`.DS_Store`。
 
 ## 4. 管线 A：特性
 

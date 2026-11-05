@@ -1,1 +1,0 @@
-{"acquired_at":"2026-10-30T02:43:35.092208Z","agent_id":"unknown","host":"JundeMacBook-Air.local","lock_id":"9bb95679af592854","operation":"acknowledge_lark_event_inbox","pid":22930,"policy":"mutation","released_at":"2026-10-30T02:43:35.127538Z","schema_version":"file_lock_holder_v0"}
