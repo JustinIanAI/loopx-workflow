@@ -39,6 +39,7 @@ coverage/
 
 # LoopX private runtime registry & state (boundary compliance)
 .loopx/registry.json
+.loopx/domain-state/
 .loopx/state/
 .loopx/cache/
 .loopx/reviews/
