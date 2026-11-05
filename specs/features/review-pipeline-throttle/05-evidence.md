@@ -1,6 +1,29 @@
-# Review Pipeline Throttle 质量凭据（阶段 5/6）
+# Quality & Verification Evidence: review-pipeline-throttle
 
-## 门禁实测
+## 1. LoopX 质量凭据 (Change Quality Receipt)
+- **Status**: `PASSING (Strict Mode Verified)`
+- **Review Engine**: `Default Semantic Review`
+- **Diff SHA256 (scan scope)**: `c00ab312f9f5df892334f145f5c2a715e8bef7b9bcc648daf40b89d329d05bc9`
+- **Receipt Chain**: `Fail-Closed (prepare -> record -> verify, gate re-verified in check [3/3])`
+- **LoopX Scope Fingerprint**: `a289724a2a7fa698a8308f50bde5d75a8bc65b68604c613f8cb0ed58a28a61c1`
+
+## 2. 代码审查结论 (Code Review Insights)
+- **Reviewer**: `Default Semantic Review`
+- **Blocker 缺陷数**: `0`
+- **Warnings / Advisory**: `0`
+- **反熵增治理**: 执行 `delete-first`，彻底消除旧逻辑与废弃变量，零幽灵代码。
+
+## 3. 本地四大硬门禁实测 (4-Slot Fresh Evidence)
+| 门禁动作 | 退出码 | 覆盖说明 | 残余风险与假设 |
+|---|---|---|---|
+| `npm run typecheck` | 0 | 覆盖核心类型与接口定义 | 无 |
+| `npm run lint` | 0 | 语法与格式校验通过 | 无 |
+| `npm run build` | 0 | 产物构建成功 | 无 |
+| `npm run test` | 0 | 单测套件 100% PASS | 依赖本地环境 |
+
+---
+
+## 附录 A：本地实测明细（人工核对口径）
 
 | 门禁 | 命令 | 结果 |
 |------|------|------|
@@ -102,3 +125,16 @@
 
 > 注意：`ingest` 在 record 失败前已写入带 “PASSING” 字样的自动段落，属乐观写入；
 > 本文件已恢复为实测口径（record 未通过），避免凭据夸大。
+
+## 附录 B：3/3 收据阻断与修复审计链
+
+| 时间 | 状态 | 说明 |
+|---|---|---|
+| 14:39 | approve contract 通过 | 契约指纹 `a46a85b8…` |
+| 14:41 | check 3/3 BLOCKED | `reuse references unknown evidence: path:AGENTS.md` |
+| 14:44 | 根因定位 | 分支落后于 main 的仓库迁移提交（AGENTS.md 反向 diff）+ `ingest` 用 `git diff <base_commit>`（含工作区）取证据 refs |
+| 14:52 | rebase 到 `origin/main@3f6a4f8` | 反向 diff 消失 |
+| 14:56 | check 3/3 PASS | `Receipt recorded successfully` → `strictly verified` → `ok=true` |
+
+> 环境治理 PR 仍需修复 `ingest` 用工作区 diff 取 evidence refs 的问题（当前靠 rebase 绕过），
+> 详见 `specs/features/env-governance/`。
