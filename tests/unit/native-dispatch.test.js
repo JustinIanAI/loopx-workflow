@@ -59,7 +59,7 @@ cmd="$1"
 subcmd="\${2:-}"
 
 if [[ "$cmd" == "repo" && "$subcmd" == "view" ]]; then
-  echo '{"nameWithOwner": "JustinIan-AI/loopx-workflow"}'
+  echo '{"nameWithOwner": "JustinIanAI/loopx-workflow"}'
   exit 0
 fi
 
