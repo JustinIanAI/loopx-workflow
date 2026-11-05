@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 
@@ -28,29 +29,30 @@ test('2. Stage Signature Gate: contract check in specs/features/<feat>/04-contra
     ? path.join(PROJECT_ROOT, 'specs/features/hard-guard/04-contract.md')
     : path.join(PROJECT_ROOT, 'specs/archive/hard-guard/04-contract.md');
   const contractSha = crypto.createHash('sha256').update(fs.readFileSync(contractPath)).digest('hex');
-  const regPath = path.join(PROJECT_ROOT, '.loopx/registry.json');
-  fs.mkdirSync(path.dirname(regPath), { recursive: true });
+  // 隔离：写入临时 registry（LOOPX_REGISTRY），绝不污染真实 .loopx/registry.json。
+  // 真实 registry 被测试造出无 state_file 的 orphan goal 会阻塞 loopx migrate-local-state
+  // （见 docs/adr/0007-environment-governance.md / INV-ENV-6）。
+  const realRegPath = path.join(PROJECT_ROOT, '.loopx/registry.json');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-registry-'));
+  const regPath = path.join(tmpDir, 'registry.json');
   let reg = { goals: [] };
-  if (fs.existsSync(regPath)) {
-    try { reg = JSON.parse(fs.readFileSync(regPath, 'utf8')); } catch (_) {}
+  if (fs.existsSync(realRegPath)) {
+    try { reg = JSON.parse(fs.readFileSync(realRegPath, 'utf8')); } catch (_) {}
   }
   if (!Array.isArray(reg.goals)) reg.goals = [];
-  let g = reg.goals.find(item => item.id === 'hard-guard-goal' || item.goal_id === 'hard-guard-goal');
-  if (!g) {
-    reg.goals.push({
-      id: 'hard-guard-goal',
-      control_plane: { progress_review: { contract_revision: contractSha } }
-    });
-  } else {
-    g.control_plane = g.control_plane || {};
-    g.control_plane.progress_review = g.control_plane.progress_review || {};
-    g.control_plane.progress_review.contract_revision = contractSha;
-  }
+  reg.goals = reg.goals.filter(item => item.id !== 'hard-guard-goal' && item.goal_id !== 'hard-guard-goal');
+  reg.goals.push({
+    id: 'hard-guard-goal',
+    state_file: path.join(tmpDir, 'ACTIVE_GOAL_STATE.md'),
+    control_plane: { progress_review: { contract_revision: contractSha } }
+  });
+  fs.mkdirSync(path.dirname(regPath), { recursive: true });
   fs.writeFileSync(regPath, JSON.stringify(reg, null, 2));
 
   // Test feature with FROZEN & APPROVED marker in 04-contract.md
   const resApproved = spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'hard-guard'], {
-    encoding: 'utf8'
+    encoding: 'utf8',
+    env: { ...process.env, LOOPX_REGISTRY: regPath },
   });
   assert.strictEqual(resApproved.status, 0, 'Approved contract file must pass gate check');
 });
