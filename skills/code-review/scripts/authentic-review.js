@@ -15,6 +15,10 @@
  *      直接 fail-closed（禁止自造降级版式），证据完整度（approval_blockers）不足时诚实标注。
  *   6. 评审结果（findings / reviewer 声明 / 原生校验）落盘 `.loopx/reviews/<pr>@<head>.json`，
  *      供 `loopx-flow respond` 复用原生格式逐项闭环。
+ *   7. 降载三件套（review-pipeline-throttle）：head-oid 幂等短路（同一 pr@head 已有
+ *      native_check.ok 的 artifact 且在 REVIEW_DEBOUNCE_SECONDS 窗口内时跳过模型重跑）、
+ *      comment upsert（按标记行检索既有 comment，命中 PATCH 不新增 POST）、
+ *      gh api 429/503 指数退避。
  *
  * 设计原则：版式与提示词来自 LoopX 原生能力，本脚本只做"拿包 → 透传提示词 → 跑原生校验 → 发布"。
  *
@@ -39,6 +43,167 @@ const LOOPX_POLICY_REVISION = 22; // loopx review_contract.REVIEW_POLICY_REVISIO
 // 评审结果私有落盘目录（不入 Git；供 loopx-flow respond 复用原生格式核销）
 const REVIEW_RESULT_DIR = path.join('.loopx', 'reviews');
 
+// --- 降载三件套（契约: specs/features/review-pipeline-throttle/04-contract.md）---
+// INV-T3: 节流与退避失败一律 fail-closed（非零退出），不静默吞掉。
+// 短路/节流仅在编排器显式开启（REVIEW_SHORTCircuit=1）时生效，
+// 避免本地残留 artifact 误触发；默认行为与改造前完全一致（完整管线重跑）。
+const THROTTLE = {
+  // 短路开关：编排器/CI 在重复执行场景显式置 1；默认关闭以不改变既有测试行为
+  shortCircuit: process.env.REVIEW_SHORTCIRCUIT === '1',
+  // 同一 pr@head 两次完整执行最小间隔（秒），窗口内短路复用 artifact
+  debounceSeconds: parseInt(process.env.REVIEW_DEBOUNCE_SECONDS || '60', 10),
+  // gh api 429/503 退避参数
+  backoffBaseMs: parseInt(process.env.REVIEW_BACKOFF_BASE_MS || '1000', 10),
+  maxRetries: parseInt(process.env.REVIEW_MAX_RETRIES || '3', 10),
+};
+// comment upsert 标记行（HTML 注释，GitHub 页面不可见；INV-T2: 必须含 pr@headOid）
+function reviewCommentMarker(pr, headOid) {
+  return `<!-- loopx-flow:review:${pr}@${String(headOid).toLowerCase()} -->`;
+}
+// 读既有评审 artifact；仅 native_check.ok===true 的 artifact 允许短路复用（INV-T1）
+function loadReviewArtifact(pr, headOid) {
+  const p = path.join(REVIEW_RESULT_DIR, `${pr}@${String(headOid).toLowerCase()}.json`);
+  if (!fs.existsSync(p)) return null;
+  try {
+    const a = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (a.schema_version !== 'loopx_flow_review_artifact_v0') return null;
+    if (!a.native_check || a.native_check.ok !== true) return null;
+    return a;
+  } catch (_) { return null; }
+}
+// 列出某 PR 的全部评审 artifact（按 pr 数字前缀匹配），供"零 API 短路"挑最新的一个
+function listReviewArtifactsForPr(pr) {
+  try {
+    if (!fs.existsSync(REVIEW_RESULT_DIR)) return [];
+    const prefix = `${pr}@`;
+    const out = [];
+    for (const f of fs.readdirSync(REVIEW_RESULT_DIR)) {
+      if (!f.startsWith(prefix) || !f.endsWith('.json')) continue;
+      try {
+        const a = JSON.parse(fs.readFileSync(path.join(REVIEW_RESULT_DIR, f), 'utf8'));
+        if (a.schema_version === 'loopx_flow_review_artifact_v0' && a.native_check && a.native_check.ok === true) {
+          out.push(a);
+        }
+      } catch (_) { /* 跳过损坏 artifact */ }
+    }
+    out.sort((x, y) => String(y.reviewed_at || '').localeCompare(String(x.reviewed_at || '')));
+    return out;
+  } catch (_) { return []; }
+}
+// 列出某 PR 的全部评审 artifact（按 pr 数字前缀匹配），供"零 API 短路"挑最新的一个
+function listReviewArtifactsForPr(pr) {
+  try {
+    if (!fs.existsSync(REVIEW_RESULT_DIR)) return [];
+    const prefix = `${pr}@`;
+    const out = [];
+    for (const f of fs.readdirSync(REVIEW_RESULT_DIR)) {
+      if (!f.startsWith(prefix) || !f.endsWith('.json')) continue;
+      try {
+        const a = JSON.parse(fs.readFileSync(path.join(REVIEW_RESULT_DIR, f), 'utf8'));
+        if (a.schema_version === 'loopx_flow_review_artifact_v0' && a.native_check && a.native_check.ok === true) {
+          out.push(a);
+        }
+      } catch (_) { /* 跳过损坏 artifact */ }
+    }
+    out.sort((x, y) => String(y.reviewed_at || '').localeCompare(String(x.reviewed_at || '')));
+    return out;
+  } catch (_) { return []; }
+}
+// 节流窗口判定：artifact 的 reviewed_at 距 now 在 [0, debounceSeconds] 内时短路；
+// debounceSeconds<=0 时禁用时间窗口短路（仅 head-oid 幂等短路仍生效）。
+function withinDebounceWindow(artifact) {
+  if (!artifact || !artifact.reviewed_at || THROTTLE.debounceSeconds <= 0) return false;
+  const ageMs = Date.now() - Date.parse(artifact.reviewed_at);
+  return ageMs >= 0 && ageMs < THROTTLE.debounceSeconds * 1000;
+}
+// head-oid 幂等短路：同一 pr@head 已存在 native_check.ok 的 artifact 时直接复用，
+// 不受 debounceSeconds 限制（避免「同一 head 反复触发完整管线」对 GitHub 限流阈值的冲击）。
+// INV-T1: 短路复用不改变发布结果（正文来自同一 artifact）。
+function headIdempotentShortCircuit(pr) {
+  const recent = listReviewArtifactsForPr(pr);
+  return recent[0] || null;
+}
+// gh api 调用 + 429/503 指数退避（Retry-After 优先，上限 maxRetries 次）
+function ghApiWithBackoff(apiArgs, { repo } = {}) {
+  let attempt = 0;
+  for (;;) {
+    const r = sh('gh', ['api', ...apiArgs], 60000);
+    if (r.status === 0) return { ok: true, out: r.stdout };
+    const text = (r.stderr || r.stdout || '');
+    const m429 = text.match(/(?:429|503)[\s\S]{0,200}retry[- ]?after[:\s]+([0-9]+)/i)
+      || text.match(/retry[- ]?after[:\s]+([0-9]+)/i);
+    if (attempt < THROTTLE.maxRetries && /429|503|abuse|rate.?limit|secondary/i.test(text)) {
+      const waitMs = m429 ? Math.min(parseInt(m429[1], 10) * 1000, 120000) : THROTTLE.backoffBaseMs * 2 ** attempt;
+      console.error(`[THROTTLE-RETRY] gh api 限流 (429/503)，${Math.ceil(waitMs / 1000)}s 后重试 (${attempt + 1}/${THROTTLE.maxRetries})...`);
+      const slept = spawnSync('sleep', [String(Math.ceil(waitMs / 1000))], { timeout: waitMs + 5000 });
+      if (slept.status !== 0) console.error(`[i] 退避 sleep 未完成，继续下一轮`);
+      attempt += 1;
+      continue;
+    }
+    return { ok: false, out: text.slice(0, 400), status: r.status };
+  }
+}
+// comment upsert（T2）：GET 检索本管线标记 comment；命中 → PATCH，未命中 → POST（gh pr comment）。
+// 短路/节流路径始终生效（避免重复推送刷量）；但完整管线的发布阶段受
+// REVIEW_UPSERT_PUBLISH 开关控制（默认关闭 → 直接 gh pr comment，与改造前行为一致，
+// 不干扰既有管线测试断言）。
+function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
+  const marker = reviewCommentMarker(pr, headOid);
+  const trimmed = String(body).replace(/\s+$/g, '');
+  const postedBody = trimmed.includes(marker) ? trimmed : `${trimmed}\n\n${marker}`;
+  if (!useUpsert) {
+    const postedFile = path.join(os.tmpdir(), `authentic-review-report-${pr}.md`);
+    fs.writeFileSync(postedFile, trimmed);
+    const cm = sh('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', postedFile]);
+    if (cm.status !== 0) {
+      throw new Error(`gh pr comment failed: ${(cm.stderr || cm.stdout || '').slice(0, 200)}`);
+    }
+    let commentId = null;
+    try { commentId = Number(JSON.parse(cm.stdout || '{}').id || null) || null; } catch (_) { /* gh 输出非 JSON */ }
+    console.log(trimmed); // 与改造前一致：完整管线发布时将正文回显到 stdout
+    console.log(`[✓] 原生五段式第三方评审报告已发布至 PR #${pr}（head ${String(headOid).slice(0, 10)}）。`);
+    return { mode: 'created', commentId };
+  }
+  const postedFile = path.join(os.tmpdir(), `authentic-review-report-upsert-${pr}.md`);
+  fs.writeFileSync(postedFile, postedBody);
+  // 检索既有 comment（按 PR 评论列表过滤标记；GET 1 次，失败不阻塞发布）
+  // 注意：gh api GET 默认 method 即 GET，无需显式传 "GET" 位置参数
+  const listRes = ghApiWithBackoff([
+    `repos/${repo}/issues/${pr}/comments?per_page=100`,
+  ]);
+  if (listRes.ok) {
+    let comments = [];
+    try { comments = JSON.parse(listRes.out || '[]'); } catch (_) { comments = []; }
+    if (!Array.isArray(comments)) comments = [];
+    console.log(`[THROTTLE-UPSERT] 检索到 ${comments.length} 条既有 comment，标记="${marker}"`);
+    const existing = comments.find(
+      c => c && typeof c.body === 'string' && c.body.includes(marker),
+    );
+    if (existing && existing.id) {
+      const patchRes = ghApiWithBackoff([
+        `-X PATCH`, `repos/${repo}/issues/comments/${existing.id}`,
+        `-F body=@${postedFile}`,
+      ]);
+      if (patchRes.ok) {
+        console.log(`[THROTTLE-UPSERT] 复用既有评审 comment id=${existing.id}（PATCH 更新，不再新增）`);
+        return { mode: 'updated', commentId: existing.id };
+      }
+      console.error(`[THROTTLE-UPSERT] PATCH 失败，回退 POST 新建: ${patchRes.out}`);
+    }
+  } else {
+    console.error(`[THROTTLE-UPSERT] 检索既有 comment 失败（限流/网络），回退 POST 新建: ${listRes.out}`);
+  }
+  // POST 路径：gh pr comment（gh CLI 自身含限流处理）
+  const cm = sh('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', postedFile]);
+  if (cm.status !== 0) {
+    throw new Error(`gh pr comment failed: ${(cm.stderr || cm.stdout || '').slice(0, 200)}`);
+  }
+  let commentId = null;
+  try { commentId = Number(JSON.parse(cm.stdout || '{}').id || null) || null; } catch (_) { /* gh 输出非 JSON */ }
+  console.log(`[THROTTLE-UPSERT] 新建评审 comment（POST）${commentId ? ` id=${commentId}` : ''}，head ${String(headOid).slice(0, 10)}。`);
+  return { mode: 'created', commentId };
+}
+
 function parseArgs(argv) {
   const o = {};
   for (let i = 2; i < argv.length; i++) {
@@ -54,6 +219,7 @@ function parseArgs(argv) {
     else if (a === '--feature') o.feature = argv[++i];
     else if (a === '--agent-bin') o.agentBin = argv[++i];
     else if (a === '--packet-file') o.packetFile = argv[++i];
+    else if (a === '--force-recheck') o.forceRecheck = true;
   }
   return o;
 }
@@ -561,7 +727,7 @@ function assertKeyCodeWalkthrough(reviewBody, behaviorBearing) {
 }
 
 // 落盘评审产物（私有、不入 Git），供 loopx-flow respond 复用原生五段式格式逐项核销。
-function persistReviewArtifact({ pr, headOid, verdict, reviewBody, findings, reviewer, nativeCheck }) {
+function persistReviewArtifact({ pr, headOid, verdict, reviewBody, findings, reviewer, nativeCheck, published }) {
   try {
     fs.mkdirSync(REVIEW_RESULT_DIR, { recursive: true });
     const artifactPath = path.join(REVIEW_RESULT_DIR, `${pr}@${headOid.toLowerCase()}.json`);
@@ -575,6 +741,7 @@ function persistReviewArtifact({ pr, headOid, verdict, reviewBody, findings, rev
       findings,
       native_check: nativeCheck || null,
       review_body: reviewBody,
+      ...(published ? { published } : {}),
     };
     fs.writeFileSync(artifactPath, JSON.stringify(payload, null, 2));
     console.log(`[✓] 评审产物已落盘: ${artifactPath}`);
@@ -663,10 +830,31 @@ function main() {
   }
 
   if (!o.pr || !o.repo) {
-    console.error('usage: authentic-review.js --pr N --repo owner/name [--feature f] [--packet-file f] [--cross-validate] [--rebuild-body] [--agent-bin bin]');
+    console.error('usage: authentic-review.js --pr N --repo owner/name [--feature f] [--packet-file f] [--cross-validate] [--rebuild-body] [--agent-bin bin] [--force-recheck]');
     process.exit(2);
   }
   const feature = o.feature || '';
+
+  // --- 0. T1/T3 head-oid 幂等 + 节流短路（零 API 优先）：
+  //      仅在编排器显式开启 REVIEW_SHORTCIRCUIT=1 时生效（避免本地残留 artifact 误触发，
+  //      默认行为与改造前完全一致）。开启后：
+  //      T1 幂等：该 PR 最近一次 native_check.ok 的 artifact 存在且处于节流窗口内时直接短路——
+  //      不发起任何 gh pr view/diff 与模型重跑（避免同一 head 反复打爆 GitHub 限流）。
+  //      T3 节流：窗口外（reviewed_at 距 now >= debounceSeconds）仍走完整管线重新核验。
+  //      --force-recheck 显式绕过短路。INV-T1: 短路不改变最终发布结果（正文一致）。
+  if (!o.forceRecheck && THROTTLE.shortCircuit) {
+    const latest = headIdempotentShortCircuit(o.pr);
+    if (latest && withinDebounceWindow(latest)) {
+      const headOidReuse = latest.head_oid;
+      console.log(`[THROTTLE] 短路复用既有评审 artifact: .loopx/reviews/${o.pr}@${String(headOidReuse).toLowerCase().slice(0, 10)}.json（${THROTTLE.debounceSeconds}s 节流窗口内，零 API 调用；跳过 gh pr view/diff 与模型重跑）。如需强制重检请加 --force-recheck。`);
+      const reused = publishReviewCommentUpsert({
+        repo: o.repo, pr: o.pr, headOid: headOidReuse, body: latest.review_body,
+        useUpsert: true, // 短路路径始终走 upsert
+      });
+      console.log(`[✓] 复用既有评审结果（verdict=${latest.verdict}，发布模式=${reused.mode}）。Authentic 审查管线完成（短路）。`);
+      process.exit(0);
+    }
+  }
 
   let head, diff;
   try {
@@ -871,24 +1059,17 @@ function main() {
       process.exit(1);
     }
     console.log('[✓] 原生五段式格式/声明校验通过（动机/思路/具体改动/风险/评价 + English verdict + Reviewer 行 + declaration）。');
+    // 发布：完整管线默认直接 gh pr comment（与改造前一致）；REVIEW_UPSERT_PUBLISH=1 时走 upsert
+    const useUpsert = process.env.REVIEW_UPSERT_PUBLISH === '1';
+    const publishRes = publishReviewCommentUpsert({ repo: o.repo, pr: o.pr, headOid, body: reviewBody, useUpsert });
     persistReviewArtifact({
       pr: o.pr, headOid, verdict, reviewBody, findings, reviewer,
       nativeCheck: check.parsed || null,
+      published: { commentId: publishRes.commentId, headOid: headOid.toLowerCase(), mode: publishRes.mode },
     });
   }
 
-  // --- 9. 发布原生五段式评审报告到 PR ---
-  const reportFile = path.join(os.tmpdir(), `authentic-review-report-${o.pr}.md`);
-  fs.writeFileSync(reportFile, reviewBody);
-  console.log(reviewBody);
-  const cm = sh('gh', ['pr', 'comment', String(o.pr), '--repo', o.repo, '--body-file', reportFile]);
-  if (cm.status !== 0) {
-    console.error(`[BLOCKED] gh pr comment failed: ${(cm.stderr || cm.stdout || '').slice(0, 200)}`);
-    process.exit(1);
-  }
-  console.log(`[✓] 原生五段式第三方评审报告已发布至 PR #${o.pr}（head ${headOid.slice(0, 10)}）。Authentic 审查管线完成。`);
-
-  // --- 10. 可选：用胶囊重建 PR body ---
+  // --- 9. 可选：用胶囊重建 PR body ---
   if (o.rebuildBody) {
     const body = buildBody(feature, diff);
     const bodyFile = path.join(os.tmpdir(), `authentic-body-${o.pr}.md`);
