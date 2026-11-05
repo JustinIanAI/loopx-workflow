@@ -168,9 +168,21 @@ cmd_doctor() {
     fi
 }
 
+# 项目本地临时沙箱（ADR-0007 / issue #8）：临时工件禁止硬编码系统 /tmp 固定文件名，
+# 否则多 Agent / 多进程会互相覆写，且重启或清理后证据丢失、平台（macOS /private/tmp、
+# Windows %TEMP%）不可移植。默认写入项目内已 gitignore 的 .loopx/tmp/，文件名必须唯一
+# （mktemp 或 PID/UUID）；CI 或隔离测试可用 LOOPX_TMP_DIR 覆盖该目录。
+LOOPX_TMP_DIR="${LOOPX_TMP_DIR:-$PROJECT_ROOT/.loopx/tmp}"
+
+ensure_loopx_tmp_dir() {
+    mkdir -p "$LOOPX_TMP_DIR"
+}
+
 cmd_init() {
     echo -e "${BLUE}==> 正在初始化 LoopX 工作流环境...${NC}"
     "$PROJECT_ROOT/scripts/workflow-init.sh"
+    mkdir -p "$PROJECT_ROOT/.loopx/tmp"
+    echo -e "${GREEN}[✓] 项目本地临时沙箱已就绪: .loopx/tmp (已 gitignore，可用 LOOPX_TMP_DIR 覆盖)${NC}"
     if command -v loopx >/dev/null 2>&1; then
         echo -e "${BLUE}==> 正在连接 LoopX 本地项目状态...${NC}"
         if ! loopx bootstrap --project "$PROJECT_ROOT"; then
@@ -955,7 +967,8 @@ HELPTXT
             fi
 
             local tmp_body
-            tmp_body="$(mktemp "${TMPDIR:-/tmp}/pr-body-${feature}-XXXXXX.md")"
+            ensure_loopx_tmp_dir
+            tmp_body="$(mktemp "${LOOPX_TMP_DIR}/pr-body-${feature}-XXXXXX.md")"
             node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature" --output-file "$tmp_body"
 
             echo -e "${BLUE}==> [PR 提交] 正在通过 GitHub CLI 创建 PR (对齐 PR #7545 双语 4-Part 体系)...${NC}"
@@ -990,7 +1003,8 @@ HELPTXT
             fi
 
             local tmp_body
-            tmp_body="$(mktemp "${TMPDIR:-/tmp}/pr-body-${feature}-XXXXXX.md")"
+            ensure_loopx_tmp_dir
+            tmp_body="$(mktemp "${LOOPX_TMP_DIR}/pr-body-${feature}-XXXXXX.md")"
             node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature" --output-file "$tmp_body"
 
             echo -e "${BLUE}==> [PR 更新] 正在更新 PR #${pr_id} 描述 (对齐 PR #7545 双语 4-Part 体系)...${NC}"

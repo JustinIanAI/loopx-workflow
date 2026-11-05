@@ -10,7 +10,9 @@ const INGEST_SCRIPT = path.join(PROJECT_ROOT, 'skills/code-review/scripts/ingest
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 
 test('1. Fail-Closed on Blocker: ingest-to-loopx-quality must exit 1 when defects are present', () => {
-  const tmpReviewJson = '/tmp/test-blocker-review.json';
+  // issue #8：测试临时工件隔离在 os.tmpdir()+mkdtemp，禁止共享 /tmp 固定文件名。
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cq-blocker-review-'));
+  const tmpReviewJson = path.join(tmpDir, 'test-blocker-review.json');
   try {
     fs.writeFileSync(tmpReviewJson, JSON.stringify({
       defects: [
@@ -36,7 +38,7 @@ test('1. Fail-Closed on Blocker: ingest-to-loopx-quality must exit 1 when defect
     assert.strictEqual(res.status, 1, 'Script must exit with code 1 when blocker defect is present');
     assert.strictEqual(res.stderr.includes('[BLOCKED]') || res.stdout.includes('[BLOCKED]'), true);
   } finally {
-    if (fs.existsSync(tmpReviewJson)) fs.unlinkSync(tmpReviewJson);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
@@ -48,12 +50,14 @@ test('2. Diff SHA256 Binding: 05-evidence.md must contain exact diff fingerprint
 
   // Isolate from host loopx daemon / network using mock binary in temporary PATH
   const tmpBin = fs.mkdtempSync(path.join(os.tmpdir(), 'mock-loopx-bin-'));
+  const tmpSandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'cq-ingest-tmp-'));
   const mockLoopx = path.join(tmpBin, 'loopx');
   fs.writeFileSync(mockLoopx, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
   const env = {
     ...process.env,
-    PATH: `${tmpBin}:${process.env.PATH || ''}`
+    PATH: `${tmpBin}:${process.env.PATH || ''}`,
+    LOOPX_TMP_DIR: tmpSandbox
   };
 
   try {
@@ -79,6 +83,7 @@ test('2. Diff SHA256 Binding: 05-evidence.md must contain exact diff fingerprint
   } finally {
     fs.rmSync(tmpFeatureDir, { recursive: true, force: true });
     fs.rmSync(tmpBin, { recursive: true, force: true });
+    fs.rmSync(tmpSandbox, { recursive: true, force: true });
   }
 });
 

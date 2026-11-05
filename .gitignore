@@ -22,14 +22,14 @@ __pycache__/
 .pytest_cache/
 
 # Test & Audit Outputs
-/tmp/
 coverage/
 *.log
-/tmp/ocr-audit-report.json
-/tmp/l1-review-evidence.md
 
 # LoopX private runtime artifacts
 .loopx/shadow/
+
+# 项目本地临时工件沙箱（禁止硬编码系统 /tmp 固定文件名，见 AGENTS.md 铁律 6）
+.loopx/tmp/
 
 # LoopX local IDE runtime state (goal leases / active states)
 .codex/
@@ -39,6 +39,7 @@ coverage/
 
 # LoopX private runtime registry & state (boundary compliance)
 .loopx/registry.json
+.loopx/domain-state/
 .loopx/state/
 .loopx/cache/
 .loopx/reviews/

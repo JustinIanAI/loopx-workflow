@@ -1,13 +1,18 @@
-const test = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync, execSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const MOCK_BIN_DIR = path.join(PROJECT_ROOT, '.tmp-mock-bin-dispatch');
-const CALLS_LOG = '/tmp/native-dispatch-mock-calls.log';
+
+// issue #8：测试临时工件隔离在 os.tmpdir()+mkdtemp，禁止共享 /tmp 固定文件名。
+const TEST_TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-native-dispatch-'));
+const CALLS_LOG = path.join(TEST_TMP_DIR, 'native-dispatch-mock-calls.log');
+after(() => fs.rmSync(TEST_TMP_DIR, { recursive: true, force: true }));
 
 function setupMocks() {
   if (!fs.existsSync(MOCK_BIN_DIR)) {
