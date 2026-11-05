@@ -682,9 +682,12 @@ HELPTXT
     fi
 
     # T2 comment upsert: 编排器场景检索既有 respond 标记 comment；命中 → PATCH，未命中 → POST
+    # 标记行置于正文尾部（HTML 注释，页面不可见），与 review 侧 upsert 保持一致，不破坏首行结构
     local marker="<!-- loopx-flow:respond:${pr_id}@${short_sha} -->"
-    local posted_body="$marker
-$(cat "$report_file")"
+    local posted_body
+    posted_body="$(cat "$report_file")
+
+${marker}"
     local posted_file
     posted_file="$(mktemp)"
     printf '%s' "$posted_body" > "$posted_file"

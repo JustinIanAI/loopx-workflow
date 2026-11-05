@@ -4,9 +4,11 @@
  *
  * 验证三项降载改动：
  *   T1 head-oid 幂等：同一 pr@head 已存在 native_check.ok=true 的 artifact 时，
- *      第二次执行短路复用，不再调用 gh pr view / gh pr diff / loopx pr-review（模型执行）。
+ *      第二次执行 1 次 gh pr view 后短路复用，不再取 diff / 重跑模型 / 堆叠评论；
+ *      跨 head 绝不复用（fail-open）。
  *   T2 comment upsert：发布阶段先 GET 检索带标记的 comment；命中 → PATCH，未命中 → POST。
- *   T3 客户端节流：进程内同 head 两次完整执行间隔 < debounceSeconds 时短路。
+ *   T3 客户端节流：同 PR 完整执行间隔 < debounceSeconds 时有界等待合并突发；
+ *      gh api 429/503 指数退避重试。
  *
  * 契约: specs/features/review-pipeline-throttle/04-contract.md
  */
@@ -62,7 +64,9 @@ function makeSandbox(opts = {}) {
     mockHeadOid = HEAD,
     reviewTemplate = 1,
     commentExisting = null, // 预置 comment 标记 → 第二次发布走 PATCH
+    apiFailFirst = false,   // gh api comments 首次返回 429（验证指数退避重试）
   } = opts;
+  const apiStateFile = path.join(dir, 'api-fail-once.state');
 
   const codexStdoutFile = path.join(dir, 'codex-default.json');
   fs.writeFileSync(codexStdoutFile, nativeModelOut({}));
@@ -90,6 +94,11 @@ function makeSandbox(opts = {}) {
     '      exit 0',
     '    fi',
     '    if [[ "$args" == *"api"* && "$args" == *"comments"* ]]; then',
+    `      if [[ "${apiFailFirst}" == "true" && ! -f ${JSON.stringify(apiStateFile)} ]]; then`,
+    `        : > ${JSON.stringify(apiStateFile)}`,
+    '        echo "gh: API rate limit exceeded for user (HTTP 429) retry-after: 0" >&2',
+    '        exit 1',
+    '      fi',
     `      echo ${JSON.stringify(Array.isArray(commentExisting) ? commentExisting : '[]')}`,
     '      exit 0',
     '    fi',
@@ -216,32 +225,44 @@ function seedArtifact(repo, pr, headOid) {
 const FEATURE = 'native-dispatch-deep-integration';
 
 describe('T1 head-oid 幂等短路', () => {
-  test('同一 head 已有 ok artifact 时，第二次执行短路：不再调 gh pr view/diff 与 loopx 模型执行', () => {
+  test('同一 head 已有 ok artifact 时，第二次执行不重跑 diff 与模型，发布走 upsert', () => {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'throttle-repo-'));
     const sbx = makeSandbox();
-    // 第一次：REVIEW_SHORTCIRCUIT=1 但无既有 artifact → 完整管线（正常落盘 .loopx/reviews/7@head.json）
-    const r1 = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {}, repo, 60);
+    // 第一次：无既有 artifact → 完整管线（落盘 .loopx/reviews/7@head.json）
+    const r1 = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {}, repo, 0);
     assert.strictEqual(r1.code, 0, r1.out);
-    // 第二次：T1 幂等 + T3 节流（debounce 窗口内）→ 零 API 短路
-    const r2 = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {}, repo, 60);
+    // 第二次：同一 head 命中幂等 → 1 次 prView 后短路（不 diff、不跑模型、不堆叠评论）
+    const r2 = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {}, repo, 0);
     assert.strictEqual(r2.code, 0, r2.out);
-    assert.match(r2.out, /THROTTLE\] 短路|复用既有/i, '应提示短路复用');
+    assert.match(r2.out, /head-oid 幂等|复用既有评审结果/i, '应提示 head-oid 幂等短路');
     const calls = fs.readFileSync(sbx.logs, 'utf8');
-    // 第一次完整管线: 起始 prView + INV2 复核 prView + diff + 模型执行
-    // 零 API 短路后第二次: 0 次。总数: view=2, diff=1, model=1
+    // 第一次: 起始 prView + INV2 复核 prView + diff + 模型; 第二次: 仅 1 次 prView
     const totalView = (calls.match(/gh .*pr view/g) || []).length;
     const totalDiff = (calls.match(/gh .*pr diff/g) || []).length;
     const totalReviewExec = (calls.match(/loopx .*pr-review .*--format json/g) || []).length;
-    assert.strictEqual(totalView, 2, `gh pr view 应共 2 次（仅第一次：起始+INV2 复核），实际 ${totalView}`);
-    assert.strictEqual(totalDiff, 1, `gh pr diff 应只发生 1 次（仅第一次），实际 ${totalDiff}`);
-    assert.strictEqual(totalReviewExec, 1, `loopx pr-review 模型执行应只发生 1 次，实际 ${totalReviewExec}`);
+    assert.strictEqual(totalView, 3, `gh pr view 应为 3 次（第一次 2 次 + 第二次幂等探测 1 次），实际 ${totalView}`);
+    assert.strictEqual(totalDiff, 1, `gh pr diff 应只发生 1 次（幂等后不得重取 diff），实际 ${totalDiff}`);
+    assert.strictEqual(totalReviewExec, 1, `模型执行应只发生 1 次（幂等后不得重跑），实际 ${totalReviewExec}`);
+  });
+
+  test('head 已漂移时不得复用旧 artifact（跨 head 复用是 fail-open）', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'throttle-repo-'));
+    const OLD_HEAD = '2222222222222222222222222222222222222222';
+    seedArtifact(repo, 7, OLD_HEAD);          // 旧 head 的评审产物
+    const sbx = makeSandbox();                 // gh 报告当前 head = HEAD
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {}, repo, 0);
+    assert.strictEqual(r.code, 0, r.out);
+    assert.ok(!/head-oid 幂等/.test(r.out), 'head 不同不得走幂等短路');
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.strictEqual((calls.match(/loopx .*pr-review .*--format json/g) || []).length, 1,
+      'head 漂移后必须重新执行评审');
   });
 
   test('--force-recheck 绕过短路，强制重跑完整管线', () => {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'throttle-repo-'));
     seedArtifact(repo, 7, HEAD);
     const sbx = makeSandbox();
-    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--force-recheck'], {}, repo, 60);
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--force-recheck'], {}, repo, 0);
     assert.strictEqual(r.code, 0, r.out);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
     assert.ok((calls.match(/loopx .*pr-review .*--format json/g) || []).length >= 1, 'force-recheck 应触发模型执行');
@@ -275,22 +296,44 @@ describe('T2 comment upsert', () => {
   });
 });
 
-describe('T3 进程内节流', () => {
-  test('REVIEW_SHORTCIRCUIT=1 且 REVIEW_DEBOUNCE_SECONDS > 0 且距上次执行 < debounce 时短路复用', () => {
+describe('T3 客户端节流', () => {
+  test('同一 PR 距上次完整执行不足 debounceSeconds 且 head 已漂移：有界等待合并突发后再执行', () => {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'throttle-repo-'));
-    seedArtifact(repo, 7, HEAD);
-    // 给 artifact 注入 reviewed_at = now（节流窗口内）
-    const p = path.join(repo, '.loopx', 'reviews', `7@${HEAD.toLowerCase()}.json`);
-    const art = JSON.parse(fs.readFileSync(p, 'utf8'));
-    art.reviewed_at = new Date().toISOString();
-    fs.writeFileSync(p, JSON.stringify(art, null, 2));
-    const sbx = makeSandbox();
-    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE],
-      {}, repo, 60);
+    const OLD_HEAD = '2222222222222222222222222222222222222222';
+    seedArtifact(repo, 7, OLD_HEAD); // 上次完整执行（不同 head）刚结束
+    const sbx = makeSandbox();       // 当前 head = HEAD（已漂移 → 幂等不命中）
+    const started = Date.now();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {}, repo, 3);
+    const elapsed = Date.now() - started;
     assert.strictEqual(r.code, 0, r.out);
-    assert.match(r.out, /THROTTLE|REUSED|短路|复用/i, '窗口内应短路');
+    assert.match(r.out, /合并突发|等待 \d+s/i, '应提示节流等待');
+    assert.ok(elapsed >= 2000, `应等待约 3s 合并突发，实际 ${elapsed}ms`);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
-    assert.strictEqual((calls.match(/loopx .*pr-review .*--format json/g) || []).length, 0,
-      '节流短路不得触发模型执行');
+    assert.strictEqual((calls.match(/loopx .*pr-review .*--format json/g) || []).length, 1,
+      '等待后仍应完成一次真实评审');
+  });
+
+  test('REVIEW_DEBOUNCE_SECONDS=0 时不做等待（禁用节流窗口）', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'throttle-repo-'));
+    seedArtifact(repo, 7, '2222222222222222222222222222222222222222');
+    const sbx = makeSandbox();
+    const started = Date.now();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {}, repo, 0);
+    const elapsed = Date.now() - started;
+    assert.strictEqual(r.code, 0, r.out);
+    assert.ok(!/合并突发/.test(r.out), 'debounce=0 不应等待');
+    assert.ok(elapsed < 2500, `debounce=0 应立即执行，实际 ${elapsed}ms`);
+  });
+
+  test('gh api 429 触发指数退避重试后成功（不 fail-closed 中断）', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'throttle-repo-'));
+    const sbx = makeSandbox({ apiFailFirst: true, commentExisting: null });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE],
+      { REVIEW_UPSERT_PUBLISH: '1', REVIEW_BACKOFF_BASE_MS: '10' }, repo, 0);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    const apiGetAttempts = (calls.match(/gh api .*comments/g) || []).length;
+    assert.ok(apiGetAttempts >= 2, `429 后应重试检索（实际 ${apiGetAttempts} 次）`);
+    assert.match(calls, /gh .*comment.*--body-file/, '退避重试后仍应完成发布');
   });
 });

@@ -71,7 +71,8 @@ function loadReviewArtifact(pr, headOid) {
     return a;
   } catch (_) { return null; }
 }
-// 列出某 PR 的全部评审 artifact（按 pr 数字前缀匹配），供"零 API 短路"挑最新的一个
+// 列出某 PR 的全部评审 artifact（按 pr 数字前缀匹配），仅供 T3 节流计算"上次完整执行"时间；
+// 绝不用它跨 head 复用评审结果（那会把旧 head 的结论当作当前 head 发布）。
 function listReviewArtifactsForPr(pr) {
   try {
     if (!fs.existsSync(REVIEW_RESULT_DIR)) return [];
@@ -90,38 +91,19 @@ function listReviewArtifactsForPr(pr) {
     return out;
   } catch (_) { return []; }
 }
-// 列出某 PR 的全部评审 artifact（按 pr 数字前缀匹配），供"零 API 短路"挑最新的一个
-function listReviewArtifactsForPr(pr) {
-  try {
-    if (!fs.existsSync(REVIEW_RESULT_DIR)) return [];
-    const prefix = `${pr}@`;
-    const out = [];
-    for (const f of fs.readdirSync(REVIEW_RESULT_DIR)) {
-      if (!f.startsWith(prefix) || !f.endsWith('.json')) continue;
-      try {
-        const a = JSON.parse(fs.readFileSync(path.join(REVIEW_RESULT_DIR, f), 'utf8'));
-        if (a.schema_version === 'loopx_flow_review_artifact_v0' && a.native_check && a.native_check.ok === true) {
-          out.push(a);
-        }
-      } catch (_) { /* 跳过损坏 artifact */ }
-    }
-    out.sort((x, y) => String(y.reviewed_at || '').localeCompare(String(x.reviewed_at || '')));
-    return out;
-  } catch (_) { return []; }
+// T3 节流：距该 PR 上次完整管线执行还需等待的毫秒数（窗口内为剩余量，窗口外/无记录为 0）。
+// 只用于"合并突发完整执行"，不参与 head-oid 幂等判定。
+function throttleRemainingMs(pr) {
+  if (THROTTLE.debounceSeconds <= 0) return 0;
+  const latest = listReviewArtifactsForPr(pr)[0];
+  if (!latest || !latest.reviewed_at) return 0;
+  const ageMs = Date.now() - Date.parse(latest.reviewed_at);
+  if (!(ageMs >= 0)) return 0;
+  const remain = THROTTLE.debounceSeconds * 1000 - ageMs;
+  return remain > 0 ? remain : 0;
 }
-// 节流窗口判定：artifact 的 reviewed_at 距 now 在 [0, debounceSeconds] 内时短路；
-// debounceSeconds<=0 时禁用时间窗口短路（仅 head-oid 幂等短路仍生效）。
-function withinDebounceWindow(artifact) {
-  if (!artifact || !artifact.reviewed_at || THROTTLE.debounceSeconds <= 0) return false;
-  const ageMs = Date.now() - Date.parse(artifact.reviewed_at);
-  return ageMs >= 0 && ageMs < THROTTLE.debounceSeconds * 1000;
-}
-// head-oid 幂等短路：同一 pr@head 已存在 native_check.ok 的 artifact 时直接复用，
-// 不受 debounceSeconds 限制（避免「同一 head 反复触发完整管线」对 GitHub 限流阈值的冲击）。
-// INV-T1: 短路复用不改变发布结果（正文来自同一 artifact）。
-function headIdempotentShortCircuit(pr) {
-  const recent = listReviewArtifactsForPr(pr);
-  return recent[0] || null;
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 // gh api 调用 + 429/503 指数退避（Retry-After 优先，上限 maxRetries 次）
 function ghApiWithBackoff(apiArgs, { repo } = {}) {
@@ -835,36 +817,52 @@ function main() {
   }
   const feature = o.feature || '';
 
-  // --- 0. T1/T3 head-oid 幂等 + 节流短路（零 API 优先）：
-  //      仅在编排器显式开启 REVIEW_SHORTCIRCUIT=1 时生效（避免本地残留 artifact 误触发，
-  //      默认行为与改造前完全一致）。开启后：
-  //      T1 幂等：该 PR 最近一次 native_check.ok 的 artifact 存在且处于节流窗口内时直接短路——
-  //      不发起任何 gh pr view/diff 与模型重跑（避免同一 head 反复打爆 GitHub 限流）。
-  //      T3 节流：窗口外（reviewed_at 距 now >= debounceSeconds）仍走完整管线重新核验。
-  //      --force-recheck 显式绕过短路。INV-T1: 短路不改变最终发布结果（正文一致）。
-  if (!o.forceRecheck && THROTTLE.shortCircuit) {
-    const latest = headIdempotentShortCircuit(o.pr);
-    if (latest && withinDebounceWindow(latest)) {
-      const headOidReuse = latest.head_oid;
-      console.log(`[THROTTLE] 短路复用既有评审 artifact: .loopx/reviews/${o.pr}@${String(headOidReuse).toLowerCase().slice(0, 10)}.json（${THROTTLE.debounceSeconds}s 节流窗口内，零 API 调用；跳过 gh pr view/diff 与模型重跑）。如需强制重检请加 --force-recheck。`);
-      const reused = publishReviewCommentUpsert({
-        repo: o.repo, pr: o.pr, headOid: headOidReuse, body: latest.review_body,
-        useUpsert: true, // 短路路径始终走 upsert
-      });
-      console.log(`[✓] 复用既有评审结果（verdict=${latest.verdict}，发布模式=${reused.mode}）。Authentic 审查管线完成（短路）。`);
-      process.exit(0);
-    }
-  }
-
-  let head, diff;
+  // --- 0. T1 head-oid 幂等（仅在编排器显式开启 REVIEW_SHORTCIRCUIT=1 时生效；
+  //      默认关闭 → 行为与改造前完全一致，不误触本地残留 artifact）：
+  //      以 1 次 gh pr view 取当前 head，命中 pr@当前head 的 native_check.ok artifact
+  //      即短路复用，跳过 gh pr diff / loopx 评审包 / 模型重跑 / 重复评论。
+  //      关键：只认同 head，跨 head 复用会把旧 head 结论当新 head 发布（fail-open）。
+  //      --force-recheck 显式绕过。
+  let head;
   try {
     head = prView(o.repo, o.pr);
-    diff = prDiff(o.repo, o.pr);
   } catch (e) {
     console.error(`[BLOCKED] ${e.message}`);
     process.exit(1);
   }
   const headOid = head.headRefOid;
+
+  if (!o.forceRecheck && THROTTLE.shortCircuit) {
+    const sameHead = loadReviewArtifact(o.pr, headOid);
+    if (sameHead) {
+      const short = String(headOid).toLowerCase().slice(0, 10);
+      console.log(`[THROTTLE] 命中 head-oid 幂等：.loopx/reviews/${o.pr}@${short}.json（当前 head 已评审且 native_check.ok；跳过 gh pr diff / 模型重跑，发布走 comment upsert）。如需强制重检请加 --force-recheck。`);
+      const reused = publishReviewCommentUpsert({
+        repo: o.repo, pr: o.pr, headOid, body: sameHead.review_body,
+        useUpsert: true, // 幂等复用路径始终走 upsert，避免每次重跑堆叠新评论
+      });
+      console.log(`[✓] 复用既有评审结果（verdict=${sameHead.verdict}，发布模式=${reused.mode}）。Authentic 审查管线完成（幂等短路）。`);
+      process.exit(0);
+    }
+  }
+
+  // --- 0b. T3 客户端节流：同一 PR 的完整管线执行间隔不足 debounceSeconds 时，
+  //        合并突发（有界等待，最多 debounceSeconds），避免 push→评审 热循环打爆限流。
+  if (!o.forceRecheck && THROTTLE.shortCircuit) {
+    const waitMs = throttleRemainingMs(o.pr);
+    if (waitMs > 0) {
+      console.log(`[THROTTLE] 距该 PR 上次完整评审不足 ${THROTTLE.debounceSeconds}s，合并突发：等待 ${Math.ceil(waitMs / 1000)}s 后再执行（上限 ${THROTTLE.debounceSeconds}s）。`);
+      sleepSync(waitMs);
+    }
+  }
+
+  let diff;
+  try {
+    diff = prDiff(o.repo, o.pr);
+  } catch (e) {
+    console.error(`[BLOCKED] ${e.message}`);
+    process.exit(1);
+  }
 
   // --- 1. 取原生评审包（格式与提示词的唯一权威；不可用即 fail-closed）---
   let packet = null;
