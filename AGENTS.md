@@ -25,7 +25,7 @@
    - 规则来源是 `docs/adr/0001-product-source-of-truth.md`。**ADR 准入矩阵**：仅改变权威所有者/默认行为/非纯增量状态或 Schema/不可逆迁移/共享契约才立 ADR；普通 Feature/Bug/测试/文档不立，引用既有 `REQ-*`/ADR。`approve`/`gate verify contract` 已按 `REQ-TRACE-2` 检查契约至少引用一条 REQ/ADR；完整追溯按 `REQ-TRACE-3` 分级执行。
 3. **断点 1 契约冻结与审批先行 (Contract Freeze & Checkpoint 1 Approval)**：
    - 在 `specs/features/<feature>/04-contract.md` 顶部必须冻结不可变 TypeScript 接口签名与断言不变量。
-   - Gate1 = **Specification Authorization**：`loopx-flow approve contract <feature>` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；`single_owner` 需 TTY 确认 + 风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 Story 的 AC、至少一条 REQ/ADR；锁定 04-contract SHA256（`configure-goal --progress-review-contract-revision`）并写 `user_gate` 授权记录后，才写 `Contract-Status: FROZEN & APPROVED`。任一步失败非 0，不得留批准标记。
+   - Gate1 = **Specification Authorization**：`loopx-flow approve contract <feature>` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；`single_owner` 需 TTY 确认 + 风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 story id 在契约 AC 矩阵中的一行、至少一条 REQ/ADR；锁定 04-contract SHA256（`configure-goal --progress-review-contract-revision`）并写 `user_gate` 授权记录后，才写 `Contract-Status: FROZEN & APPROVED`。任一步失败非 0，不得留批准标记。
 4. **多 Agent 任务排他锁与反熵增 (Multi-Agent Concurrency & Anti-Entropy)**：
    - 并行工作时，必须先通过 `loopx-flow todo claim <todo-id> --goal-id <gid>` 锁定租约（内部完成 register-agent + task-lease acquire --owner --idempotency-key），严禁争抢同一任务。
    - 多特性分支开发时，合并前必须通过 `loopx integration-branch` 在本地隔离 worktree 提前探测并解决冲突。

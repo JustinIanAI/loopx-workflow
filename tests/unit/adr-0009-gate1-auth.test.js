@@ -196,6 +196,41 @@ test('T9 gate verify：配置模式与 evidence 模式不一致必须失败', ()
   } finally { h.cleanup(dir); }
 });
 
+test('story id 不在契约 AC 矩阵 → approve 非 0 且不写批准标记', () => {
+  const dir = sandboxWithConfig('independent');
+  try {
+    h.writeCapsule(dir, FEATURE, {
+      stories: '# Stories\n\n- **Story-09**: 孤立故事\n  - AC-09-1: 故事文件里有 AC，矩阵没有对应行\n',
+      contract: [
+        '# Contract: ' + FEATURE,
+        '',
+        '- **Contract-Status**: DRAFT (Pending Approval)',
+        '',
+        '## 2. AC 矩阵',
+        '',
+        '| AC | Story | 验证 |',
+        '|---|---|---|',
+        '| AC-01-1 | Story-01 | tests/unit/adr-0009-gate1-auth.test.js |',
+        '',
+        '## 3. Scope / 非目标',
+        '',
+        '- **Scope**: 仅本特性',
+        '- **Verification Plan**: npm run test',
+        '- **依赖顺序**: Story-01',
+        '- **引用**: REQ-CHECKPOINT-1',
+        ''
+      ].join('\n')
+    });
+    approveLoopxMock(dir);
+    approveGhMock(dir, path.join(dir, 'comments.json'));
+    const r = h.run(dir, ['approve', 'contract', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /AC 矩阵/);
+    assert.match(r.stderr + r.stdout, /Story-09/);
+    assert.doesNotMatch(fs.readFileSync(path.join(dir, 'specs/features', FEATURE, '04-contract.md'), 'utf8'), /FROZEN & APPROVED/);
+  } finally { h.cleanup(dir); }
+});
+
 test('T0 gate verify：single_owner 配置 + 匹配 evidence 通过', () => {
   const { dir } = gateVerifySandbox({});
   try {
