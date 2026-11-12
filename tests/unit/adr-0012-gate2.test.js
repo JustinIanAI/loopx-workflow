@@ -196,6 +196,33 @@ test('T9 已 MERGED 但缺 release-authorization → 记审计告警而非静默
   } finally { h.cleanup(dir); }
 });
 
+test('配置损坏时 merge 非 0，不退回 reviewDecision，不调用 gh pr merge', () => {
+  const { dir } = setup({ mode: 'single_owner', decision: 'APPROVED' });
+  fs.writeFileSync(path.join(dir, 'loopx-workflow.config.json'), '{');
+  try {
+    const r = h.run(dir, ['merge', '1', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /授权配置|authorization_mode/);
+    assert.doesNotMatch(r.stdout + r.stderr, /审查决议确认/);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), '');
+  } finally { h.cleanup(dir); }
+});
+
+test('authorization_mode 为空时 merge 非 0，不退回 reviewDecision', () => {
+  const { dir } = setup({ mode: 'single_owner', decision: 'APPROVED' });
+  fs.writeFileSync(path.join(dir, 'loopx-workflow.config.json'), JSON.stringify({
+    schema_version: 'loopx_workflow_config_v0',
+    authorization_mode: ''
+  }));
+  try {
+    const r = h.run(dir, ['merge', '1', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /授权配置|authorization_mode/);
+    assert.doesNotMatch(r.stdout + r.stderr, /审查决议确认/);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), '');
+  } finally { h.cleanup(dir); }
+});
+
 test('Mode B 接受 Agent review issue comment（当前发布通道）作为 head 证据', () => {
   const { dir, contractSha } = setup({
     mode: 'single_owner',

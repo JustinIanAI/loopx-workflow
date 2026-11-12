@@ -138,7 +138,7 @@ L0 命令不是 LoopX 转发器，而是场景操作契约。每条命令必须�
 | 8 断点 2 | 归档目录与已停机的 Goal | Mode A：GitHub 非作者 Approve；Mode B：`release-approve`；之后 `merge` |
 
 
-**Gate1（Specification Authorization）**：`approve contract` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；`single_owner` 需 TTY 确认 + 风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 Story 的 AC、至少一条 REQ/ADR；锁 04-contract SHA 并写 `user_gate` 授权记录（固定 evidence 串）；任一失败非 0 且不写批准标记。
+**Gate1（Specification Authorization）**：`approve contract` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；`single_owner` 需 TTY 确认 + 风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 story id 在 AC 矩阵中的一行、至少一条 REQ/ADR；锁 04-contract SHA 并写 `user_gate` 授权记录（固定 evidence 串）；任一失败非 0 且不写批准标记。
 
 **Gate2（Release Authorization）**：Mode A（`independent`）要求非作者 formal review `APPROVED` 且 `review.commit_id == headRefOid`；Mode B（`single_owner`）要求当前 head 的 Agent COMMENT + `release-approve` 评论（head/contract 与当前 PR 一致）；`merge` 按模式复核 readiness、二次 HEAD 后合入。Gate1 批准不得继承为 Gate2。
 
@@ -284,7 +284,8 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | 当前分支是 `main` 或 `master` | 已安装的 pre-commit | 拒绝 `git commit` |
 | 未跑过 `init` | `git commit` on `main` | 钩子不存在，本仓库命令不会拦截 |
 | 缺 `loopx-workflow.config.json` 或 Gate1 配置无效 | `approve contract` | 非 0，不写批准标记 |
-| 规格包缺 AC/Scope/Verification Plan 或 Story 无 AC | `approve contract` | 非 0，不写批准标记 |
+| 规格包缺 AC/Scope/Verification Plan、Story 无 AC，或 story id 在 AC 矩阵无行 | `approve contract` | 非 0，不写批准标记 |
+| 配置文件存在但 JSON 非法或 `authorization_mode` 非法 | `merge` | 非 0，不退回 `reviewDecision`，不调用 `gh pr merge` |
 | `single_owner` 缺风险接受 | `approve contract` | 非 0 |
 | `independent` 缺有效第二账号 `gate=1` 评论 | `approve contract` | 非 0 |
 | 授权记录缺失/被取代/evidence 缺键/模式不一致 | `gate verify contract` | 非 0 |

@@ -513,6 +513,28 @@ gate1_spec_complete() {
     grep -Eq 'REQ-|ADR-' "$contract" || return 1
     if [[ -f "$stories" ]] && grep -qi 'Story' "$stories"; then
         grep -qi 'AC' "$stories" || return 1
+        # ADR-0009 决策 5③：每个 story id 必须在契约 AC 矩阵里占一行，不能只在故事文件里搜到 AC。
+        node -e '
+const fs = require("fs");
+const stories = fs.readFileSync(process.argv[1], "utf8");
+const contract = fs.readFileSync(process.argv[2], "utf8");
+const ids = [...new Set([...stories.matchAll(/\bStory-\d+\b/g)].map((m) => m[0]))];
+if (!ids.length) process.exit(0);
+let matrix = "";
+const heading = contract.search(/^#{1,6}[^\n]*AC\s*矩阵/im);
+if (heading >= 0) {
+  const rest = contract.slice(heading);
+  const next = rest.slice(1).search(/\n#{1,6} /);
+  matrix = next >= 0 ? rest.slice(0, next + 1) : rest;
+} else {
+  matrix = contract.split(/\n/).filter((line) => /\bAC\b/i.test(line)).join("\n");
+}
+const missing = ids.filter((id) => !new RegExp("\\b" + id + "\\b").test(matrix));
+if (missing.length) {
+  console.error("AC 矩阵缺少 story: " + missing.join(","));
+  process.exit(1);
+}
+' "$stories" "$contract" || return 1
     fi
     return 0
 }
@@ -783,7 +805,7 @@ cmd_approve() {
         echo "[-] [FAIL-CLOSED] 01-decisions.md 未标记 APPROVED" >&2; exit 1
     fi
     if ! gate1_spec_complete "$feature"; then
-        echo "[-] [FAIL-CLOSED] 规格不完整: 04-contract 需含 AC/Scope/Verification Plan/依赖顺序/REQ或ADR，Story 需有 AC" >&2; exit 1
+        echo "[-] [FAIL-CLOSED] 规格不完整: 04-contract 需含 AC/Scope/Verification Plan/依赖顺序/REQ或ADR，且每个 story id 在 AC 矩阵中有一行" >&2; exit 1
     fi
 
     local principal="" executor="" spec_commit=""
@@ -1510,7 +1532,15 @@ cmd_merge() {
         feature="${BASH_REMATCH[1]}"
     fi
     local auth_mode_val=""
-    if [[ -f "$(auth_config_path)" ]]; then auth_mode_val="$(auth_mode)"; fi
+    if [[ -f "$(auth_config_path)" ]]; then
+        # 文件在但解析失败或 mode 非法时，禁止退回「无配置」的 reviewDecision 路径（ADR-0009：非法配置即非 0）。
+        auth_require_config
+        auth_mode_val="$(auth_mode)"
+        if [[ "$auth_mode_val" != "independent" && "$auth_mode_val" != "single_owner" ]]; then
+            echo -e "${RED}[-] [FAIL-CLOSED] authorization_mode 无法解析，禁止退回 reviewDecision。${NC}" >&2
+            exit 1
+        fi
+    fi
     local original_branch
     original_branch="$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null || true)"
 
