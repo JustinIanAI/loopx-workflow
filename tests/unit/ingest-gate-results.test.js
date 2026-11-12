@@ -12,7 +12,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, execSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const INGEST_SCRIPT = path.join(PROJECT_ROOT, 'skills/code-review/scripts/ingest-to-loopx-quality.js');
@@ -167,7 +167,8 @@ test('5. 四门禁全绿：退出 0，05-evidence 记录来源与逐门禁真实
     assert.strictEqual(res.status, 0, '全绿必须退出 0: ' + res.stderr);
     const text = readEvidence(sandbox);
     assert.strictEqual(text.includes('PASSING'), true);
-    assert.strictEqual(text.includes(gateFile), true, '必须记录 gate-results 来源路径');
+    assert.strictEqual(text.includes(GATE_RESULTS_SCHEMA), true, '来源必须是稳定的 schema，不能写宿主机临时路径');
+    assert.strictEqual(text.includes(gateFile), false, '临时路径会让每次 check 改写证据');
     for (const name of ['typecheck', 'lint', 'build', 'test']) {
       const row = gateRow(text, name);
       assert.ok(row && row.includes(BT + '0' + BT), name + ' 行必须记录真实退出码 0: ' + row);
@@ -177,5 +178,46 @@ test('5. 四门禁全绿：退出 0，05-evidence 记录来源与逐门禁真实
     assert.strictEqual(text.includes('not_applicable'), false, '四门禁不得标 not_applicable');
   } finally {
     cleanup(sandbox);
+  }
+});
+
+test('6. 已跟踪的 05-evidence 再 ingest 一次不得改字节', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ingest-stable-'));
+  const feature = 'stable-evidence';
+  const tmpBin = fs.mkdtempSync(path.join(os.tmpdir(), 'ingest-stable-bin-'));
+  let gateFile = '';
+  try {
+    execSync('git init -q && git config user.email t@example.com && git config user.name t', { cwd: dir });
+    fs.mkdirSync(path.join(dir, 'specs/features', feature), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'README.md'), '# stable\n');
+    execSync('git add -A && git commit -qm init', { cwd: dir });
+    const base = execSync('git rev-parse HEAD', { cwd: dir, encoding: 'utf8' }).trim();
+    const mock = [
+      '#!/usr/bin/env bash',
+      'if [[ "$*" == *prepare* ]]; then',
+      '  printf \'%s\\n\' \'{"scope":{"scope_fingerprint":"fixture","base_commit":"' + base + '","base_ref":"HEAD"}}\'',
+      '  exit 0',
+      'fi',
+      'exit 0'
+    ].join('\n');
+    fs.writeFileSync(path.join(tmpBin, 'loopx'), mock, { mode: 0o755 });
+    gateFile = path.join(os.tmpdir(), 'ingest-stable-gates-' + process.pid + '.json');
+    fs.writeFileSync(gateFile, JSON.stringify({ schema_version: GATE_RESULTS_SCHEMA, gates: allPassGates() }));
+    const run = () => spawnSync(process.execPath, [
+      INGEST_SCRIPT, '--feature', feature, '--goal-id', feature + '-goal', '--gate-results', gateFile
+    ], { cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: tmpBin + ':' + (process.env.PATH || '') } });
+    const first = run();
+    assert.strictEqual(first.status, 0, first.stdout + first.stderr);
+    const evidencePath = path.join(dir, 'specs/features', feature, '05-evidence.md');
+    const before = fs.readFileSync(evidencePath, 'utf8');
+    execSync('git add specs/features/' + feature + '/05-evidence.md && git commit -qm evidence', { cwd: dir });
+    const second = run();
+    assert.strictEqual(second.status, 0, second.stdout + second.stderr);
+    assert.strictEqual(fs.readFileSync(evidencePath, 'utf8'), before);
+    assert.strictEqual(execSync('git status --porcelain', { cwd: dir, encoding: 'utf8' }), '');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(tmpBin, { recursive: true, force: true });
+    if (gateFile) fs.rmSync(gateFile, { force: true });
   }
 });

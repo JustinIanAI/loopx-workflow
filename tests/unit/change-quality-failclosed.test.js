@@ -91,7 +91,8 @@ test('2. Diff SHA256 Binding: 05-evidence.md must contain exact diff fingerprint
     assert.strictEqual(text.includes('Diff SHA256'), true, 'Evidence must record exact Diff SHA256');
     assert.strictEqual(text.includes('PASSING'), true);
     assert.strictEqual(text.includes('Gate Results Source'), true, 'Evidence must name gate-results source');
-    assert.strictEqual(text.includes(gateResultsFile), true, 'Evidence must record the real gate-results path');
+    assert.strictEqual(text.includes('loopx_flow_gate_results_v0'), true, 'Evidence source must be the stable schema id');
+    assert.strictEqual(text.includes(gateResultsFile), false, 'Evidence must not embed the host temp path');
   } finally {
     fs.rmSync(tmpFeatureDir, { recursive: true, force: true });
     fs.rmSync(tmpBin, { recursive: true, force: true });
