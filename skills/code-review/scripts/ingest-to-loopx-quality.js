@@ -10,6 +10,7 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, spawnSync } = require('child_process');
@@ -21,6 +22,7 @@ function parseArgs() {
     goalId: '',
     reviewJson: '',
     ocrJson: '',
+    gateResults: '',
     baseRef: 'origin/main',
     strict: true
   };
@@ -35,6 +37,8 @@ function parseArgs() {
       options.reviewJson = args[++i];
     } else if (arg === '--ocr-json' && args[i + 1]) {
       options.ocrJson = args[++i];
+    } else if (arg === '--gate-results' && args[i + 1]) {
+      options.gateResults = args[++i];
     } else if (arg === '--base-ref' && args[i + 1]) {
       options.baseRef = args[++i];
     }
@@ -158,6 +162,179 @@ function scanDiffForDefects(diffText) {
   return defects;
 }
 
+// ── 四门禁实测结果：check 落盘 → ingest 消费，ingest 绝不重跑门禁（ADR-0011 §2/§3） ──
+// typecheck/lint/build/test 是固定证据槽位，不得标 not_applicable；缺结果时写 not_run
+// 并让 check 非 0，禁止把缺失结果补写成 passed。
+const REQUIRED_GATES = ['typecheck', 'lint', 'build', 'test'];
+const GATE_RESULTS_SCHEMA = 'loopx_flow_gate_results_v0';
+const GATE_COMMANDS = {
+  typecheck: 'npm run typecheck',
+  lint: 'npm run lint',
+  build: 'npm run build',
+  test: 'npm run test'
+};
+const GATE_COVERAGE = {
+  typecheck: '覆盖核心类型与接口定义',
+  lint: '语法与格式校验',
+  build: '产物构建与 CLI 入口健康度',
+  test: '单测套件与独立断言'
+};
+const GATE_RESIDUAL = {
+  typecheck: '无',
+  lint: '无',
+  build: '无',
+  test: '依赖本地环境'
+};
+
+// 读取 --gate-results：缺失/不可读/非法 JSON/schema 不符都降级为「没有结果」，
+// 由 normalizeGate 统一写 not_run 并让进程非 0（fail-closed，无例外）。
+function readGateResults(gateResultsPath) {
+  const snapshot = {
+    source: gateResultsPath ? String(gateResultsPath) : '',
+    error: '',
+    entries: {}
+  };
+  if (!gateResultsPath) {
+    snapshot.error = '未提供 --gate-results（ingest 不重跑四门禁，缺结果拒绝写 passed）';
+    return snapshot;
+  }
+  let raw;
+  try {
+    raw = fs.readFileSync(gateResultsPath, 'utf8');
+  } catch (err) {
+    snapshot.error = `gate-results 不可读: ${err.message}`;
+    return snapshot;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    snapshot.error = `gate-results 不是合法 JSON: ${err.message}`;
+    return snapshot;
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.gates)) {
+    snapshot.error = 'gate-results 缺少 gates 数组';
+    return snapshot;
+  }
+  if (parsed.schema_version !== undefined && parsed.schema_version !== GATE_RESULTS_SCHEMA) {
+    snapshot.error = `gate-results schema_version 不是 ${GATE_RESULTS_SCHEMA}`;
+    return snapshot;
+  }
+  for (const entry of parsed.gates) {
+    if (!entry || typeof entry.name !== 'string' || !entry.name) continue;
+    // 同名门禁重复出现时以首次为准，不叠加/不择优。
+    if (Object.prototype.hasOwnProperty.call(snapshot.entries, entry.name)) continue;
+    snapshot.entries[entry.name] = entry;
+  }
+  return snapshot;
+}
+
+// 门禁归一化（fail-closed）：只有 status=passed 且 exit_code===0 才算 passed；
+// 非零真实退出码优先判 failed；其余缺失/未跑/自相矛盾一律 not_run。
+function normalizeGate(name, entry) {
+  const defaultCommand = GATE_COMMANDS[name] || `npm run ${name}`;
+  const coverage = GATE_COVERAGE[name] || '门禁实测';
+  const residual = GATE_RESIDUAL[name] || '无';
+  if (!entry) {
+    return { name, command: defaultCommand, coverage, residual, exitCode: null, status: 'not_run', reason: '门禁结果缺失' };
+  }
+  const exitCode = typeof entry.exit_code === 'number' && Number.isFinite(entry.exit_code) ? entry.exit_code : null;
+  const declared = typeof entry.status === 'string' ? entry.status : '';
+  const command = typeof entry.command === 'string' && entry.command.trim() ? entry.command.trim() : defaultCommand;
+  if (exitCode !== null && exitCode !== 0) {
+    return { name, command, coverage, residual, exitCode, status: 'failed', reason: `真实退出码 ${exitCode}` };
+  }
+  if (declared === 'failed') {
+    return { name, command, coverage, residual, exitCode, status: 'failed', reason: 'status=failed' };
+  }
+  if (declared === 'passed' && exitCode === 0) {
+    return { name, command, coverage, residual, exitCode, status: 'passed', reason: '' };
+  }
+  return {
+    name, command, coverage, residual, exitCode, status: 'not_run',
+    reason: declared ? `status=${declared}` : 'status 缺失或未实测'
+  };
+}
+
+function collectGates(snapshot) {
+  return REQUIRED_GATES.map((name) => normalizeGate(name, snapshot.entries[name]));
+}
+
+function summarizeGateVerdict(gates) {
+  if (gates.some((g) => g.status === 'failed')) return 'failed';
+  if (gates.some((g) => g.status !== 'passed')) return 'not_run';
+  return 'passed';
+}
+
+// LoopX validation.status 只能是 passed/failed/skipped（ADR-0011 §10）：
+// not_run/blocked/deferred → skipped + required:true；not_applicable 不进入门禁行。
+function toLoopXValidation(gates) {
+  return gates.map((g) => ({
+    validator: g.name,
+    status: g.status === 'passed' ? 'passed' : (g.status === 'failed' ? 'failed' : 'skipped'),
+    scope: 'exact_scope',
+    required: true
+  }));
+}
+
+function receiptStatusLabel(gateVerdict) {
+  if (gateVerdict === 'passed') return 'PASSING (Strict Mode Verified)';
+  if (gateVerdict === 'failed') return 'FAILED (Gate Failures Present)';
+  return 'NOT_RUN (Gate Results Missing or Incomplete)';
+}
+
+function formatGateExitCode(gate) {
+  return gate.exitCode === null ? 'N/A' : String(gate.exitCode);
+}
+
+// 05-evidence.md 由 ingest 生成（禁止手写覆盖）：逐门禁写真实退出码 + gate-results 来源。
+function buildEvidenceContent(context) {
+  const gateRows = context.gates.map((gate) => (
+    `| \`${gate.name}\` | \`${gate.command}\` | \`${formatGateExitCode(gate)}\` | ${gate.status} | ${gate.coverage} | \`${gate.command}\` | exact_scope | real | ${gate.residual} |`
+  )).join('\n');
+  const gateWarning = context.gateSnapshot.error
+    ? `- **Gate Results Warning**: \`${context.gateSnapshot.error}\`\n`
+    : '';
+  const scopeLine = context.scope
+    ? `- **LoopX Scope Fingerprint**: \`${context.scope.fingerprint}\``
+    : '';
+
+  return `# Quality & Verification Evidence: ${context.feature}
+
+## 1. LoopX 质量凭据 (Change Quality Receipt)
+- **Status**: \`${receiptStatusLabel(context.gateVerdict)}\`
+- **Review Engine**: \`${context.reviewSource}\`
+- **Diff SHA256 (scan scope)**: \`${context.diffSha256}\`
+- **Receipt Chain**: \`Fail-Closed (prepare -> record -> verify, gate re-verified in check [3/3])\`
+${scopeLine}
+
+## 2. 代码审查结论 (Code Review Insights)
+- **Reviewer**: \`${context.reviewSource}\`
+- **Blocker 缺陷数**: \`${context.blockerCount}\`
+- **Warnings / Advisory**: \`${context.warningCount}\`
+- **反熵增治理**: 执行 \`delete-first\`，彻底消除旧逻辑与废弃变量，零幽灵代码。
+
+## 3. 本地四大硬门禁实测 (4-Slot Fresh Evidence)
+- **Gate Results Source**: \`${context.gateSnapshot.source || 'NOT_PROVIDED'}\`
+- **Gate Results Schema**: \`${GATE_RESULTS_SCHEMA}\`
+- **Gate Verdict**: \`${context.gateVerdict}\`
+${gateWarning}
+| 门禁动作 | 命令 | 退出码 | 实测状态 | 覆盖说明 | Oracle | Scope | Real-vs-Mock | 残余风险与假设 |
+|---|---|---|---|---|---|---|---|---|
+${gateRows}
+`;
+}
+
+// 仅在 feature 胶囊目录存在时写 05-evidence（与既有 fail-closed 行为一致）。
+function writeEvidence(opts, content) {
+  const evidencePath = path.resolve(process.cwd(), `specs/features/${opts.feature}/05-evidence.md`);
+  if (!fs.existsSync(path.dirname(evidencePath))) {
+    return '';
+  }
+  fs.writeFileSync(evidencePath, content, 'utf8');
+  return evidencePath;
+}
+
 function main() {
   const opts = parseArgs();
   console.log(`[LoopX Quality Ingestion] Processing for feature: ${opts.feature || 'default'}, goal: ${opts.goalId || 'default'}`);
@@ -246,6 +423,47 @@ function main() {
     process.exit(1);
   }
 
+  // 3.6 四门禁实测结果（check 落盘 → ingest 消费）：缺结果或任一门禁失败必须先写
+  //     真实证据再非 0；绝不记录 passed 收据，也绝不把缺失结果补写成 passed。
+  const gateSnapshot = readGateResults(opts.gateResults);
+  const gates = collectGates(gateSnapshot);
+  const gateVerdict = summarizeGateVerdict(gates);
+  const evidenceContext = {
+    feature: opts.feature,
+    reviewSource,
+    blockerCount,
+    warningCount,
+    diffSha256,
+    scope,
+    gateSnapshot,
+    gates,
+    gateVerdict
+  };
+
+  if (gateVerdict !== 'passed') {
+    if (gateSnapshot.error) {
+      console.warn(`[!] ${gateSnapshot.error}；四门禁按 not_run 处理。`);
+    }
+    if (opts.feature) {
+      const nonPassingEvidence = writeEvidence(opts, buildEvidenceContent(evidenceContext));
+      if (nonPassingEvidence) {
+        console.warn(`[!] 已写入非全绿证据: ${nonPassingEvidence}`);
+      }
+    }
+    const failedGates = gates.filter((g) => g.status === 'failed');
+    const notRunGates = gates.filter((g) => g.status !== 'passed' && g.status !== 'failed');
+    const detailParts = [];
+    if (failedGates.length > 0) {
+      detailParts.push(`failed: ${failedGates.map((g) => `${g.name}(exit=${formatGateExitCode(g)})`).join(', ')}`);
+    }
+    if (notRunGates.length > 0) {
+      detailParts.push(`not_run: ${notRunGates.map((g) => g.name).join(', ')}`);
+    }
+    console.error(`\n[BLOCKED] 四门禁未全绿 (${gateVerdict}): ${detailParts.join(' | ') || '无实测结果'}`);
+    console.error('[BLOCKED] ingest 只消费 check 的四门禁退出码；缺结果或失败时拒绝写 passed 收据。');
+    process.exit(1);
+  }
+
   // 4. Assemble change_quality_agent_result_v2 payload
   const changedFiles = [];
   for (const m of scopeDiff.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)) {
@@ -278,18 +496,16 @@ function main() {
       safe_fix_applied: false
     },
     risks,
-    validation: [
-      { validator: 'typecheck', status: 'passed', scope: 'exact_scope', required: true },
-      { validator: 'lint', status: 'passed', scope: 'exact_scope', required: true },
-      { validator: 'build', status: 'passed', scope: 'exact_scope', required: true },
-      { validator: 'test', status: 'passed', scope: 'exact_scope', required: true }
-    ]
+    // 只翻译实测结果：passed→passed；failed→failed；not_run→skipped+required:true。
+    validation: toLoopXValidation(gates)
   };
   if (scope) {
     qualityResult.scope_fingerprint = scope.fingerprint;
   }
 
-  const tempResultPath = '/tmp/change-quality-agent-result.json';
+  // 独立临时目录：并行运行（如 Lead 同时跑 check 与单测）时互不覆盖 payload。
+  const tempResultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-change-quality-'));
+  const tempResultPath = path.join(tempResultDir, 'change-quality-agent-result.json');
   fs.writeFileSync(tempResultPath, JSON.stringify(qualityResult, null, 2));
   console.log(`[✓] Generated standardized quality payload: ${tempResultPath}`);
 
@@ -297,32 +513,8 @@ function main() {
   //    Order matters: any file write after record/verify would drift the
   //    exact-scope fingerprint and break the strict verification gate.
   if (opts.feature) {
-    const evidencePath = path.resolve(process.cwd(), `specs/features/${opts.feature}/05-evidence.md`);
-    if (fs.existsSync(path.dirname(evidencePath))) {
-      const evidenceContent = `# Quality & Verification Evidence: ${opts.feature}
-
-## 1. LoopX 质量凭据 (Change Quality Receipt)
-- **Status**: \`${blockerCount === 0 ? 'PASSING (Strict Mode Verified)' : 'FAILED (Blockers Present)'}\`
-- **Review Engine**: \`${reviewSource}\`
-- **Diff SHA256 (scan scope)**: \`${diffSha256}\`
-- **Receipt Chain**: \`Fail-Closed (prepare -> record -> verify, gate re-verified in check [3/3])\`
-${scope ? `- **LoopX Scope Fingerprint**: \`${scope.fingerprint}\`` : ''}
-
-## 2. 代码审查结论 (Code Review Insights)
-- **Reviewer**: \`${reviewSource}\`
-- **Blocker 缺陷数**: \`${blockerCount}\`
-- **Warnings / Advisory**: \`${warningCount}\`
-- **反熵增治理**: 执行 \`delete-first\`，彻底消除旧逻辑与废弃变量，零幽灵代码。
-
-## 3. 本地四大硬门禁实测 (4-Slot Fresh Evidence)
-| 门禁动作 | 退出码 | 覆盖说明 | 残余风险与假设 |
-|---|---|---|---|
-| \`npm run typecheck\` | 0 | 覆盖核心类型与接口定义 | 无 |
-| \`npm run lint\` | 0 | 语法与格式校验通过 | 无 |
-| \`npm run build\` | 0 | 产物构建成功 | 无 |
-| \`npm run test\` | 0 | 单测套件 100% PASS | 依赖本地环境 |
-`;
-      fs.writeFileSync(evidencePath, evidenceContent, 'utf8');
+    const evidencePath = writeEvidence(opts, buildEvidenceContent(evidenceContext));
+    if (evidencePath) {
       console.log(`[✓] Synced quality evidence to: ${evidencePath}`);
     }
   }

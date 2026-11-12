@@ -46,6 +46,19 @@ test('2. Diff SHA256 Binding: 05-evidence.md must contain exact diff fingerprint
   fs.mkdirSync(tmpFeatureDir, { recursive: true });
   const evidenceFile = path.join(tmpFeatureDir, '05-evidence.md');
 
+  // ingest 不重跑四门禁：必须提供 check 落盘的全绿 gate-results（含真实退出码 0）。
+  const tmpGateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cq-gate-results-'));
+  const gateResultsFile = path.join(tmpGateDir, 'gate-results.json');
+  fs.writeFileSync(gateResultsFile, JSON.stringify({
+    schema_version: 'loopx_flow_gate_results_v0',
+    gates: [
+      { name: 'typecheck', command: 'npm run typecheck', exit_code: 0, status: 'passed' },
+      { name: 'lint', command: 'npm run lint', exit_code: 0, status: 'passed' },
+      { name: 'build', command: 'npm run build', exit_code: 0, status: 'passed' },
+      { name: 'test', command: 'npm run test', exit_code: 0, status: 'passed' }
+    ]
+  }));
+
   // Isolate from host loopx daemon / network using mock binary in temporary PATH
   const tmpBin = fs.mkdtempSync(path.join(os.tmpdir(), 'mock-loopx-bin-'));
   const mockLoopx = path.join(tmpBin, 'loopx');
@@ -59,7 +72,8 @@ test('2. Diff SHA256 Binding: 05-evidence.md must contain exact diff fingerprint
   try {
     const res = spawnSync(process.execPath, [
       INGEST_SCRIPT,
-      '--feature', tmpFeature
+      '--feature', tmpFeature,
+      '--gate-results', gateResultsFile
     ], {
       cwd: PROJECT_ROOT,
       env,
@@ -76,9 +90,12 @@ test('2. Diff SHA256 Binding: 05-evidence.md must contain exact diff fingerprint
     const text = fs.readFileSync(evidenceFile, 'utf8');
     assert.strictEqual(text.includes('Diff SHA256'), true, 'Evidence must record exact Diff SHA256');
     assert.strictEqual(text.includes('PASSING'), true);
+    assert.strictEqual(text.includes('Gate Results Source'), true, 'Evidence must name gate-results source');
+    assert.strictEqual(text.includes(gateResultsFile), true, 'Evidence must record the real gate-results path');
   } finally {
     fs.rmSync(tmpFeatureDir, { recursive: true, force: true });
     fs.rmSync(tmpBin, { recursive: true, force: true });
+    fs.rmSync(tmpGateDir, { recursive: true, force: true });
   }
 });
 

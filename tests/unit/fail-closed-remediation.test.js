@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync, execSync } = require('node:child_process');
+const h = require('./helpers/m0-sandbox');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
@@ -103,21 +104,18 @@ test('2. approve without loopx exits 1 and leaves contract unchanged', () => {
 
 test('3. approve configure-goal failure rolls back approval marker', () => {
   const feature = 'fc-approve-fail';
-  makeCapsule(feature);
-  resetMock();
-  writeScript('loopx', `#!/usr/bin/env bash
-if [[ "$*" == *"configure-goal"* ]]; then echo "configure boom" >&2; exit 1; fi
-if [[ "$*" == *"sync-global"* ]]; then exit 0; fi
-exit 0
-`);
-  const contract = path.join(PROJECT_ROOT, 'specs/features', feature, '04-contract.md');
-  const before = fs.readFileSync(contract, 'utf8');
+  const dir = h.makeSandbox('fc-approve-fail-');
   try {
-    const r = runFlow(['approve', 'contract', feature]);
+    const { contractPath } = h.writeCapsule(dir, feature);
+    h.writeConfig(dir, 'independent');
+    h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
+    h.mockLoopx(dir, 'if [[ "$*" == *"configure-goal"* ]]; then echo "configure boom" >&2; exit 1; fi\nexit 0');
+    const before = fs.readFileSync(contractPath, 'utf8');
+    const r = h.run(dir, ['approve', 'contract', feature]);
     assert.strictEqual(r.status, 1, r.stdout + r.stderr);
-    assert.strictEqual(fs.readFileSync(contract, 'utf8'), before);
-    assert.doesNotMatch(fs.readFileSync(contract, 'utf8'), /FROZEN & APPROVED/);
-  } finally { cleanupCapsule(feature); }
+    assert.strictEqual(fs.readFileSync(contractPath, 'utf8'), before);
+    assert.doesNotMatch(fs.readFileSync(contractPath, 'utf8'), /FROZEN & APPROVED/);
+  } finally { h.cleanup(dir); }
 });
 
 test('4. ingest without feature or goal exits 1', () => {
@@ -142,48 +140,60 @@ test('5. check without feature/goal exits 1 before gates', () => {
 
 test('6. sync-global failure after successful lock keeps the locked approval', () => {
   const feature = 'fc-approve-syncfail';
-  makeCapsule(feature);
-  resetMock();
-  writeScript('loopx', `#!/usr/bin/env bash
-if [[ "$*" == *"configure-goal"* ]]; then exit 0; fi
-if [[ "$*" == *"sync-global"* ]]; then echo "sync boom" >&2; exit 1; fi
-exit 0
-`);
+  const dir = h.makeSandbox('fc-approve-sync-');
   try {
-    const r = runFlow(['approve', 'contract', feature]);
+    const { contractPath } = h.writeCapsule(dir, feature);
+    h.writeConfig(dir, 'independent');
+    h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
+    h.mockLoopx(dir, `args="$*"
+if [[ "$args" == *"configure-goal"* ]]; then exit 0; fi
+if [[ "$args" == *"register-agent"* ]]; then exit 0; fi
+if [[ "$args" == *"todo add"* ]]; then echo '{"todo_id":"todo_syncfail"}'; exit 0; fi
+if [[ "$args" == *"todo complete"* ]]; then exit 0; fi
+if [[ "$args" == *"sync-global"* ]]; then echo "sync boom" >&2; exit 1; fi
+exit 0`);
+    const r = h.run(dir, ['approve', 'contract', feature]);
     assert.strictEqual(r.status, 1, r.stdout + r.stderr);
     assert.match(r.stdout + r.stderr, /契约已锁定成功/);
-    assert.match(fs.readFileSync(path.join(PROJECT_ROOT, 'specs/features', feature, '04-contract.md'), 'utf8'), /FROZEN & APPROVED/);
-  } finally { cleanupCapsule(feature); }
+    assert.match(fs.readFileSync(contractPath, 'utf8'), /FROZEN & APPROVED/);
+  } finally { h.cleanup(dir); }
 });
 
 test('7. approve passes --registry to configure-goal', () => {
   const feature = 'fc-approve-registry';
-  makeCapsule(feature);
-  resetMock();
-  const calls = path.join(MOCK_BIN, 'calls.log');
-  writeScript('loopx', '#!/usr/bin/env bash\necho "$*" >> ' + JSON.stringify(calls) + '\nexit 0\n');
+  const dir = h.makeSandbox('fc-approve-registry-');
   try {
-    const r = runFlow(['approve', 'contract', feature]);
+    const { contractPath } = h.writeCapsule(dir, feature);
+    h.writeConfig(dir, 'independent');
+    h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
+    h.mockLoopx(dir, `args="$*"
+if [[ "$args" == *"todo add"* ]]; then echo '{"todo_id":"todo_reg"}'; exit 0; fi
+if [[ "$args" == *"sync-global"* ]]; then exit 0; fi
+exit 0`);
+    const r = h.run(dir, ['approve', 'contract', feature]);
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
-    const log = fs.readFileSync(calls, 'utf8');
+    const log = fs.readFileSync(path.join(dir, 'loopx-calls.log'), 'utf8');
     assert.match(log, /--registry .*configure-goal/);
-  } finally { cleanupCapsule(feature); }
+  } finally { h.cleanup(dir); }
 });
 
 test('8. approve feature name cannot inject shell through cleanup trap', () => {
   const feature = "fc-trap'inject; touch /tmp/loopx-pwn; '";
   const payload = '/tmp/loopx-pwn';
   try { fs.unlinkSync(payload); } catch (_) {}
-  makeCapsule(feature);
-  resetMock();
-  writeScript('loopx', '#!/usr/bin/env bash\nexit 0\n');
+  const dir = h.makeSandbox('fc-trap-');
   try {
-    const r = runFlow(['approve', 'contract', feature]);
+    const { contractPath } = h.writeCapsule(dir, feature);
+    h.writeConfig(dir, 'independent');
+    h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
+    h.mockLoopx(dir, `if [[ "$*" == *"todo add"* ]]; then echo '{"todo_id":"todo_trap"}'; exit 0; fi
+if [[ "$*" == *"sync-global"* ]]; then exit 0; fi
+exit 0`);
+    const r = h.run(dir, ['approve', 'contract', feature]);
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     assert.strictEqual(fs.existsSync(payload), false, 'trap must not execute injected shell');
   } finally {
-    cleanupCapsule(feature);
+    h.cleanup(dir);
     try { fs.unlinkSync(payload); } catch (_) {}
   }
 });
