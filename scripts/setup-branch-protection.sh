@@ -317,7 +317,8 @@ const payload = {
   enforce_admins: true,
   allow_force_pushes: false,
   allow_deletions: false,
-  required_pull_request_reviews: null
+  required_pull_request_reviews: null,
+  restrictions: null
 };
 if (mode === "independent") {
   payload.required_pull_request_reviews = {
@@ -334,8 +335,9 @@ process.stdout.write(JSON.stringify(payload));
     fi
 
     log "PUT 分支保护..."
-    if ! printf '%s' "$payload" | gh api --method PUT "repos/${REPO}/branches/${BRANCH}/protection" --input - >/dev/null 2>&1; then
-        echo "[-] [setup-branch-protection] 收敛分支保护失败 (PUT)" >&2
+    local put_out
+    if ! put_out="$(printf '%s' "$payload" | gh api --method PUT "repos/${REPO}/branches/${BRANCH}/protection" --input - 2>&1)"; then
+        echo "[-] [setup-branch-protection] 收敛分支保护失败 (PUT): ${put_out}" >&2
         return 1
     fi
 
