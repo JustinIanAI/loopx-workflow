@@ -1,0 +1,8 @@
+{
+  "schema_version": "loopx_workflow_config_v0",
+  "authorization_mode": "single_owner",
+  "single_owner_risk_acceptance": {
+    "accepted_by": "JustinIanAI",
+    "accepted_at": "2026-11-12T09:43:44Z"
+  }
+}
