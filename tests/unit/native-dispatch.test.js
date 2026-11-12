@@ -27,6 +27,11 @@ if [[ "$args" == *"task-lease acquire"* ]]; then
   exit 0
 fi
 
+if [[ "$args" == *"task-lease inspect"* ]]; then
+  echo '{"version": 1, "owner": "loopx-flow-agent"}'
+  exit 0
+fi
+
 if [[ "$args" == *"task-lease release"* ]]; then
   echo "[Mock LoopX] lease released"
   exit 0
@@ -37,7 +42,7 @@ if [[ "$args" == *"issue-fix feasibility"* ]]; then
     echo "[Mock LoopX] feasibility engine error" >&2
     exit 1
   fi
-  echo '{"route": "fix_pr", "rationale": "bounded scope with confirmed reproduction"}'
+  echo '{"decision": {"route": "fix_pr", "rationale": "bounded scope with confirmed reproduction"}}'
   exit 0
 fi
 
@@ -103,9 +108,14 @@ test('1. Todo lease claim: must acquire exclusive lease via task-lease acquire a
     assert.strictEqual(res.status, 0, `claim must succeed: ${res.stderr}`);
     const calls = fs.readFileSync(CALLS_LOG, 'utf8');
     assert.strictEqual(
-      calls.includes('task-lease acquire --goal-id native-dispatch-deep-integration-goal --todo-id todo_ab12cd34ef56'),
+      calls.includes('task-lease acquire --goal-id native-dispatch-deep-integration-goal --todo-id todo_ab12cd34ef56 --owner loopx-flow-agent --idempotency-key loopx-flow:claim:native-dispatch-deep-integration-goal:todo_ab12cd34ef56:loopx-flow-agent'),
       true,
-      `must call task-lease acquire with goal-id and todo-id, got: ${calls}`
+      `must call task-lease acquire with owner + idempotency-key (issue #12), got: ${calls}`
+    );
+    assert.strictEqual(
+      calls.includes('register-agent --goal-id native-dispatch-deep-integration-goal --agent-id loopx-flow-agent'),
+      true,
+      `must register lease owner before acquire, got: ${calls}`
     );
 
     // Negative: lease conflict must fail closed with exit 1
@@ -136,6 +146,7 @@ test('2. Todo lease done: must complete todo then release the lease', () => {
     assert.ok(releaseCall, `must call task-lease release, got: ${calls.join(' | ')}`);
     assert.strictEqual(completeCall.includes('--todo-id todo_ab12cd34ef56'), true, 'complete must target the todo');
     assert.strictEqual(releaseCall.includes('--todo-id todo_ab12cd34ef56'), true, 'release must target the todo');
+    assert.strictEqual(releaseCall.includes('--expected-version 1'), true, 'release must use inspect version CAS');
   } finally {
     cleanupMocks();
   }
