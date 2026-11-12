@@ -1,6 +1,6 @@
 # Architecture Decisions: m0-application-orchestration
 
-- **Status**: APPROVED
+- **Status**: APPROVED BY HUMAN (JustinIanAI@2026-11-12 17:43:54)
 - **Feature**: m0-application-orchestration
 - **产品决策正文**: [ADR-0008](../../docs/adr/0008-application-orchestration-layer.md) ~ [ADR-0012](../../docs/adr/0012-delivery-authorization-and-recovery.md)；本文只记录本切片实现取舍。
 

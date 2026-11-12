@@ -1,6 +1,6 @@
 # Feature Contract: m0-application-orchestration
 
-- **Contract-Status**: DRAFT (Pending Approval)
+- **Contract-Status**: FROZEN & APPROVED
 - **Feature Branch**: feature/m0-application-orchestration
 - **LoopX Goal**: m0-application-orchestration-goal
 - **引用**: REQ-CHECKPOINT-1, REQ-CHECKPOINT-2, REQ-CHECKPOINT-3, REQ-GATE1-AUTH-1, REQ-GATE2-MODE-1, REQ-CI-PROTECTION-1, REQ-QUALITY-1, REQ-EVIDENCE-1, REQ-ISSUE-PIPELINE-1, REQ-NATIVE-1；ADR-0008, ADR-0009, ADR-0010, ADR-0011, ADR-0012。
