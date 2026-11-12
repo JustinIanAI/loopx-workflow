@@ -45,6 +45,7 @@ coverage/
 .loopx/*.sqlite*
 .loopx/**/*.lock
 .loopx/goals/
+.loopx/domain-state/
 
 # Local agent scratch / test isolation artifacts (must never pollute diff scope)
 .workbuddy/
