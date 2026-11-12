@@ -104,6 +104,19 @@ function getScopeDiff(baseCommit) {
   }
 }
 
+// 05-evidence 会写回扫描范围内。哈希若包含它自己，每次 check 都会改文件，
+// 提交后又让收据的 head 落后。指纹只覆盖证据文件以外的 diff。
+function diffExcludingEvidence(diffText, relPath) {
+  if (!diffText || !relPath) return diffText || '';
+  const chunks = diffText.split(/(?=^diff --git )/m);
+  return chunks.filter((chunk) => {
+    if (!chunk.startsWith('diff --git ')) return true;
+    const header = chunk.split('\n', 1)[0];
+    const hit = header.endsWith(`a/${relPath}`) || header.endsWith(`b/${relPath}`);
+    return !hit;
+  }).join('');
+}
+
 // 运行时工件：LoopX/宿主私有状态与锁文件，永不作为收据 reuse 证据。
 // 收据只允许引用「本次交付已提交」的源码/文档文件，否则 loopx change-quality record
 // 会以 `reuse references unknown evidence: path:<x>` fail-closed（见 ADR-0007）。
@@ -292,11 +305,9 @@ function buildEvidenceContent(context) {
   const gateRows = context.gates.map((gate) => (
     `| \`${gate.name}\` | \`${gate.command}\` | \`${formatGateExitCode(gate)}\` | ${gate.status} | ${gate.coverage} | \`${gate.command}\` | exact_scope | real | ${gate.residual} |`
   )).join('\n');
+  const sourceLabel = context.gateSnapshot.error ? 'NOT_PROVIDED' : GATE_RESULTS_SCHEMA;
   const gateWarning = context.gateSnapshot.error
     ? `- **Gate Results Warning**: \`${context.gateSnapshot.error}\`\n`
-    : '';
-  const scopeLine = context.scope
-    ? `- **LoopX Scope Fingerprint**: \`${context.scope.fingerprint}\``
     : '';
 
   return `# Quality & Verification Evidence: ${context.feature}
@@ -306,7 +317,7 @@ function buildEvidenceContent(context) {
 - **Review Engine**: \`${context.reviewSource}\`
 - **Diff SHA256 (scan scope)**: \`${context.diffSha256}\`
 - **Receipt Chain**: \`Fail-Closed (prepare -> record -> verify, gate re-verified in check [3/3])\`
-${scopeLine}
+- **LoopX Scope Fingerprint**: see the LoopX change-quality receipt
 
 ## 2. 代码审查结论 (Code Review Insights)
 - **Reviewer**: \`${context.reviewSource}\`
@@ -315,7 +326,7 @@ ${scopeLine}
 - **反熵增治理**: 执行 \`delete-first\`，彻底消除旧逻辑与废弃变量，零幽灵代码。
 
 ## 3. 本地四大硬门禁实测 (4-Slot Fresh Evidence)
-- **Gate Results Source**: \`${context.gateSnapshot.source || 'NOT_PROVIDED'}\`
+- **Gate Results Source**: \`${sourceLabel}\`
 - **Gate Results Schema**: \`${GATE_RESULTS_SCHEMA}\`
 - **Gate Verdict**: \`${context.gateVerdict}\`
 ${gateWarning}
@@ -350,7 +361,9 @@ function main() {
     console.log(`[✓] Exact-scope resolved: fingerprint=${scope.fingerprint.slice(0, 12)}... base=${scope.baseRef}@${scope.baseCommit.slice(0, 10)}`);
   }
   const scopeDiff = getScopeDiff(scope && scope.baseCommit);
-  const diffSha256 = crypto.createHash('sha256').update(scopeDiff || 'clean').digest('hex');
+  const evidenceRel = opts.feature ? `specs/features/${opts.feature}/05-evidence.md` : '';
+  const hashedDiff = diffExcludingEvidence(scopeDiff, evidenceRel);
+  const diffSha256 = crypto.createHash('sha256').update(hashedDiff || 'clean').digest('hex');
 
   // 1. Process Alibaba OCR JSON if provided
   if (opts.ocrJson && fs.existsSync(opts.ocrJson)) {
