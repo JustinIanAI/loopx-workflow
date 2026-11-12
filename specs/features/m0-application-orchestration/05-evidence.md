@@ -3,9 +3,9 @@
 ## 1. LoopX 质量凭据 (Change Quality Receipt)
 - **Status**: `PASSING (Strict Mode Verified)`
 - **Review Engine**: `Default Semantic Review`
-- **Diff SHA256 (scan scope)**: `2518252e4c790f7887301efdf69219350ab36edbbe2fd46fa5f18b6b7ad46555`
+- **Diff SHA256 (scan scope)**: `085f02b189dbb423cd5f792c191f4f9f887482c547359d057990e8fbfd851037`
 - **Receipt Chain**: `Fail-Closed (prepare -> record -> verify, gate re-verified in check [3/3])`
-- **LoopX Scope Fingerprint**: `3b3c31dc903adcf6b210903b10b691d6ca6953be8d2cd2ea279296ce59be64ff`
+- **LoopX Scope Fingerprint**: see the LoopX change-quality receipt
 
 ## 2. 代码审查结论 (Code Review Insights)
 - **Reviewer**: `Default Semantic Review`
@@ -14,7 +14,7 @@
 - **反熵增治理**: 执行 `delete-first`，彻底消除旧逻辑与废弃变量，零幽灵代码。
 
 ## 3. 本地四大硬门禁实测 (4-Slot Fresh Evidence)
-- **Gate Results Source**: `/var/folders/94/tnw0cpkj7g52sszmf7pdb2zr0000gn/T//loopx-flow-gate-results.UZnSsk`
+- **Gate Results Source**: `loopx_flow_gate_results_v0`
 - **Gate Results Schema**: `loopx_flow_gate_results_v0`
 - **Gate Verdict**: `passed`
 
