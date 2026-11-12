@@ -16,6 +16,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # env-governance 测试以 origin/main 为已提交 diff 基线，浅克隆会缺该 ref
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
