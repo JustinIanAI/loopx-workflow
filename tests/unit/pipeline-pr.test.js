@@ -5,6 +5,7 @@ const path = require('node:path');
 const { spawnSync, execSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const h = require('./helpers/m0-sandbox');
+const { detachRepoConfig } = require('./helpers/repo-isolation');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
@@ -169,6 +170,9 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
   const currentHeadSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
   setupMockGh(currentHeadSha);
   setupMockLoopx();
+  // e2e 覆盖 feature/check/review/legacy merge 接线；临时移开仓库级授权配置，
+  // Gate1/Gate2 模式行为由 adr-0009 / adr-0012 专项测试覆盖。
+  const restoreConfig = detachRepoConfig();
 
   const testEnv = {
     ...process.env,
@@ -241,6 +245,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
     console.log('[Test E2E] 6. End-to-end PR Review & Merge pipeline simulation completed successfully!');
   } finally {
     cleanupMockGh();
+    restoreConfig();
     if (hadReg && originalReg !== null) fs.writeFileSync(REG_PATH, originalReg);
     else if (!hadReg && fs.existsSync(REG_PATH)) fs.unlinkSync(REG_PATH);
     if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
@@ -260,6 +265,7 @@ test('Merge Readiness Fail-Closed: loopx-flow merge must block when LoopX readin
   const currentHeadSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
   setupMockGh(currentHeadSha);
   setupMockLoopx();
+  const restoreConfig = detachRepoConfig();
 
   const testEnv = {
     ...process.env,
@@ -287,5 +293,6 @@ test('Merge Readiness Fail-Closed: loopx-flow merge must block when LoopX readin
     console.log('[Test E2E] Fail-closed merge readiness lock verification completed successfully!');
   } finally {
     cleanupMockGh();
+    restoreConfig();
   }
 });
