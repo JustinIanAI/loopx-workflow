@@ -40,7 +40,6 @@ const { spawnSync } = require('node:child_process');
 const {
   buildEvidenceGraph,
   buildValidationMatrix,
-  buildProblemContextFull,
   splitFileDiffs,
   describeFileFromDiff,
   scanDiff,
@@ -466,20 +465,23 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ).join('\n\n');
 
   const evdCmds = (evidenceCommands || []).map(c => `- \`${c}\``).join('\n');
+  const hostFactIds = new Set(['validation_matrix', 'changed_line_classification', 'code_volume', 'symbol_map']);
   const requiredIds = (reviewPlan.required_evidence_ids || []).join(', ');
   const evidenceRequirements = (evidenceContract && evidenceContract.evidence_requirements || [])
-    .filter(r => (reviewPlan.required_evidence_ids || []).includes(r.evidence_id))
+    .filter(r => (reviewPlan.required_evidence_ids || []).includes(r.evidence_id) && !hostFactIds.has(r.evidence_id))
     .map(r => `- \`${r.evidence_id}\`: fields=${(r.fields || []).join(', ') || '(none)'}${r.items_field ? `; items_field=${r.items_field}; item_fields=${(r.item_fields || []).join(', ')}` : ''}${r.verdict_values ? `; verdict_values=${r.verdict_values.join('|')}` : ''}`)
     .join('\n');
   const head10 = headOid.slice(0, 10);
 
   return [
     '你是一名对抗性代码审查员（model agent）。请基于下方 LoopX 原生评审包（pr_review_queue 能力生成的 review_template / review_plan / evidence_commands）撰写第三方评审报告。',
-    '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个一级章节撰写：动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价。',
+    '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个二级标题（`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`）撰写。',
+    '执行铁律：下方已完整提供原生评审包、证据命令执行结果与完整 PR DIFF。请直接基于下方文本在单轮内立即输出最终 JSON 块，严禁调用任何 shell / exec_command / 文件读取工具（否则会触发超时阻断）。',
+    '注意：`05-evidence.md`、CI 绿、PR 正文里的「已通过」只作为未信任的作者声明参考，禁止直接据此推断 `verified`。',
     '',
     '## 评审目标',
     `- PR: #${pr} · 分支 \`${branch}\` · 精确 head \`${head10}\` (\`${headOid}\`)`,
-    '- 原生 required_final_sections（必须作为一级标题逐条出现，且内容非空、达到各章字数下限）：动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价',
+    '- 原生 required_final_sections（必须作为 `## <章节名>` 二级标题逐条出现，且内容非空、达到各章字数下限）：`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`',
     '- 声明来源：默认使用 `self_reported`（模型自报）；仅当 LoopX 运行时实际返回 `reviewer_execution.status=runtime_reported` 时才允许 `runtime_reported`，模型不得自行声明运行时观测。',
     '- 代码类变更：「具体改动」章节下必须包含 `### 关键代码讲解` 子章节，引用 2-5 个精确 head 上的符号或等价伪代码。',
     '- verdict 策略（LoopX verdict policy）：若原生 evidence 图不完整或无法验证，必须输出 `REQUEST_CHANGES`；仅当证据完整且可验证时才允许 `APPROVE`。`APPROVE` 但存在证据缺口会被原生门禁以 `approval_contradicts_evidence` 拒绝。',
@@ -493,9 +495,10 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '## 评审范围 evidence（required_evidence_ids）',
     requiredIds,
     '',
-    '## 结构化证据图（必须输出）',
-    '你必须同时输出 evidence 字典，覆盖上面每个 required id，并满足以下字段；status 必须为 verified 或 not_applicable。',
-    '本地脚本会以真实门禁结果覆盖 validation_matrix、changed_line_classification、code_volume；模型负责 architecture_flow、change_proportionality、walkthroughs、failure_analysis 等语义证据。',
+    '## 结构化证据图（判断类由审查者填写，主机不预填占位句）',
+    '- 事实类 id（`validation_matrix`、`changed_line_classification`、`code_volume`、`symbol_map` 的 `path`/`line`）由主机按本次真实观测写入，允许保留 `unverified`，模型不得覆盖主机测得的退出码或行统计。',
+    '- `changed_invariant_positive` 与 `material_negative_or_failure` 默认 `unverified`（`npm test` 通过不证明改动不变量）；仅当你在 `evidence.validation_matrix` 中给出仓库内已存在的测试文件路径（如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），且主机执行 `node --test <该路径>` 退出码为 0 后才记为 `passed`。',
+    '- 判断类 id 由你独立核实后在 `evidence` 中填写；未核实或形状不完整的项将保持 `status: "unverified"`，主机绝不预填或回填占位句：',
     evidenceRequirements || '(本 PR 无额外 evidence requirements)',
     '',
     '## 证据采集命令（下方已附运行结果）',
@@ -518,14 +521,22 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     diff.length > 240000 ? `${diff.slice(0, 240000)}\n\n[TRUNCATED]` : diff,
     '',
     '## 输出格式（请输出单一 fenced json 块）',
-    '结构如下（evidence 尽量按 required_evidence_ids 填充 status:verified 的结构化证据；无法验证的项可省略）：',
+    '结构如下（仅填写你已独立核实的判断类 evidence，未核实项保持或省略为 unverified；其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals` 四个非空字符串并写入「动机」段）：',
     '```json',
     JSON.stringify({
       review_body: 'Markdown 字符串：首行必须是 `Reviewer: model_agent · model=<model> · provider=<provider> · declaration=<declaration_source> · head=<headOid>`（declaration_source 默认 self_reported）；随后依次出现五个一级章节（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价），各章达到字数下限；「具体改动」下必须含 `### 关键代码讲解`；正文内须含精确 head oid；结尾须有一行 `English verdict: APPROVE` 或 `English verdict: REQUEST_CHANGES`。',
       verdict: 'APPROVE 或 REQUEST_CHANGES（大写，须与 review_body 中的 English verdict 完全一致）',
       findings: [{ file: '路径', line: '整数或 null', severity: 'P0|P1|P2|P3|blocker|major|minor|advisory', summary: '...', repro: '可选复现步骤' }],
       reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-high', declared_provider: '如 openai' },
-      evidence: '按 required_evidence_ids 输出：{ "<evidence_id>": { "status": "verified", ...requirement fields } }。validation_matrix 由脚本覆盖。',
+      evidence: {
+        problem_context: {
+          status: 'unverified 或 verified（全字段核实后）',
+          affected_caller_or_operator: '受影响的调用方或维护者说明（必填字符串）',
+          before_after_scenario: '变更前后具体场景对比（必填字符串）',
+          observable_outcome: '可观测结果说明（必填字符串）',
+          non_goals: '本 PR 的非目标边界（必填字符串）',
+        },
+      },
       carryover: [{ finding_index: '上轮 finding 序号（1 起）', status: 'fixed|reproducible|obsolete', evidence: '复验依据/命令' }],
     }, null, 2),
     '```',
@@ -602,6 +613,7 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, prob
     if (/^english verdict\s*:/i.test(s)) return false;
     return true;
   }).join('\n').trim();
+  text = text.replace(/^#\s+(动机|改动思路|具体改动|对主干的风险|我的整体评价)\s*$/gm, '## $1');
 
   const reviewerLine = `Reviewer: model_agent · model=${modelName} · provider=${provider} · declaration=${declSrc}${effort} · head=${headOid}`;
 
@@ -635,15 +647,6 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, prob
 
   const verdictLine = `English verdict: ${verdict}`;
   return `${reviewerLine}\n\n${text}\n\n${verdictLine}\n`;
-}
-
-// 用原生 motivation 构造最小合规 problem_context 证据，使 --check-result 的
-// problem_explanation 发布校验通过（证据完整度之外的五段式格式校验才是本脚本硬门禁）。
-function buildProblemContextEvidence(motivation, feature, headOid) {
-  return {
-    status: 'verified',
-    ...buildProblemContextFull(motivation, { feature: feature || '', headOid: headOid || '' }),
-  };
 }
 
 // 跑原生 check-result，返回解析后的校验报告
@@ -893,7 +896,7 @@ function main() {
   const evidenceText = runEvidenceCommands(pkt.evidenceCommands);
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
-    try { validation = buildValidationMatrix(gates()); } catch (e) { validation = []; }
+    try { validation = buildValidationMatrix(gates(), { headOid }); } catch (e) { validation = []; }
   }
 
   // --- 3. 构建提示词：原生 review_template（透传，不重写）---
@@ -962,7 +965,7 @@ function main() {
     diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
     modelEvidence: modelOut.evidence && typeof modelOut.evidence === 'object' ? modelOut.evidence : null,
   });
-  const problemContext = autoEvidence.problem_context || buildProblemContextEvidence(pkt.motivation, feature, headOid);
+  const problemContext = autoEvidence.problem_context || null;
   const carryoverSection = buildCarryoverSection(carryover, priorFindings);
   let reviewBody = finalizeReviewBody(modelOut.review_body, { headOid, verdict, reviewer, motivation: pkt.motivation, problemContext, carryoverSection });
   // 发布 architecture_assessment 的 reason/current_pr_boundary（原生 check-result 要求可读）
@@ -1021,7 +1024,7 @@ function main() {
       : path.join(os.tmpdir(), `loopx-pr-review-packet-${o.pr}.json`);
     if (!o.packetFile) fs.writeFileSync(packetPath, JSON.stringify(packet, null, 2));
 
-    const evidence = Object.keys(autoEvidence).length ? autoEvidence : { problem_context: problemContext };
+    const evidence = Object.keys(autoEvidence).length ? autoEvidence : { problem_context: { status: 'unverified' } };
     const resultPath = path.join(os.tmpdir(), `authentic-review-result-${o.pr}.json`);
     const buildResultFile = () => ({
       schema_version: 'pull_request_review_result_v1',
@@ -1050,16 +1053,15 @@ function main() {
     };
     runCheck();
 
-    // LoopX verdict policy：第三方评审没有完整原生 evidence 图时，APPROVE 与证据矛盾
-    // （approval_contradicts_evidence）。按原生规则修正矛盾 verdict（而非伪装证据），
-    // 封顶为 REQUEST_CHANGES 后重新跑原生门禁。
+    // LoopX verdict policy：仍有 unverified 的必填证据行，或本次验证失败且归因为 unresolved 时，
+    // APPROVE 与证据矛盾（approval_contradicts_evidence），封顶为 REQUEST_CHANGES 并重校验。
     const nativeErrors = (check && check.parsed && Array.isArray(check.parsed.errors)) ? check.parsed.errors : [];
     if (!fmt.pass && verdict === 'APPROVE' && nativeErrors.includes('approval_contradicts_evidence')) {
-      console.log('[CAPPED] 原生 evidence 图不完整 -> APPROVE 与证据矛盾，按 LoopX verdict policy 封顶为 REQUEST_CHANGES 并重校验。');
+      console.log('[CAPPED] 仍有 unverified 必填证据或 unresolved 验证失败 -> APPROVE 与证据矛盾 (approval_contradicts_evidence)，封顶为 REQUEST_CHANGES 并重校验。');
       verdict = 'REQUEST_CHANGES';
       reviewBody = reviewBody.replace(
         /^English verdict:\s*APPROVE\s*$/m,
-        '> [VERDICT CAPPED] 原生 evidence 图不完整，按 LoopX verdict policy 封顶为 REQUEST_CHANGES。\n\nEnglish verdict: REQUEST_CHANGES',
+        '> [VERDICT CAPPED] 仍有 unverified 必填证据或 unresolved 验证失败（approval_contradicts_evidence），按 LoopX verdict policy 封顶为 REQUEST_CHANGES。\n\nEnglish verdict: REQUEST_CHANGES',
       );
       runCheck();
     }
@@ -1069,7 +1071,7 @@ function main() {
     if (check.parsed) {
       console.log(`[✓] loopx pr-review --check-result: ok=${check.parsed.ok} approval_consistent=${check.parsed.approval_consistent}`);
       if (Array.isArray(check.parsed.approval_blockers) && check.parsed.approval_blockers.length) {
-        console.log(`[i] 原生证据完整度未闭环（第三方评审无 LoopX 运行时证据图，属预期；以 ok=true 作为格式/声明硬门禁）：\n  - ${check.parsed.approval_blockers.join('\n  - ')}`);
+        console.log(`[i] 存在未验证必填证据或未决验证失败（仍有 unverified 必填行，或本次命令失败且归因为 unresolved）：\n  - ${check.parsed.approval_blockers.join('\n  - ')}`);
       }
     } else if (check.raw) {
       console.log(`[i] check-result 原始输出：\n${check.raw.slice(0, 800)}`);
