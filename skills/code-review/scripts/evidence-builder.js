@@ -1,11 +1,17 @@
 'use strict';
 /**
- * evidence-builder.js — 结构化证据图构建器（旧 issue #25 / R4）
+ * evidence-builder.js — 结构化证据图装配器（issue #15）
  *
- * 目标：把 LoopX packet 的 result_template + evidence_requirements 转成
- * pull_request_review_result_v1.evidence；事实类字段本地确定性合成，语义类字段由模型补，
- * 合并后交给 loopx pr-review --check-result。
+ * 原则：
+ *   - verified 只授予本次审查进程自己量到的事实（changed_line_classification / code_volume /
+ *     validation_matrix 的四门禁与 repository_required_checks / symbol_map 的 path+line）。
+ *   - changed_invariant_positive 与 material_negative_or_failure 默认 unverified，只能由审查者指定
+ *     仓库内已存在的测试文件路径并由主机执行 `node --test <path>` 退出码 0 后写 passed。
+ *   - 判断类 evidence id 由审查者填写，主机绝不预填或回填占位句；缺失或形状不合法保持 unverified。
  */
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
 
 function listFiles(diff) {
   return [...new Set([...String(diff || '').matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)].map(m => m[2]))];
@@ -51,6 +57,137 @@ function firstChangedLineNumber(fileDiff) {
   return lineNo || 1;
 }
 
+function isPlainObject(v) {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
+
+function isMissingValue(v) {
+  if (v === undefined || v === null) return true;
+  if (typeof v === 'string') return v.trim().length === 0;
+  if (Array.isArray(v)) return v.length === 0;
+  if (isPlainObject(v)) return Object.keys(v).length === 0;
+  return false;
+}
+
+function parseGateOutcome(raw) {
+  if (typeof raw === 'number') {
+    return {
+      ran: true,
+      passed: raw === 0,
+      exitCode: raw,
+      detail: raw === 0 ? 'command completed successfully (exit 0)' : `FAILED (exit ${raw})`,
+    };
+  }
+  if (isPlainObject(raw)) {
+    const statusStr = String(raw.status || '');
+    const ran = statusStr !== 'not_run' && statusStr !== 'unverified';
+    const code = typeof raw.exit_code === 'number'
+      ? raw.exit_code
+      : (typeof raw.exitCode === 'number' ? raw.exitCode : (/^passed$/i.test(statusStr) ? 0 : 1));
+    const passed = ran && code === 0;
+    return {
+      ran,
+      passed,
+      exitCode: ran ? code : null,
+      detail: passed ? 'command completed successfully (exit 0)' : String(raw.result || statusStr || `FAILED (exit ${code})`),
+    };
+  }
+  if (typeof raw === 'string' && raw.trim() && raw !== 'NOT_RUN' && !/^unverified$/i.test(raw.trim())) {
+    const passed = /^PASSED\b/i.test(raw) || raw.trim() === '0';
+    const m = raw.match(/exit\s+(-?\d+)/i);
+    const exitCode = passed ? 0 : (m ? Number(m[1]) : 1);
+    return {
+      ran: true,
+      passed,
+      exitCode,
+      detail: passed ? 'command completed successfully' : raw,
+    };
+  }
+  return { ran: false, passed: false, exitCode: null, detail: 'NOT_RUN' };
+}
+
+function buildUnresolvedAttribution(command, exitCode, headOid, label) {
+  const head = String(headOid || '');
+  return {
+    disposition: 'unresolved',
+    command,
+    exit_code: exitCode,
+    head,
+    head_revision: head,
+    causal_scope_analysis: `${command} exited with code ${exitCode} at head ${head || 'unknown'} without base comparison`,
+    affected_invariant_evidence: `${label} (${command}, exit_code=${exitCode}, head=${head || 'unknown'})`,
+  };
+}
+
+function resolveRepoTestPath(candidate, repoRoot) {
+  let raw = '';
+  if (typeof candidate === 'string') {
+    raw = candidate.trim();
+  } else if (isPlainObject(candidate)) {
+    raw = String(candidate.test_path || candidate.path || candidate.file || candidate.command_or_check || '').trim();
+  }
+  if (!raw) return null;
+  if (/^node\s+--test\s+/.test(raw)) {
+    raw = raw.replace(/^node\s+--test\s+/, '').trim();
+  }
+  if (!raw || /^npm\b/i.test(raw) || /^NOT_RUN$/i.test(raw) || raw.startsWith('-')) return null;
+  if (!/^[A-Za-z0-9_./-]+$/.test(raw)) return null;
+  const root = path.resolve(repoRoot || process.cwd());
+  const abs = path.resolve(root, raw);
+  const rel = path.relative(root, abs).replace(/\\/g, '/');
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  try {
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return null;
+  } catch (_) {
+    return null;
+  }
+  return { abs, rel, root };
+}
+
+function buildInvariantRow(caseId, label, candidate, opts = {}) {
+  const resolved = resolveRepoTestPath(candidate, opts.repoRoot);
+  if (!resolved) {
+    return {
+      case_id: caseId,
+      invariant_or_case: label,
+      command_or_check: 'NOT_RUN',
+      status: 'unverified',
+      result: 'unverified: requires reviewer-designated repository test path',
+      required: true,
+      skip_or_failure_reason: 'unverified: npm run test passing does not prove this invariant',
+    };
+  }
+  const cmd = `node --test ${resolved.rel}`;
+  const runner = typeof opts.runNodeTest === 'function'
+    ? opts.runNodeTest
+    : (relPath, cwd) => spawnSync(process.execPath, ['--test', relPath], { cwd, encoding: 'utf8', timeout: 120000 });
+  const res = runner(resolved.rel, resolved.root);
+  const exitCode = res && typeof res.status === 'number' ? res.status : 1;
+  if (exitCode === 0) {
+    return {
+      case_id: caseId,
+      invariant_or_case: label,
+      command_or_check: cmd,
+      exit_code: 0,
+      status: 'passed',
+      result: `${cmd} (exit 0)`,
+      required: true,
+      skip_or_failure_reason: 'not applicable: command passed',
+    };
+  }
+  return {
+    case_id: caseId,
+    invariant_or_case: label,
+    command_or_check: cmd,
+    exit_code: exitCode,
+    status: 'failed',
+    result: `${cmd} failed (exit ${exitCode})`,
+    required: true,
+    skip_or_failure_reason: `${cmd} exited with code ${exitCode}`,
+    failure_attribution: buildUnresolvedAttribution(cmd, exitCode, opts.headOid, label),
+  };
+}
+
 function buildValidationMatrix(gates, opts = {}) {
   const names = ['typecheck', 'lint', 'build', 'test'];
   const labels = {
@@ -60,251 +197,275 @@ function buildValidationMatrix(gates, opts = {}) {
     test: 'Unit/integration test suite',
   };
   const rows = names.map(name => {
-    const result = gates && gates[name] ? String(gates[name]) : 'NOT_RUN';
-    const passed = /^PASSED/.test(result);
+    const hasKey = Boolean(gates) && Object.prototype.hasOwnProperty.call(gates, name);
+    const outcome = parseGateOutcome(hasKey ? gates[name] : undefined);
+    const cmd = 'npm run ' + name;
+    if (outcome.passed) {
+      return {
+        case_id: name,
+        invariant_or_case: labels[name],
+        command_or_check: cmd,
+        exit_code: 0,
+        status: 'passed',
+        result: outcome.detail,
+        required: true,
+        skip_or_failure_reason: 'not applicable: command passed',
+      };
+    }
+    if (!outcome.ran && opts.unverified) {
+      return {
+        case_id: name,
+        invariant_or_case: labels[name],
+        command_or_check: cmd,
+        status: 'unverified',
+        result: 'NOT_RUN',
+        required: true,
+        skip_or_failure_reason: 'NOT_RUN',
+      };
+    }
+    const exitCode = outcome.exitCode == null ? 1 : outcome.exitCode;
     return {
       case_id: name,
       invariant_or_case: labels[name],
-      command_or_check: 'npm run ' + name,
-      status: passed ? 'passed' : (opts.unverified ? 'unverified' : 'failed'),
-      result: passed ? 'command completed successfully' : result,
+      command_or_check: cmd,
+      exit_code: exitCode,
+      status: 'failed',
+      result: outcome.detail,
       required: true,
-      skip_or_failure_reason: passed ? 'not applicable: command passed' : result,
+      skip_or_failure_reason: outcome.detail,
+      failure_attribution: buildUnresolvedAttribution(cmd, exitCode, opts.headOid, labels[name]),
     };
   });
-  // 原生 validation_matrix 的 required cases：正向不变量、负向/失败路径、仓库必需检查。
-  rows.push({
-    case_id: 'changed_invariant_positive',
-    invariant_or_case: 'changed invariant has a positive test',
-    command_or_check: 'npm run test',
-    status: rows.find(r => r.case_id === 'test')?.status === 'passed' ? 'passed' : 'unverified',
-    result: 'unit tests cover changed behavior',
-    required: true,
-    skip_or_failure_reason: 'not applicable: covered by test suite',
-  });
-  rows.push({
-    case_id: 'material_negative_or_failure',
-    invariant_or_case: 'negative/failure path exercised',
-    command_or_check: 'npm run test',
-    status: rows.find(r => r.case_id === 'test')?.status === 'passed' ? 'passed' : 'unverified',
-    result: 'negative cases in unit suite',
-    required: true,
-    skip_or_failure_reason: 'not applicable: covered by test suite',
-  });
+  const inv = isPlainObject(opts.invariantTests) ? opts.invariantTests : {};
+  rows.push(buildInvariantRow(
+    'changed_invariant_positive',
+    'changed invariant has a positive test',
+    inv.changed_invariant_positive,
+    opts,
+  ));
+  rows.push(buildInvariantRow(
+    'material_negative_or_failure',
+    'negative/failure path exercised',
+    inv.material_negative_or_failure,
+    opts,
+  ));
+  const allFourPassed = names.every(n => rows.find(r => r.case_id === n)?.status === 'passed');
   rows.push({
     case_id: 'repository_required_checks',
     invariant_or_case: 'repository-required checks',
     command_or_check: 'npm run typecheck && npm run lint && npm run build && npm run test',
-    status: names.every(n => rows.find(r => r.case_id === n)?.status === 'passed') ? 'passed' : 'unverified',
-    result: 'all repository gates executed',
+    status: allFourPassed ? 'passed' : 'unverified',
+    result: allFourPassed ? 'all repository gates executed' : 'not all repository gates passed',
     required: true,
-    skip_or_failure_reason: 'not applicable: all gates passed',
+    skip_or_failure_reason: allFourPassed ? 'not applicable: all gates passed' : 'unverified: not all repository gates exited 0',
   });
   return rows;
 }
 
-function buildProblemContextFull(motivation, ctx) {
-  const mot = String(motivation || '').replace(/[\r\n]+/g, ' ').slice(0, 600);
-  const feature = ctx.feature || '本 PR';
-  return {
-    goal_basis: '本次交付目标是 ' + feature + '：' + (mot || '按契约完成变更并保留可验证证据。'),
-    author_claim: '作者声称已实现 ' + feature + ' 的验收项并完成本地门禁。',
-    old_behavior: '变更前该入口缺少结构化证据与逐文件说明，评审只能依赖人工浏览 diff。',
-    affected_caller_or_operator: '受影响的是 PR 作者、评审者与维护者：他们需要在合并前确认证据与文件改动一致。',
-    compounding_cost: '缺少证据会导致复审往返、合入延迟，并可能让未验证的行为进入主干。',
-    before_after_scenario: '变更前：评审需手工推断证据；变更后：review result 直接携带可校验的 evidence graph。',
-    smaller_fix_analysis: '只补字段而不接入 check-result 会留下假证据；因此本 PR 同时接入原生门禁校验。',
-    observable_outcome: '在无阻塞 PR 上，check-result 返回 ok=true 且 approval_consistent=true。',
-    outcome_impact: {
-      long_horizon: { decision: 'not_applicable', reason: '本次改动限于评审证据管线，不改变长期运行状态。', inspected_path: 'skills/code-review/scripts' },
-      user_experience: { decision: 'not_applicable', reason: '评审者在 PR 页面获得更完整的证据与文件说明。', inspected_path: 'skills/code-review/scripts' },
-    },
-    spec_basis: {
-      decision: ctx.specRef ? 'mapped' : 'no_spec',
-      ...(ctx.specRef
-        ? { spec_source: 'linked_issue_or_task', spec_ref: ctx.specRef, spec_revision: ctx.headOid, reason: '按 issue #3 的验收准则实现。' }
-        : { spec_source: 'none', reason: '本仓库未为评审证据图单独维护可引用的规格文件。' }),
-    },
-    non_goals: '不伪造未执行的 validation，不绕过 check-result，不为通过门禁而删除 required evidence 字段。',
-    verdict: 'goal_achieved',
+function extractModelInvariantCandidate(modelValidation, caseId) {
+  if (!isPlainObject(modelValidation)) return null;
+  if (modelValidation[caseId] !== undefined) return modelValidation[caseId];
+  if (Array.isArray(modelValidation.items)) {
+    const found = modelValidation.items.find(it => isPlainObject(it) && it.case_id === caseId);
+    if (found) return found;
+  }
+  return null;
+}
+
+function buildHostValidationRow(ctx, modelValidation) {
+  const baseItems = Array.isArray(ctx.validation) && ctx.validation.length
+    ? ctx.validation.map(item => ({ ...item }))
+    : buildValidationMatrix({}, { unverified: true, headOid: ctx.headOid, repoRoot: ctx.repoRoot, runNodeTest: ctx.runNodeTest });
+  const labels = {
+    changed_invariant_positive: 'changed invariant has a positive test',
+    material_negative_or_failure: 'negative/failure path exercised',
   };
-}
-
-function genericVerdict(id, req) {
-  const prefs = {
-    problem_context: 'goal_achieved',
-    semantic_alignment: 'not_applicable',
-    repository_reuse: 'no_existing_candidate',
-    observable_semantics: 'equivalent',
-    code_volume: 'necessary',
-    change_proportionality: 'proportionate',
-    default_off_isolation: 'not_applicable',
-    authority_semantics: 'aligned',
-    decision_text_assessment: 'not_applicable',
-    scope_coverage: 'not_applicable',
-  };
-  const allowed = Array.isArray(req.verdict_values) ? req.verdict_values : [];
-  if (prefs[id] && (!allowed.length || allowed.includes(prefs[id]))) return prefs[id];
-  return allowed.find(v => !/not_yet_proven|unintended|disproportionate|not_isolated|misleading|violated|blocking/.test(v)) || allowed[0] || 'not_applicable';
-}
-
-function genericString(id, field, ctx) {
-  const file = ctx.files[0] || 'NOT_PROVIDED';
-  return id + '.' + field + ': 基于 exact head ' + String(ctx.headOid).slice(0, 10) + ' 的 ' + file + ' 变更声明；详细证据见 diff 与 validation_matrix。';
-}
-
-function specialValue(id, field, ctx) {
-  if (field === 'outcome_impact') {
-    return {
-      long_horizon: { decision: 'not_applicable', reason: '本次改动不改变长期运行状态或持久化生命周期。', inspected_path: 'skills/code-review/scripts' },
-      user_experience: { decision: 'not_applicable', reason: '评审者获得更完整证据，不改变普通用户入口。', inspected_path: 'skills/code-review/scripts' },
-    };
-  }
-  if (field === 'spec_basis') {
-    return { decision: 'no_spec', spec_source: 'none', reason: '未为评审证据图维护独立规格文件；以本 PR 契约与 issue #3 验收为准。' };
-  }
-  if (field === 'compatibility_assessment') {
-    return { decision: 'not_applicable', reason: '本次改动未引入持久化或消费者兼容边界。' };
-  }
-  if (field === 'architecture_assessment') {
-    return { decision: 'not_applicable', reason: '本次改动位于既有评审脚本内部，不新增跨边界机制。' };
-  }
-  if (field === 'scope_coverage') {
-    return { decision: 'not_applicable', reason: '本次改动不新增 gate 或覆盖选择器。' };
-  }
-  if (field === 'decision_text_assessment') {
-    return { verdict: 'not_applicable', checked_scope: 'skills/code-review/scripts', reason: '未改变 agent-consumed 决策文本。' };
-  }
-  if (field === 'state_model_assessment') {
-    return { classification: 'not_applicable', reason: '未新增或新强制状态字段。' };
-  }
-  return undefined;
-}
-
-function fillField(id, field, req, ctx) {
-  const special = specialValue(id, field, ctx);
-  if (special !== undefined) return special;
-  if (field === 'verdict') return genericVerdict(id, req);
-  if (field === 'decision') return genericVerdict(id, req);
-  if (field === 'scope_fit_verdict') return 'fit';
-  if (field === 'files') return ctx.files.length ? ctx.files : ['NOT_PROVIDED'];
-  if (field === 'additions') return ctx.stats.additions;
-  if (field === 'deletions') return ctx.stats.deletions;
-  if (field === 'searched_revisions') return [String(ctx.headOid).slice(0, 12)];
-  if (field === 'queries_and_paths') return ['rg --files', ...ctx.files.slice(0, 5)];
-  if (field === 'existing_candidates') return ['none found in bounded search'];
-  if (field === 'comparison_rows') return [{ input_and_pre_state: 'bounded diff sample', entrypoint_and_backend: 'review pipeline', baseline_observation: 'no evidence graph', head_observation: 'evidence graph built', expected_invariant_source: 'issue #3', validation_evidence: 'npm test' }];
-  if (field === 'execution_receipts') return [{ revision: String(ctx.headOid).slice(0, 12), command: 'npm test', public_entrypoint: 'loopx-flow review', backend: 'local', fixture_fingerprint: 'repo tree', exit_status: 0, observation_fingerprint: 'tests pass', public_safe_artifact_reference_or_inline_observation: 'validation_matrix' }];
-  if (field === 'cases') return [{ case_id: 'covered_subject', status: 'passed', input_and_authority: 'standard review', expected_outcome: 'evidence graph built', observed_outcome: 'check-result ok', entrypoint_and_evidence: 'npm test' }];
-  if (field === 'mechanisms') return [{ mechanism: 'review evidence builder', responsibility: 'local_helper', owning_boundary: 'skills/code-review/scripts', activation_and_default: 'always on', failure_and_recovery: 'NOT_VERIFIED on missing fields', placement_basis: 'existing review script' }];
-  if (field === 'unverified_dimensions') return ['none declared beyond bounded diff'];
-  if (field === 'validation_evidence') return ['npm test'];
-  if (field === 'evidence_refs') return ['validation_matrix'];
-  if (field === 'clause_comparisons') return [{ baseline_clause: 'none', head_clause: 'none', obligation_or_condition: 'not applicable', assessment: 'not_applicable' }];
-  if (field === 'counterfactuals') return [{ triggering_state: 'none', expected_obligation: 'not_applicable', observed_result: 'not_applicable', evidence_ref: 'validation_matrix', status: 'not_applicable' }];
-  if (field === 'criteria') return [{ criterion_id: 'C1', requirement: 'evidence graph complete', disposition: 'implemented', symbol_or_path: 'skills/code-review/scripts/evidence-builder.js', validation_ref: 'validation_matrix' }];
-  if (field === 'highest_value_simplification') return '合并本地事实与模型语义，避免两套证据生成器。';
-  if (field === 'strongest_case_against_shipping') return '若证据图字段只是占位符，则价值有限；本 PR 用 check-result 验证结构并保留真实 validation。';
-  if (field === 'why_smaller_or_existing_owner_is_insufficient') return '现有 review 只有五段正文，无法满足原生 evidence 门禁。';
-  return genericString(id, field, ctx);
-}
-
-function buildSymbolItems(ctx) {
-  const items = [];
-  const files = ctx.files.length ? ctx.files : ['NOT_PROVIDED'];
-  for (const file of files.slice(0, 5)) {
-    const fileDiff = ctx.fileDiffs.get(file) || '';
-    items.push({
-      path: file,
-      line: firstChangedLineNumber(fileDiff),
-      symbol: firstChangedLine(fileDiff).slice(0, 120) || file,
-      responsibility: 'behavior-bearing change in ' + file,
-      before_after_behavior: 'diff adds/changes behavior at exact head',
-      input_or_pre_state: 'pre-change tree',
-      critical_branch_or_invariant: 'evidence graph must remain structurally complete',
-      callee_or_side_effect: 'none beyond review pipeline',
-      return_or_consumer: 'check-result',
-      failure_fallback_or_retry_owner: 'review script NOT_VERIFIED',
-      caller_evidence: 'review pipeline',
+  for (const caseId of ['changed_invariant_positive', 'material_negative_or_failure']) {
+    const candidate = extractModelInvariantCandidate(modelValidation, caseId);
+    if (!candidate) continue;
+    const evaluated = buildInvariantRow(caseId, labels[caseId], candidate, {
+      headOid: ctx.headOid,
+      repoRoot: ctx.repoRoot,
+      runNodeTest: ctx.runNodeTest,
     });
+    const idx = baseItems.findIndex(item => item && item.case_id === caseId);
+    if (idx >= 0) baseItems[idx] = evaluated;
+    else baseItems.push(evaluated);
   }
-  while (items.length < 2) items.push({ ...items[0] });
-  return items.slice(0, 5);
-}
-
-function buildWalkthroughs(ctx) {
   return {
-    positive: {
-      trigger: 'review pipeline runs on a clean PR',
-      ordered_symbols_or_steps: ['authentic-review.js', 'evidence-builder.js', 'loopx pr-review --check-result'],
-      state_transitions: 'packet -> evidence graph -> result',
-      observable_result: 'check-result ok=true and approval_consistent=true',
-    },
-    negative: {
-      triggering_input_or_state: 'missing required evidence field',
-      ordered_symbols_or_steps: ['evidence-builder.js', 'authentic-review.js'],
-      rejection_fallback_or_wrong_outcome: 'NOT_VERIFIED before publishing',
-      error_or_retry_owner: 'review script',
-    },
+    status: 'verified',
+    items: baseItems,
   };
 }
 
-function localEvidence(id, req, ctx) {
-  const row = { status: 'verified' };
-  if (id === 'problem_context') {
-    Object.assign(row, buildProblemContextFull(ctx.motivation, ctx));
-    return row;
-  }
-  for (const field of req.fields || []) row[field] = fillField(id, field, req, ctx);
-  if (id === 'validation_matrix') row.items = ctx.validation;
-  if (id === 'symbol_map') row.items = buildSymbolItems(ctx);
-  if (id === 'walkthroughs') Object.assign(row, buildWalkthroughs(ctx));
-  if (id === 'changed_line_classification') {
-    row.files = ctx.files.length ? ctx.files : ['NOT_PROVIDED'];
-    row.additions = ctx.stats.additions;
-    row.deletions = ctx.stats.deletions;
-    row.behavior_role = 'behavior-bearing review pipeline change';
-  }
-  if (id === 'code_volume') {
-    row.compatibility_assessment = { decision: 'not_applicable', reason: 'no persisted or consumer compatibility boundary touched' };
-    row.changed_line_shape = ctx.stats.additions + ' additions / ' + ctx.stats.deletions + ' deletions';
-  }
-  if (id === 'change_proportionality') {
-    row.architecture_assessment = { decision: 'not_applicable', reason: 'change stays inside existing review script boundary', current_pr_boundary: 'skills/code-review/scripts only' };
-  }
-  if (id === 'observable_semantics') {
-    row.scope_coverage = { decision: 'not_applicable', reason: 'no gate or coverage selector added' };
-    row.decision_text_assessment = { verdict: 'not_applicable', checked_scope: 'skills/code-review/scripts', reason: 'no agent-consumed decision text change' };
-  }
-  if (id === 'repository_reuse') {
-    row.state_model_assessment = { classification: 'not_applicable', reason: 'no new persistent state' };
-  }
-  if (id === 'semantic_alignment') {
-    row.checked_scope = 'skills/code-review/scripts';
-    row.impact_reason = 'no shared contract vocabulary changed';
-    row.verdict = 'not_applicable';
+function buildChangedLineClassificationRow(ctx, modelRow) {
+  const row = {
+    status: 'verified',
+    files: ctx.files.slice(),
+    additions: ctx.stats.additions,
+    deletions: ctx.stats.deletions,
+  };
+  if (isPlainObject(modelRow) && typeof modelRow.behavior_role === 'string' && modelRow.behavior_role.trim()) {
+    row.behavior_role = modelRow.behavior_role.trim();
   }
   return row;
 }
 
-function mergeRow(local, model, id) {
-  if (!model || typeof model !== 'object') return local;
-  if (['validation_matrix', 'changed_line_classification', 'code_volume', 'symbol_map'].includes(id)) {
-    return local;
+function buildCodeVolumeRow(ctx, modelRow) {
+  const row = {
+    status: 'verified',
+    additions: ctx.stats.additions,
+    deletions: ctx.stats.deletions,
+    changed_line_shape: `${ctx.stats.additions} additions / ${ctx.stats.deletions} deletions`,
+  };
+  if (isPlainObject(modelRow)) {
+    for (const key of [
+      'largest_production_hotspots',
+      'active_call_site_evidence',
+      'compatibility_assessment',
+      'verdict',
+      'highest_value_simplification',
+      'behavior_preserving_validation',
+    ]) {
+      if (!isMissingValue(modelRow[key])) row[key] = modelRow[key];
+    }
   }
-  const merged = { ...local, ...model, status: model.status || local.status || 'verified' };
-  for (const [k, v] of Object.entries(local)) {
-    if (merged[k] === undefined || merged[k] === null || merged[k] === '') merged[k] = v;
-  }
-  return merged;
+  return row;
 }
 
-function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, validation, modelEvidence }) {
+function buildSymbolMapRow(req, ctx, modelRow) {
+  const hostItems = ctx.files.slice(0, 5).map(file => ({
+    path: file,
+    line: firstChangedLineNumber(ctx.fileDiffs.get(file) || ''),
+  }));
+  const itemFields = Array.isArray(req.item_fields) && req.item_fields.length
+    ? req.item_fields
+    : [
+        'path',
+        'line',
+        'symbol',
+        'responsibility',
+        'before_after_behavior',
+        'input_or_pre_state',
+        'critical_branch_or_invariant',
+        'callee_or_side_effect',
+        'return_or_consumer',
+        'failure_fallback_or_retry_owner',
+        'caller_evidence',
+      ];
+  const minItems = req.item_count && typeof req.item_count.minimum === 'number' ? req.item_count.minimum : 2;
+  const maxItems = req.item_count && typeof req.item_count.maximum === 'number' ? req.item_count.maximum : 5;
+  if (!isPlainObject(modelRow) || modelRow.status !== 'verified' || !Array.isArray(modelRow.items)) {
+    return { status: 'unverified', items: hostItems };
+  }
+  const candidateItems = modelRow.items.slice(0, maxItems);
+  if (candidateItems.length < minItems || candidateItems.some(it => !isPlainObject(it))) {
+    return { status: 'unverified', items: hostItems };
+  }
+  const mergedItems = candidateItems.map((it, idx) => {
+    const byPath = hostItems.find(h => h.path === it.path);
+    const anchor = byPath || hostItems[idx] || null;
+    return {
+      ...it,
+      ...(anchor ? { path: anchor.path, line: anchor.line } : {}),
+    };
+  });
+  const complete = mergedItems.every(it => itemFields.every(f => !isMissingValue(it[f])));
+  if (!complete) {
+    return { status: 'unverified', items: hostItems };
+  }
+  return { status: 'verified', items: mergedItems };
+}
+
+function isValidJudgmentRow(id, modelRow, req, plan) {
+  if (!isPlainObject(modelRow)) return false;
+  if (modelRow.status === 'not_applicable') {
+    const detailKeys = Object.keys(modelRow).filter(k => k !== 'status' && k !== 'verdict' && !isMissingValue(modelRow[k]));
+    if (!detailKeys.length) return false;
+    if (Array.isArray(req.verdict_values) && req.verdict_values.length && modelRow.verdict !== undefined) {
+      if (!req.verdict_values.includes(modelRow.verdict)) return false;
+    }
+    return true;
+  }
+  if (modelRow.status !== 'verified') return false;
+  for (const field of req.fields || []) {
+    if (isMissingValue(modelRow[field])) return false;
+  }
+  if (Array.isArray(req.verdict_values) && req.verdict_values.length) {
+    if (!req.verdict_values.includes(modelRow.verdict)) return false;
+  }
+  if (typeof req.positive_field === 'string') {
+    const pos = modelRow[req.positive_field];
+    if (!isPlainObject(pos)) return false;
+    for (const f of req.positive_fields || []) {
+      if (isMissingValue(pos[f])) return false;
+    }
+  }
+  const negRequired = !plan || !plan.applicability || plan.applicability.negative_walkthrough_required !== false;
+  if (typeof req.negative_field === 'string' && negRequired) {
+    const neg = modelRow[req.negative_field];
+    if (!isPlainObject(neg)) return false;
+    for (const f of req.negative_fields || []) {
+      if (isMissingValue(neg[f])) return false;
+    }
+  }
+  if (id === 'problem_context') {
+    const oi = modelRow.outcome_impact;
+    if (!isPlainObject(oi) || !isPlainObject(oi.long_horizon) || !isPlainObject(oi.user_experience)) return false;
+    if (isMissingValue(oi.long_horizon.decision) || isMissingValue(oi.long_horizon.reason)) return false;
+    if (isMissingValue(oi.user_experience.decision) || isMissingValue(oi.user_experience.reason)) return false;
+    const sb = modelRow.spec_basis;
+    if (!isPlainObject(sb) || isMissingValue(sb.decision) || isMissingValue(sb.spec_source) || isMissingValue(sb.reason)) return false;
+    if (sb.decision === 'mapped') {
+      if (isMissingValue(sb.spec_ref) || isMissingValue(sb.spec_revision) || !Array.isArray(sb.criteria) || !sb.criteria.length) return false;
+    }
+  }
+  if (id === 'change_proportionality') {
+    const aa = modelRow.architecture_assessment;
+    if (!isPlainObject(aa) || isMissingValue(aa.decision) || isMissingValue(aa.reason)) return false;
+    if (aa.decision !== 'not_applicable') {
+      if (!Array.isArray(aa.mechanisms) || !aa.mechanisms.length || isMissingValue(aa.current_pr_boundary) || isMissingValue(aa.validation_evidence)) {
+        return false;
+      }
+    }
+  }
+  if (id === 'observable_semantics') {
+    if ((req.fields || []).includes('scope_coverage')) {
+      const sc = modelRow.scope_coverage;
+      if (!isPlainObject(sc) || isMissingValue(sc.decision) || isMissingValue(sc.reason)) return false;
+    }
+    if ((req.fields || []).includes('decision_text_assessment')) {
+      const dt = modelRow.decision_text_assessment;
+      if (!isPlainObject(dt) || isMissingValue(dt.verdict) || isMissingValue(dt.checked_scope) || isMissingValue(dt.reason)) return false;
+    }
+  }
+  if (id === 'repository_reuse' && (req.fields || []).includes('state_model_assessment')) {
+    const sm = modelRow.state_model_assessment;
+    if (!isPlainObject(sm) || isMissingValue(sm.classification) || isMissingValue(sm.reason)) return false;
+  }
+  return true;
+}
+
+function buildJudgmentRow(id, req, plan, modelRow) {
+  if (!isPlainObject(modelRow)) return { status: 'unverified' };
+  if (!isValidJudgmentRow(id, modelRow, req, plan)) {
+    if (id === 'problem_context') {
+      const out = { status: 'unverified' };
+      for (const k of ['affected_caller_or_operator', 'before_after_scenario', 'observable_outcome', 'non_goals', 'remaining_gap']) {
+        if (typeof modelRow[k] === 'string' && modelRow[k].trim()) out[k] = modelRow[k].trim();
+      }
+      return out;
+    }
+    return { status: 'unverified' };
+  }
+  return { ...modelRow };
+}
+
+function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, validation, modelEvidence, repoRoot, runNodeTest }) {
   const reqs = new Map((contract && contract.evidence_requirements || []).map(r => [r.evidence_id, r]));
-  const requiredIds = Array.isArray(plan.required_evidence_ids) ? plan.required_evidence_ids : [];
-  const templateEvidence = plan.result_template && plan.result_template.evidence ? plan.result_template.evidence : {};
+  const requiredIds = Array.isArray(plan && plan.required_evidence_ids) ? plan.required_evidence_ids : [];
   const ctx = {
-    feature: plan.feature || 'review-evidence-graph',
+    feature: (plan && plan.feature) || 'review-evidence-graph',
     headOid: String(headOid || ''),
     pr,
     motivation,
@@ -313,15 +474,23 @@ function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, val
     fileDiffs: splitFileDiffs(diff),
     stats: diffStats(diff),
     validation: Array.isArray(validation) ? validation : [],
+    repoRoot,
+    runNodeTest,
   };
   const out = {};
   for (const id of requiredIds) {
     const req = reqs.get(id) || {};
-    const local = localEvidence(id, req, ctx);
-    const modelRow = modelEvidence && typeof modelEvidence === 'object' ? modelEvidence[id] : null;
-    out[id] = mergeRow(local, modelRow, id);
-    if (templateEvidence[id] && templateEvidence[id].status === 'unverified' && out[id].status === 'verified') {
-      // template is only a placeholder; keep verified.
+    const modelRow = isPlainObject(modelEvidence) ? modelEvidence[id] : null;
+    if (id === 'validation_matrix') {
+      out[id] = buildHostValidationRow(ctx, modelRow);
+    } else if (id === 'changed_line_classification') {
+      out[id] = buildChangedLineClassificationRow(ctx, modelRow);
+    } else if (id === 'code_volume') {
+      out[id] = buildCodeVolumeRow(ctx, modelRow);
+    } else if (id === 'symbol_map') {
+      out[id] = buildSymbolMapRow(req, ctx, modelRow);
+    } else {
+      out[id] = buildJudgmentRow(id, req, plan, modelRow);
     }
   }
   return out;
@@ -355,7 +524,6 @@ module.exports = {
   splitFileDiffs,
   diffStats,
   buildValidationMatrix,
-  buildProblemContextFull,
   buildEvidenceGraph,
   describeFileFromDiff,
   scanDiff,
