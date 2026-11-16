@@ -19,6 +19,63 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
+# 按仓库真实存在的远程默认基线解析：origin/HEAD → origin/main → origin/master（GitHub Issue #13）。
+# 单一事实源在 ingest-to-loopx-quality.js#discoverBaseRef；shell 侧只做委托与降级，避免两处逻辑漂移。
+resolve_change_quality_base_ref() {
+    local ref
+    ref="$(node -e '
+const ingest = require(process.argv[1]);
+try { process.stdout.write(ingest.discoverBaseRef(".")); } catch (_) {}
+' "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" 2>/dev/null)" || true
+    [[ -n "$ref" ]] && { printf '%s' "$ref"; return 0; }
+    return 1
+}
+
+# Goal 未启用 change-quality 资格时，fail-closed 输出诊断卡（原因 + 可执行修复命令）。
+# 用法: preflight_change_quality_qualification <goal-id> [check|doctor]
+#   check  → 资格未启用直接 exit 1（前置阻断，不等四大门禁跑完）
+#   doctor → 返回 1 供体检汇总为 WARN（doctor 是阶段 0 体检，不作为交付门禁）
+preflight_change_quality_qualification() {
+    local goal_id="${1:-}" mode="${2:-check}" base_ref payload verdict prepare_rc
+    [[ -n "$goal_id" ]] || return 0
+    command -v loopx >/dev/null 2>&1 || return 0
+    base_ref="$(resolve_change_quality_base_ref || true)"
+    [[ -n "$base_ref" ]] || base_ref="origin/main"
+    # 分离捕获退出码与 JSON 输出：严禁用 `|| echo '{}'` 拼接，否则 prepare 失败时双 JSON
+    # 会让 JSON.parse 失败并回落空对象，UNKNOWN 被误判为 OK，跳过前置阻断空跑四大门禁。
+    prepare_rc=0
+    payload="$(loopx $REGISTRY_FLAG change-quality prepare --goal-id "$goal_id" --base-ref "$base_ref" --format json 2>/dev/null)" || prepare_rc=$?
+    verdict="$(node -e '
+let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+let p={};try{p=JSON.parse(d)}catch(_){}
+if(p.ok===false)process.stdout.write("UNKNOWN");
+else if(p.status==="disabled"||(p.policy&&p.policy.enabled===false))process.stdout.write("DISABLED");
+else process.stdout.write("OK");
+})' <<< "$payload")"
+    if [[ "$prepare_rc" -ne 0 ]]; then
+        verdict="UNKNOWN"
+    fi
+    if [[ "$verdict" == "DISABLED" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] Goal '$goal_id' 未启用 change-quality 资格，无法生成质量收据。${NC}" >&2
+        echo -e "[-] 为什么阻断？资格未启用时 loopx change-quality record 会以 \"qualification is disabled for this goal\" 拒绝。" >&2
+        echo -e "💡 原因：Goal 的 control_plane.change_quality_qualification.enabled 未打开，收据无法写入。" >&2
+        echo -e "🛠️ 修复指令: loopx configure-goal --goal-id $goal_id --change-quality-enabled --execute" >&2
+        [[ "$mode" == "check" ]] && exit 1
+        return 1
+    fi
+    if [[ "$verdict" == "UNKNOWN" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法判定 Goal '$goal_id' 的 change-quality 资格（prepare 非零退出或返回 ok=false），禁止放行。${NC}" >&2
+        echo -e "[-] 为什么阻断？资格状态 UNKNOWN 时生成的质量收据不可信；check 不得空跑四大门禁后进入交付。" >&2
+        echo -e "    prepare 退出码: ${prepare_rc}；prepare 输出: ${payload:0:400}" >&2
+        echo -e "💡 原因：Goal 未注册 / 控制面异常 / 基线不可解析，导致 loopx change-quality prepare 失败。" >&2
+        echo -e "🛠️ 修复指令: 确认 Goal 已注册并启用资格: loopx configure-goal --goal-id $goal_id --change-quality-enabled --execute" >&2
+        echo -e "🛠️ 诊断指令: loopx change-quality prepare --goal-id $goal_id --base-ref $base_ref --format json" >&2
+        [[ "$mode" == "check" ]] && exit 1
+        return 1
+    fi
+    return 0
+}
+
 usage() {
     cat << 'USAGETXT'
 ===============================================================================
@@ -142,6 +199,38 @@ process.stdout.write([...new Set(bad)].join(" "))
     return "$fail"
 }
 
+# change-quality 资格与默认基线诊断（GitHub Issue #13）：阶段 0 体检，WARN 不硬阻断。
+cmd_doctor_change_quality() {
+    local fail=0 goal="" branch base_ref
+    echo -e "\n${BLUE}==> change-quality 资格与远程默认基线诊断 (GitHub Issue #13)...${NC}"
+    if base_ref="$(resolve_change_quality_base_ref)"; then
+        echo -e "${GREEN}[✓] 远程默认基线解析: $base_ref${NC}"
+    else
+        echo -e "${YELLOW}[WARN] 无法解析远程默认基线（origin/HEAD / origin/main / origin/master 均不存在）${NC}"
+        echo -e "       🛠️ 修复: git fetch origin && git remote set-head origin -a"
+        fail=1
+    fi
+    if ! command -v loopx >/dev/null 2>&1; then
+        echo -e "${YELLOW}[WARN] 未检测到 loopx，跳过 Goal 资格诊断${NC}"
+        return "$fail"
+    fi
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+    if [[ "$branch" =~ ^feature/(.+) ]]; then
+        goal="${BASH_REMATCH[1]}-goal"
+    fi
+    if [[ -z "$goal" ]]; then
+        echo -e "${YELLOW}[i] 当前非 feature/<name> 分支，跳过 Goal 资格诊断（可用: loopx-flow check --goal-id <id> 触发）${NC}"
+        return "$fail"
+    fi
+    if preflight_change_quality_qualification "$goal" doctor; then
+        echo -e "${GREEN}[✓] Goal '$goal' 已启用 change-quality 资格${NC}"
+    else
+        echo -e "${YELLOW}[WARN] Goal '$goal' 资格未启用或未注册（详见上方诊断卡）${NC}"
+        fail=1
+    fi
+    return "$fail"
+}
+
 cmd_doctor() {
     echo -e "${BLUE}==> [1/3] 运行流水线前置哨兵体检 (Preflight Sentinel)...${NC}"
     "$PROJECT_ROOT/scripts/preflight-check.sh"
@@ -165,6 +254,11 @@ cmd_doctor() {
     # 环境治理：路由/registry 一致性 + API 预算基线（WARN 不阻断，但给出可执行修复指令）
     if ! cmd_doctor_control_plane; then
         echo -e "\n${YELLOW}[i] 控制面一致性检查存在告警：不影响本地门禁，但会影响 approve/check/迁移的稳定性。${NC}"
+    fi
+
+    # 环境治理：change-quality 资格与远程默认基线（GitHub Issue #13）
+    if ! cmd_doctor_change_quality; then
+        echo -e "\n${YELLOW}[i] change-quality 诊断存在告警：check 会在前置阶段 fail-closed，请按诊断卡修复。${NC}"
     fi
 }
 
@@ -541,6 +635,18 @@ cmd_check() {
     fi
     local resolved_goal="${goal_id:-${feature}-goal}"
 
+    # 前置解析真实远程默认基线（GitHub Issue #13）：失败必须早于四大门禁。
+    local cq_base_ref
+    if ! cq_base_ref="$(resolve_change_quality_base_ref)"; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法解析远程默认基线：origin/HEAD / origin/main / origin/master 均不存在。${NC}" >&2
+        echo -e "[-] 为什么阻断？change-quality prepare/record/verify 必须绑定可解析的远程基线。${NC}" >&2
+        echo -e "🛠️ 修复指令: git fetch origin && git remote set-head origin -a" >&2
+        exit 1
+    fi
+
+    # 前置诊断 Goal 资格：未启用则 fail-closed，不再空跑四大门禁。
+    preflight_change_quality_qualification "$resolved_goal" check
+
     echo -e "${BLUE}======================================================================${NC}"
     echo -e "${BLUE}        执行本地四大硬门禁与代码质量一体化自检                          ${NC}"
     echo -e "${BLUE}======================================================================${NC}"
@@ -571,10 +677,10 @@ cmd_check() {
             exit 1
         fi
         echo -e "    检测到启用阿里 OCR 选配项，调用技能内自闭环脚本..."
-        "$PROJECT_ROOT/skills/open-code-review/run-ocr.sh" origin/main "$feature"
+        "$PROJECT_ROOT/skills/open-code-review/run-ocr.sh" "$cq_base_ref" "$feature"
     else
         echo -e "    调用默认语义契约审查并送入 LoopX Quality 适配器..."
-        node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" ${feature:+--feature "$feature"} --goal-id "$resolved_goal"
+        node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" ${feature:+--feature "$feature"} --goal-id "$resolved_goal" --base-ref "$cq_base_ref"
     fi
 
     echo -e "\n${BOLD}[3/3] 正在核验 LoopX change-quality 严格收据凭据 (Fail-Closed)...${NC}"
@@ -585,7 +691,7 @@ cmd_check() {
         exit 1
     fi
     local cq_json cq_ok
-    cq_json="$(loopx $REGISTRY_FLAG change-quality verify --goal-id "$resolved_goal" --repo-path . --format json 2>&1 || echo '{}')"
+    cq_json="$(loopx $REGISTRY_FLAG change-quality verify --goal-id "$resolved_goal" --repo-path . --base-ref "$cq_base_ref" --format json 2>&1 || echo '{}')"
     cq_ok="$(node -e '
 const fs = require("fs");
 let d = {};

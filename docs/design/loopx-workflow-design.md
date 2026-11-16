@@ -230,6 +230,9 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | `configure-goal` 失败 | `approve` | 非 0，契约保持未批准 |
 | `sync-global` 重试后仍失败 | `feature` / `approve` | 非 0 |
 | 质量扫描存在 blocker | `ingest` / `check` | record 前非 0 |
+| 远程默认基线为 `origin/master`（无 `origin/main`） | `check` / `ingest` | 按 `origin/HEAD` → `origin/main` → `origin/master` 解析真实基线并透传 `--base-ref`，正常生成收据 |
+| 三种远程默认基线均不存在 | `check` / `ingest` | 前置非 0，提示 `git fetch origin && git remote set-head origin -a` |
+| Goal 未启用 change-quality 资格 | `check` / `doctor` | `check` 前置非 0（先于四大门禁）并输出诊断卡与 `loopx configure-goal --goal-id <goal> --change-quality-enabled --execute`；`doctor` 输出同类诊断卡并告警 |
 | PR 已 MERGED 且仍有未完成步骤 | `merge` | 不重复合并，补步骤；全部完成才成功 |
 | `goal-lifecycle stop` 失败 | `merge` | 非 0；GitHub squash 可能已完成 |
 | 全局退役、`sync-global` 或 archive 失败 | `merge` | 非 0；打印已合入未闭环与重跑命令 |
