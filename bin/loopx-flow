@@ -102,8 +102,10 @@ usage() {
   init                    初始化项目工作流骨架、依赖及本地 LoopX 连接
   status                  查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
   todo list [goal_id]     列出指定或当前 Goal 下的全部 Agent / User Todos
-  todo claim <tid>        申领排他租约 (task-lease acquire --owner 与稳定 --idempotency-key)
-                          身份取该 Goal 已注册 Agent；多个时设置 LOOPX_AGENT_ID。
+  todo claim <tid>        申领排他租约 (task-lease acquire --owner 与代际 --idempotency-key)
+                          先读完 agent-directory 分页，再按 task-lease inspect 选键。
+                          活动租约且 owner 相同则复用当前键；过期、释放或不存在则换新代际键。
+                          可传 --idempotency-key 原样透传。多个身份时设置 LOOPX_AGENT_ID。
                           未注册则 Fail-Closed，并打印 loopx register-agent ... --execute
   todo done <tid>         标记任务完成并释放排他租约 (loopx todo --status done + task-lease release)
   help, --help, -h        显示本帮助信息
@@ -1560,78 +1562,325 @@ cmd_status() {
 }
 
 # 打印可直接执行的 register-agent 修复命令。预览不够，必须带 --execute。
+# 占位符 <registered-agent-id> 必须原样出现；%q 会把它写成 \<registered-agent-id\>。
 print_register_agent_repair() {
     local goal_id="$1"
     local agent_id="$2"
     local goal_q agent_q
     printf -v goal_q '%q' "$goal_id"
-    printf -v agent_q '%q' "$agent_id"
+    if [[ "$agent_id" == "<registered-agent-id>" ]]; then
+        agent_q="$agent_id"
+    else
+        printf -v agent_q '%q' "$agent_id"
+    fi
     echo -e "${YELLOW}    修复: loopx ${REGISTRY_FLAG} --format json register-agent --goal-id ${goal_q} --agent-id ${agent_q} --execute${NC}" >&2
 }
 
-# 幂等键只由 goal、todo、owner 派生，重试保持不变，且满足 LoopX public-safe token。
+# 幂等键：显式 --idempotency-key 原样透传。否则先看 inspect。
+# 活动且同一 owner 复用该代际键；过期、释放或其他代际用 epoch/version 生成下一把键。
+# 没有租约记录时，仍用 goal、todo、owner 的稳定键，方便首次申领重试。
 claim_idempotency_key() {
-    node -e '
+    node - "$1" "$2" "$3" "$4" "$5" <<'NODE'
 const crypto = require("crypto");
-const [goalId, todoId, owner] = process.argv.slice(1);
+const fs = require("fs");
+const [goalId, todoId, owner, explicit, inspectFile] = process.argv.slice(2);
 if (!goalId || !todoId || !owner) process.exit(2);
-const hex = crypto.createHash("sha256").update(goalId + "\n" + todoId + "\n" + owner, "utf8").digest("hex");
-const key = "loopx-flow:claim:" + hex;
-if (!/^[A-Za-z0-9_.:@\/-]{1,160}$/.test(key)) process.exit(3);
-process.stdout.write(key);
-' "$1" "$2" "$3"
+const token = /^[A-Za-z0-9_.:@\/-]{1,160}$/;
+function emit(key) {
+  if (!token.test(key)) {
+    process.stderr.write("幂等键不是 LoopX public-safe token\n");
+    process.exit(3);
+  }
+  process.stdout.write(key);
+}
+if (explicit) {
+  emit(explicit);
+  process.exit(0);
+}
+function firstJson(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === "\"") inStr = false;
+      continue;
+    }
+    if (c === "\"") { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+if (!inspectFile) {
+  process.stderr.write("缺少 task-lease inspect 结果，已阻断申领\n");
+  process.exit(4);
+}
+let raw = "";
+try { raw = fs.readFileSync(inspectFile, "utf8"); }
+catch (_) {
+  process.stderr.write("无法读取 task-lease inspect 结果，已阻断申领\n");
+  process.exit(4);
+}
+let payload;
+try { payload = JSON.parse(firstJson(raw) || ""); }
+catch (_) {
+  process.stderr.write("task-lease inspect 输出不是 JSON，已阻断申领\n");
+  process.exit(4);
+}
+if (!payload || payload.ok !== true) {
+  const code = payload && payload.error_code ? payload.error_code : "inspect_failed";
+  process.stderr.write("task-lease inspect 失败: " + code + "\n");
+  process.exit(4);
+}
+const lease = payload.lease == null ? null : payload.lease;
+if (lease != null && (typeof lease !== "object" || Array.isArray(lease))) {
+  process.stderr.write("task-lease inspect 的 lease 字段无法解析，已阻断申领\n");
+  process.exit(4);
+}
+function digest(material) {
+  return crypto.createHash("sha256").update(material, "utf8").digest("hex");
+}
+const baseMaterial = goalId + "\n" + todoId + "\n" + owner;
+const baseKey = "loopx-flow:claim:" + digest(baseMaterial);
+function integerField(value, fallback) {
+  if (value == null || value === "") return fallback;
+  const number = typeof value === "number"
+    ? value
+    : (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value) ? Number(value) : NaN);
+  if (!Number.isSafeInteger(number) || number < 0) return null;
+  return number;
+}
+function timeActive(record) {
+  if (record.schema_version !== "task_lease_v0" || record.status !== "active") return false;
+  if (typeof record.expires_at !== "string") return null;
+  const expiresAt = Date.parse(record.expires_at);
+  if (!Number.isFinite(expiresAt)) return null;
+  return expiresAt > Date.now();
+}
+if (lease == null) {
+  emit(baseKey);
+  process.exit(0);
+}
+const active = timeActive(lease);
+if (active == null) {
+  process.stderr.write("活动租约缺少可解析的 expires_at，已阻断申领\n");
+  process.exit(4);
+}
+if (active === true && lease.owner === owner) {
+  if (typeof lease.idempotency_key !== "string") {
+    process.stderr.write("活动租约没有可复用的 idempotency_key，已阻断申领\n");
+    process.exit(4);
+  }
+  emit(lease.idempotency_key);
+  process.exit(0);
+}
+const epoch = integerField(lease.lease_epoch, 1);
+const version = integerField(lease.version, 0);
+if (epoch == null || version == null) {
+  process.stderr.write("租约代际 lease_epoch / version 无法解析，已阻断申领\n");
+  process.exit(4);
+}
+emit("loopx-flow:claim:" + digest(baseMaterial + "\n" + String(epoch) + "\n" + String(version) + "\nnext"));
+NODE
 }
 
+# 读完 agent-directory 的全部分页后再判定 owner。首页最多 24 行，诊断行会占满首页。
 # 成功时向 stdout 打印已注册 agent id。失败时打印修复指令并返回 1，不申领租约。
 resolve_claim_owner() {
     local goal_id="$1"
-    local directory_json="" verdict=""
-    if ! directory_json="$(loopx $REGISTRY_FLAG --format json agent-directory --goal-id "$goal_id" 2>/dev/null)"; then
-        directory_json="${directory_json:-}"
-    fi
-    if ! verdict="$(printf '%s' "$directory_json" | node -e '
+    local page_dir cursor="" page_index=0 meta next_cursor
+    page_dir="$(mktemp -d "${TMPDIR:-/tmp}/loopx-flow-agents.XXXXXX")"
+
+    while true; do
+        page_index=$((page_index + 1))
+        if (( page_index > 128 )); then
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal ${goal_id} 的 agent-directory 分页超过 128 页，已阻断租约申领。${NC}" >&2
+            rm -rf "$page_dir"
+            return 1
+        fi
+        local page_file="$page_dir/$(printf 'page-%03d.json' "$page_index")"
+        if [[ -z "$cursor" ]]; then
+            loopx $REGISTRY_FLAG --format json agent-directory --goal-id "$goal_id" >"$page_file" 2>/dev/null || true
+        else
+            loopx $REGISTRY_FLAG --format json agent-directory --goal-id "$goal_id" --cursor "$cursor" >"$page_file" 2>/dev/null || true
+        fi
+        meta="$(node - "$page_file" <<'NODE'
+const fs = require("fs");
+let raw = "";
+try { raw = fs.readFileSync(process.argv[2], "utf8"); }
+catch (_) { process.stdout.write("BAD"); process.exit(0); }
+function firstJson(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === "\"") inStr = false;
+      continue;
+    }
+    if (c === "\"") { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+let payload;
+try { payload = JSON.parse(firstJson(raw) || ""); }
+catch (_) { process.stdout.write("BAD"); process.exit(0); }
+if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  process.stdout.write("BAD");
+  process.exit(0);
+}
+if (payload.ok === false && payload.error_code === "goal_not_registered") {
+  process.stdout.write("GOAL_MISSING");
+  process.exit(0);
+}
+if (payload.ok !== true) { process.stdout.write("BAD"); process.exit(0); }
+const next = payload.next_cursor;
+if (next == null || next === "") { process.stdout.write("END"); process.exit(0); }
+if (typeof next !== "string" || /[\s\u0000]/.test(next)) {
+  process.stdout.write("BAD");
+  process.exit(0);
+}
+process.stdout.write("NEXT " + next);
+NODE
+)"
+        case "$meta" in
+            END|GOAL_MISSING)
+                break
+                ;;
+            BAD|"")
+                echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Goal ${goal_id} 的已注册 Agent 身份，已阻断租约申领。${NC}" >&2
+                local goal_q
+                printf -v goal_q '%q' "$goal_id"
+                echo -e "${YELLOW}    修复: loopx ${REGISTRY_FLAG} --format json agent-directory --goal-id ${goal_q}${NC}" >&2
+                rm -rf "$page_dir"
+                return 1
+                ;;
+            NEXT\ *)
+                next_cursor="${meta#NEXT }"
+                if [[ -n "$next_cursor" && -f "$page_dir/seen" ]] && grep -Fxq -e "$next_cursor" "$page_dir/seen"; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] Goal ${goal_id} 的 agent-directory 游标重复，已停止翻页并阻断租约申领。${NC}" >&2
+                    rm -rf "$page_dir"
+                    return 1
+                fi
+                if [[ -z "$next_cursor" || "$next_cursor" == "$cursor" ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] Goal ${goal_id} 的 agent-directory 游标没有前进，已阻断租约申领。${NC}" >&2
+                    rm -rf "$page_dir"
+                    return 1
+                fi
+                printf '%s\n' "$next_cursor" >> "$page_dir/seen"
+                cursor="$next_cursor"
+                ;;
+            *)
+                echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Goal ${goal_id} 的已注册 Agent 身份，已阻断租约申领。${NC}" >&2
+                rm -rf "$page_dir"
+                return 1
+                ;;
+        esac
+    done
+
+    node - "$page_dir" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const dir = process.argv[2];
 const envRaw = String(process.env.LOOPX_AGENT_ID || "").trim();
 const fold = (value) => String(value || "").trim().toLowerCase().replace(/ /g, "-");
-let raw = "";
-process.stdin.on("data", (chunk) => { raw += chunk; });
-process.stdin.on("end", () => {
-  let payload;
-  try { payload = JSON.parse(raw); } catch (_) { process.stdout.write("LOOKUP_FAILED"); return; }
-  if (!payload || typeof payload !== "object") { process.stdout.write("LOOKUP_FAILED"); return; }
-  if (payload.ok === false && payload.error_code === "goal_not_registered") {
-    process.stdout.write("GOAL_MISSING");
-    return;
+function firstJson(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === "\"") inStr = false;
+      continue;
+    }
+    if (c === "\"") { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
   }
-  if (payload.ok !== true) { process.stdout.write("LOOKUP_FAILED"); return; }
-  const registered = [];
+  return null;
+}
+function write(verdict, extra) {
+  const fields = extra || {};
+  fs.writeFileSync(path.join(dir, "verdict"), verdict);
+  fs.writeFileSync(path.join(dir, "owner"), fields.owner || "");
+  fs.writeFileSync(path.join(dir, "env_id"), fields.env || "");
+  fs.writeFileSync(path.join(dir, "registered"), (fields.registered || []).join("\n"));
+}
+const files = fs.readdirSync(dir).filter((name) => /^page-\d+\.json$/.test(name)).sort();
+let goalMissing = false;
+let declared = null;
+const registered = [];
+for (const name of files) {
+  const raw = fs.readFileSync(path.join(dir, name), "utf8");
+  let payload;
+  try { payload = JSON.parse(firstJson(raw) || ""); }
+  catch (_) { write("LOOKUP_FAILED"); process.exit(0); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    write("LOOKUP_FAILED");
+    process.exit(0);
+  }
+  if (payload.ok === false && payload.error_code === "goal_not_registered") {
+    goalMissing = true;
+    continue;
+  }
+  if (payload.ok !== true) { write("LOOKUP_FAILED"); process.exit(0); }
+  const count = Number(payload.registered_agent_count);
+  if (Number.isFinite(count)) declared = declared == null ? count : Math.max(declared, count);
   for (const row of Array.isArray(payload.rows) ? payload.rows : []) {
     if (!row || row.registered !== true || typeof row.agent_id !== "string" || !row.agent_id) continue;
     if (!registered.includes(row.agent_id)) registered.push(row.agent_id);
   }
-  const declared = Number(payload.registered_agent_count);
-  const count = Number.isFinite(declared) ? declared : registered.length;
-  if (envRaw) {
-    const match = registered.find((id) => id === envRaw || fold(id) === fold(envRaw));
-    if (match) { process.stdout.write("OK " + match); return; }
-    process.stdout.write("UNREGISTERED " + envRaw + (registered.length ? " " + registered.join(" ") : ""));
-    return;
-  }
-  if (count > registered.length) {
-    process.stdout.write(registered.length ? "AMBIGUOUS " + registered.join(" ") : "AMBIGUOUS");
-    return;
-  }
-  if (registered.length === 1) { process.stdout.write("OK " + registered[0]); return; }
-  if (registered.length === 0) { process.stdout.write("MISSING"); return; }
-  process.stdout.write("AMBIGUOUS " + registered.join(" "));
-});
-')"; then
-        echo -e "${RED}[-] [FAIL-CLOSED] 无法解析 Goal ${goal_id} 的 Agent 身份，已阻断租约申领。${NC}" >&2
-        return 1
+}
+if (goalMissing) { write("GOAL_MISSING"); process.exit(0); }
+if (declared != null && declared > registered.length) { write("LOOKUP_FAILED"); process.exit(0); }
+if (envRaw) {
+  const match = registered.find((id) => id === envRaw || fold(id) === fold(envRaw));
+  if (match) write("OK", { owner: match });
+  else write("UNREGISTERED", { env: envRaw, registered });
+  process.exit(0);
+}
+if (registered.length === 1) write("OK", { owner: registered[0] });
+else if (registered.length === 0) write("MISSING");
+else write("AMBIGUOUS", { registered });
+NODE
+
+    local verdict="" owner_id="" env_id="" known=""
+    verdict="$(cat "$page_dir/verdict" 2>/dev/null || true)"
+    owner_id="$(cat "$page_dir/owner" 2>/dev/null || true)"
+    env_id="$(cat "$page_dir/env_id" 2>/dev/null || true)"
+    if [[ -s "$page_dir/registered" ]]; then
+        known="$(tr '\n' ' ' < "$page_dir/registered" | sed 's/[[:space:]]*$//')"
     fi
+    rm -rf "$page_dir"
 
     case "$verdict" in
-        OK\ *)
-            printf '%s\n' "${verdict#OK }"
+        OK)
+            if [[ -z "$owner_id" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 无法解析 Goal ${goal_id} 的 Agent 身份，已阻断租约申领。${NC}" >&2
+                return 1
+            fi
+            printf '%s\n' "$owner_id"
             return 0
             ;;
         MISSING)
@@ -1644,28 +1893,18 @@ process.stdin.on("end", () => {
             print_register_agent_repair "$goal_id" "<registered-agent-id>"
             return 1
             ;;
-        AMBIGUOUS*)
-            local known="${verdict#AMBIGUOUS}"
-            known="${known# }"
+        AMBIGUOUS)
             echo -e "${RED}[-] [FAIL-CLOSED] Goal ${goal_id} 有多个已注册 Agent，未设置唯一的 LOOPX_AGENT_ID，已阻断租约申领。${NC}" >&2
             if [[ -n "$known" ]]; then
                 echo -e "${YELLOW}    已注册: ${known}${NC}" >&2
-            else
-                echo -e "${YELLOW}    agent-directory 报告还有未出现在本页的注册身份，编排器不会猜测 owner。${NC}" >&2
             fi
             echo -e "${YELLOW}    修复: LOOPX_AGENT_ID=<registered-agent-id> loopx-flow todo claim <todo_id> --goal-id ${goal_id}${NC}" >&2
             return 1
             ;;
-        UNREGISTERED\ *)
-            local rest="${verdict#UNREGISTERED }"
-            local env_id="${rest%% *}"
-            local others=""
-            if [[ "$rest" == *" "* ]]; then
-                others="${rest#* }"
-            fi
+        UNREGISTERED)
             echo -e "${RED}[-] [FAIL-CLOSED] 当前 Agent 身份 ${env_id} 尚未在 Goal ${goal_id} 注册，已阻断租约申领。${NC}" >&2
-            if [[ -n "$others" ]]; then
-                echo -e "${YELLOW}    该 Goal 已注册: ${others}${NC}" >&2
+            if [[ -n "$known" ]]; then
+                echo -e "${YELLOW}    该 Goal 已注册: ${known}${NC}" >&2
                 echo -e "${YELLOW}    若应使用已有身份: LOOPX_AGENT_ID=<registered-agent-id> loopx-flow todo claim <todo_id> --goal-id ${goal_id}${NC}" >&2
             fi
             print_register_agent_repair "$goal_id" "$env_id"
@@ -1673,6 +1912,9 @@ process.stdin.on("end", () => {
             ;;
         *)
             echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Goal ${goal_id} 的已注册 Agent 身份，已阻断租约申领。${NC}" >&2
+            if [[ "$verdict" == "LOOKUP_FAILED" ]]; then
+                echo -e "${YELLOW}    agent-directory 在翻页结束后仍少于 registered_agent_count，编排器不会把残页判成缺失或歧义。${NC}" >&2
+            fi
             local goal_q
             printf -v goal_q '%q' "$goal_id"
             echo -e "${YELLOW}    修复: loopx ${REGISTRY_FLAG} --format json agent-directory --goal-id ${goal_q}${NC}" >&2
@@ -1723,11 +1965,21 @@ cmd_todo_lease() {
     local mode="$1"
     shift
 
-    local todo_id="" goal_id=""
+    local todo_id="" goal_id="" idempotency_key=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --goal-id)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}[-] 错误: --goal-id 需要一个值。${NC}" >&2
+                    exit 1
+                fi
                 goal_id="$2"; shift 2 ;;
+            --idempotency-key)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}[-] 错误: --idempotency-key 需要一个 public-safe token。${NC}" >&2
+                    exit 1
+                fi
+                idempotency_key="$2"; shift 2 ;;
             *)
                 if [[ -z "$todo_id" ]]; then todo_id="$1"; fi; shift ;;
         esac
@@ -1747,16 +1999,86 @@ cmd_todo_lease() {
 
     if [[ "$mode" == "claim" ]]; then
         echo -e "${BLUE}==> [租约流转] 正在申领排他租约: $todo_id @ $goal_id ...${NC}"
-        local owner="" idempotency_key=""
+        local owner="" inspect_file="" explicit_key="$idempotency_key"
         owner="$(resolve_claim_owner "$goal_id")" || exit 1
-        if ! idempotency_key="$(claim_idempotency_key "$goal_id" "$todo_id" "$owner")"; then
+        if [[ -z "$explicit_key" ]]; then
+            inspect_file="$(mktemp)"
+            local inspect_rc=0
+            loopx $REGISTRY_FLAG --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" >"$inspect_file" 2>&1 || inspect_rc=$?
+            if [[ "$inspect_rc" -ne 0 ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的租约状态，已阻断申领。${NC}" >&2
+                cat "$inspect_file" >&2
+                rm -f "$inspect_file"
+                exit 1
+            fi
+        fi
+        if ! idempotency_key="$(claim_idempotency_key "$goal_id" "$todo_id" "$owner" "$explicit_key" "$inspect_file")"; then
             echo -e "${RED}[-] [FAIL-CLOSED] 无法为 Todo ${todo_id} 生成 public-safe 幂等键，已阻断租约申领。${NC}" >&2
+            rm -f "$inspect_file"
             exit 1
         fi
-        if ! loopx $REGISTRY_FLAG task-lease acquire --goal-id "$goal_id" --todo-id "$todo_id" --owner "$owner" --idempotency-key "$idempotency_key"; then
-            echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: Todo $todo_id 可能已被其他 Agent 持有，操作已阻断。${NC}" >&2
+        rm -f "$inspect_file"
+        local acquire_log acquire_rc=0 acquire_code=""
+        acquire_log="$(mktemp)"
+        loopx $REGISTRY_FLAG --format json task-lease acquire --goal-id "$goal_id" --todo-id "$todo_id" --owner "$owner" --idempotency-key "$idempotency_key" >"$acquire_log" 2>&1 || acquire_rc=$?
+        if [[ "$acquire_rc" -ne 0 ]]; then
+            cat "$acquire_log" >&2
+            acquire_code="$(node - "$acquire_log" <<'NODE'
+const fs = require("fs");
+const raw = fs.readFileSync(process.argv[2], "utf8");
+function firstJson(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === "\"") inStr = false;
+      continue;
+    }
+    if (c === "\"") { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+let code = "";
+try {
+  const payload = JSON.parse(firstJson(raw) || "");
+  if (payload && typeof payload.error_code === "string") code = payload.error_code;
+} catch (_) {}
+if (!code) {
+  const matched = raw.match(/idempotency_key_reuse|todo_lease_conflict|write_scope_conflict|owner_not_registered/);
+  if (matched) code = matched[0];
+}
+process.stdout.write(code);
+NODE
+)"
+            case "$acquire_code" in
+                idempotency_key_reuse)
+                    echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: LoopX 拒绝 idempotency_key_reuse。该幂等键属于已结束的租约代际，操作已阻断。${NC}" >&2
+                    ;;
+                todo_lease_conflict|write_scope_conflict)
+                    echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: Todo $todo_id 可能已被其他 Agent 持有，操作已阻断。${NC}" >&2
+                    ;;
+                *)
+                    if [[ -n "$acquire_code" ]]; then
+                        echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: LoopX 返回 ${acquire_code}，操作已阻断。${NC}" >&2
+                    else
+                        echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: LoopX 拒绝了 task-lease acquire，操作已阻断。${NC}" >&2
+                    fi
+                    ;;
+            esac
+            rm -f "$acquire_log"
             exit 1
         fi
+        cat "$acquire_log"
+        rm -f "$acquire_log"
         echo -e "${GREEN}[✓] 排他租约已获取 (ACQUIRED): $todo_id${NC}"
     else
         echo -e "${BLUE}==> [租约流转] 正在完成 Todo 并释放租约: $todo_id @ $goal_id ...${NC}"

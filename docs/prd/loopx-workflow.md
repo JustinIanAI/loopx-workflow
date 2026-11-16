@@ -178,7 +178,7 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 #### 控制面边界
 
 - **REQ-NATIVE-1** `todo claim` / `todo done` 的租约、`issue` 的 `route`、`integrate` 的 sync/status，以 LoopX 输出为准。编排器不在这三个结果上做第二套判断。
-- **REQ-LEASE-1** `todo claim` 调用 `loopx task-lease acquire` 时必须带 `--owner` 与稳定 `--idempotency-key`（ADR-0009）。owner 是该 Goal 已注册的 Agent：`LOOPX_AGENT_ID` 能对应到注册身份时用注册表拼写；否则仅在注册身份恰好一个时自动使用。没有注册身份、身份多于一个且未指定、或 `LOOPX_AGENT_ID` 未注册时，退出码为 1，打印可执行修复指令（缺注册时为带 `--execute` 的 `loopx register-agent`），并且不调用 `task-lease acquire`。幂等键由 goal、todo、owner 稳定派生，重试不变。acquire 本身的拒绝仍以 LoopX 输出为准。
+- **REQ-LEASE-1** `todo claim` 调用 `loopx task-lease acquire` 时必须带 `--owner` 与 `--idempotency-key`（ADR-0009）。owner 是该 Goal 已注册的 Agent。`agent-directory` 要跟随 `next_cursor` 读完，再判定身份；`registered: false` 的诊断行不是 owner。`LOOPX_AGENT_ID` 能对应到注册身份时用注册表拼写；否则仅在注册身份恰好一个时自动使用。没有注册身份、身份多于一个且未指定、目录未读全，或 `LOOPX_AGENT_ID` 未注册时，退出码为 1，打印可执行修复指令（缺注册时为带 `--execute` 的 `loopx register-agent`，占位符 `<registered-agent-id>` 原样输出），并且不调用 `task-lease acquire`。未传 `--idempotency-key` 时，先 `task-lease inspect`：没有租约记录则用 goal、todo、owner 的稳定键；活动租约且 owner 相同则复用该代际键；已过期或已释放则用纳入 `lease_epoch` 与 `version` 的下一把键。显式 `--idempotency-key` 原样透传。acquire 的拒绝仍以 LoopX 输出为准，`idempotency_key_reuse` 不得被写成“已被其他 Agent 持有”。
 - **REQ-GOAL-1** 新特性的 LoopX 状态文件放在该特性胶囊内。`merge` 以可观测状态做幂等：已 `MERGED` 时跳过合并与 readiness，只补未完成步骤；stop/retire 的“已执行”识别为成功；stop/retire/sync/archive 任一失败非 0，并打印“已合入、未闭环”与重跑命令；只有全部步骤完成才打印完成。合入后刷新本地 base 分支并提交/推送 archive 移动，push 失败同样非 0。
 
 #### 明确不在本基线里的行为

@@ -23,6 +23,11 @@ if [[ "$args" == *"agent-directory"* ]]; then
   exit 0
 fi
 
+if [[ "$args" == *"task-lease inspect"* ]]; then
+  echo '{"ok":true,"action":"inspect","active":false,"lease":null}'
+  exit 0
+fi
+
 if [[ "$args" == *"task-lease acquire"* ]]; then
   if [[ "\${MOCK_TASK_LEASE_FAIL:-}" == "1" ]]; then
     echo "[Mock LoopX] lease conflict: held by another agent" >&2
