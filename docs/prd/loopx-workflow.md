@@ -152,6 +152,7 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 
 - **REQ-GATE-1** `check` 按顺序执行 `npm run typecheck`、`npm run lint`、`npm run build`、`npm run test`。前一个失败则不继续。
 - **REQ-QUALITY-1** 默认审查由 `skills/code-review/scripts/ingest-to-loopx-quality.js` 写入 LoopX `change-quality` 收据，并回写 `05-evidence.md`。`--with-ocr` 才调用阿里 OCR。OCR 不是默认阻断项。收据的 `validation` 必须来自实际门禁结果；没有 feature 且没有 `--goal-id` 时非 0，不写任何胶囊。
+- **REQ-QUALITY-3** `check` 与 `ingest` 按 `origin/HEAD` → `origin/main` → `origin/master` 解析仓库实际存在的远程默认基线，并作为 `--base-ref` 透传给 `change-quality` prepare/record/verify 与 OCR；三者皆不存在时非 0 并提示修复命令，禁止伪造 `origin/main`。Goal 未启用 change-quality 资格时，`check` 在四大门禁之前 fail-closed，`doctor` 输出同类诊断卡，均给出 `loopx configure-goal --goal-id <goal> --change-quality-enabled --execute`。见 ADR-0008。
 - **REQ-ENV-1** `loopx-flow doctor` 必须前置暴露控制面路由问题：runtime root 与项目 `common_runtime_root`
   不一致、`~/.loopx` 半迁移残留、registry 中缺失 `state_file` 的 goal、运行时工件仍被 Git 跟踪。
   发现问题时给出“原因 / 影响 / 修复指令”，不因此阻断本地门禁，但必须可见。路由收敛只允许通过

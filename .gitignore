@@ -49,3 +49,7 @@ coverage/
 # Local agent scratch / test isolation artifacts (must never pollute diff scope)
 .workbuddy/
 specs/features/cq-isolated-*/
+
+# Multica runtime-injected agent instructions (not product source)
+CODEBUDDY.md
+.codebuddy/
