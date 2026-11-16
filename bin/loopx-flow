@@ -45,7 +45,9 @@ usage() {
   init                    初始化项目工作流骨架、依赖及本地 LoopX 连接
   status                  查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
   todo list [goal_id]     列出指定或当前 Goal 下的全部 Agent / User Todos
-  todo claim <tid>        申领指定 Todo 的排他租约 (loopx task-lease acquire, 冲突即 Fail-Closed)
+  todo claim <tid>        申领排他租约 (task-lease acquire --owner 与稳定 --idempotency-key)
+                          身份取该 Goal 已注册 Agent；多个时设置 LOOPX_AGENT_ID。
+                          未注册则 Fail-Closed，并打印 loopx register-agent ... --execute
   todo done <tid>         标记任务完成并释放排他租约 (loopx todo --status done + task-lease release)
   help, --help, -h        显示本帮助信息
 
@@ -1451,6 +1453,128 @@ cmd_status() {
     fi
 }
 
+# 打印可直接执行的 register-agent 修复命令。预览不够，必须带 --execute。
+print_register_agent_repair() {
+    local goal_id="$1"
+    local agent_id="$2"
+    local goal_q agent_q
+    printf -v goal_q '%q' "$goal_id"
+    printf -v agent_q '%q' "$agent_id"
+    echo -e "${YELLOW}    修复: loopx ${REGISTRY_FLAG} --format json register-agent --goal-id ${goal_q} --agent-id ${agent_q} --execute${NC}" >&2
+}
+
+# 幂等键只由 goal、todo、owner 派生，重试保持不变，且满足 LoopX public-safe token。
+claim_idempotency_key() {
+    node -e '
+const crypto = require("crypto");
+const [goalId, todoId, owner] = process.argv.slice(1);
+if (!goalId || !todoId || !owner) process.exit(2);
+const hex = crypto.createHash("sha256").update(goalId + "\n" + todoId + "\n" + owner, "utf8").digest("hex");
+const key = "loopx-flow:claim:" + hex;
+if (!/^[A-Za-z0-9_.:@\/-]{1,160}$/.test(key)) process.exit(3);
+process.stdout.write(key);
+' "$1" "$2" "$3"
+}
+
+# 成功时向 stdout 打印已注册 agent id。失败时打印修复指令并返回 1，不申领租约。
+resolve_claim_owner() {
+    local goal_id="$1"
+    local directory_json="" verdict=""
+    if ! directory_json="$(loopx $REGISTRY_FLAG --format json agent-directory --goal-id "$goal_id" 2>/dev/null)"; then
+        directory_json="${directory_json:-}"
+    fi
+    if ! verdict="$(printf '%s' "$directory_json" | node -e '
+const envRaw = String(process.env.LOOPX_AGENT_ID || "").trim();
+const fold = (value) => String(value || "").trim().toLowerCase().replace(/ /g, "-");
+let raw = "";
+process.stdin.on("data", (chunk) => { raw += chunk; });
+process.stdin.on("end", () => {
+  let payload;
+  try { payload = JSON.parse(raw); } catch (_) { process.stdout.write("LOOKUP_FAILED"); return; }
+  if (!payload || typeof payload !== "object") { process.stdout.write("LOOKUP_FAILED"); return; }
+  if (payload.ok === false && payload.error_code === "goal_not_registered") {
+    process.stdout.write("GOAL_MISSING");
+    return;
+  }
+  if (payload.ok !== true) { process.stdout.write("LOOKUP_FAILED"); return; }
+  const registered = [];
+  for (const row of Array.isArray(payload.rows) ? payload.rows : []) {
+    if (!row || row.registered !== true || typeof row.agent_id !== "string" || !row.agent_id) continue;
+    if (!registered.includes(row.agent_id)) registered.push(row.agent_id);
+  }
+  const declared = Number(payload.registered_agent_count);
+  const count = Number.isFinite(declared) ? declared : registered.length;
+  if (envRaw) {
+    const match = registered.find((id) => id === envRaw || fold(id) === fold(envRaw));
+    if (match) { process.stdout.write("OK " + match); return; }
+    process.stdout.write("UNREGISTERED " + envRaw + (registered.length ? " " + registered.join(" ") : ""));
+    return;
+  }
+  if (count > registered.length) {
+    process.stdout.write(registered.length ? "AMBIGUOUS " + registered.join(" ") : "AMBIGUOUS");
+    return;
+  }
+  if (registered.length === 1) { process.stdout.write("OK " + registered[0]); return; }
+  if (registered.length === 0) { process.stdout.write("MISSING"); return; }
+  process.stdout.write("AMBIGUOUS " + registered.join(" "));
+});
+')"; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法解析 Goal ${goal_id} 的 Agent 身份，已阻断租约申领。${NC}" >&2
+        return 1
+    fi
+
+    case "$verdict" in
+        OK\ *)
+            printf '%s\n' "${verdict#OK }"
+            return 0
+            ;;
+        MISSING)
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal ${goal_id} 尚未注册 Agent 身份，已阻断租约申领。${NC}" >&2
+            print_register_agent_repair "$goal_id" "<registered-agent-id>"
+            return 1
+            ;;
+        GOAL_MISSING)
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal ${goal_id} 不在 LoopX registry 中，无法解析已注册 Agent，已阻断租约申领。${NC}" >&2
+            print_register_agent_repair "$goal_id" "<registered-agent-id>"
+            return 1
+            ;;
+        AMBIGUOUS*)
+            local known="${verdict#AMBIGUOUS}"
+            known="${known# }"
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal ${goal_id} 有多个已注册 Agent，未设置唯一的 LOOPX_AGENT_ID，已阻断租约申领。${NC}" >&2
+            if [[ -n "$known" ]]; then
+                echo -e "${YELLOW}    已注册: ${known}${NC}" >&2
+            else
+                echo -e "${YELLOW}    agent-directory 报告还有未出现在本页的注册身份，编排器不会猜测 owner。${NC}" >&2
+            fi
+            echo -e "${YELLOW}    修复: LOOPX_AGENT_ID=<registered-agent-id> loopx-flow todo claim <todo_id> --goal-id ${goal_id}${NC}" >&2
+            return 1
+            ;;
+        UNREGISTERED\ *)
+            local rest="${verdict#UNREGISTERED }"
+            local env_id="${rest%% *}"
+            local others=""
+            if [[ "$rest" == *" "* ]]; then
+                others="${rest#* }"
+            fi
+            echo -e "${RED}[-] [FAIL-CLOSED] 当前 Agent 身份 ${env_id} 尚未在 Goal ${goal_id} 注册，已阻断租约申领。${NC}" >&2
+            if [[ -n "$others" ]]; then
+                echo -e "${YELLOW}    该 Goal 已注册: ${others}${NC}" >&2
+                echo -e "${YELLOW}    若应使用已有身份: LOOPX_AGENT_ID=<registered-agent-id> loopx-flow todo claim <todo_id> --goal-id ${goal_id}${NC}" >&2
+            fi
+            print_register_agent_repair "$goal_id" "$env_id"
+            return 1
+            ;;
+        *)
+            echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Goal ${goal_id} 的已注册 Agent 身份，已阻断租约申领。${NC}" >&2
+            local goal_q
+            printf -v goal_q '%q' "$goal_id"
+            echo -e "${YELLOW}    修复: loopx ${REGISTRY_FLAG} --format json agent-directory --goal-id ${goal_q}${NC}" >&2
+            return 1
+            ;;
+    esac
+}
+
 # 从显式参数或当前 feature 分支推导 LoopX Goal ID
 resolve_goal_id() {
     local explicit_goal="${1:-}"
@@ -1517,7 +1641,13 @@ cmd_todo_lease() {
 
     if [[ "$mode" == "claim" ]]; then
         echo -e "${BLUE}==> [租约流转] 正在申领排他租约: $todo_id @ $goal_id ...${NC}"
-        if ! loopx $REGISTRY_FLAG task-lease acquire --goal-id "$goal_id" --todo-id "$todo_id"; then
+        local owner="" idempotency_key=""
+        owner="$(resolve_claim_owner "$goal_id")" || exit 1
+        if ! idempotency_key="$(claim_idempotency_key "$goal_id" "$todo_id" "$owner")"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 无法为 Todo ${todo_id} 生成 public-safe 幂等键，已阻断租约申领。${NC}" >&2
+            exit 1
+        fi
+        if ! loopx $REGISTRY_FLAG task-lease acquire --goal-id "$goal_id" --todo-id "$todo_id" --owner "$owner" --idempotency-key "$idempotency_key"; then
             echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: Todo $todo_id 可能已被其他 Agent 持有，操作已阻断。${NC}" >&2
             exit 1
         fi

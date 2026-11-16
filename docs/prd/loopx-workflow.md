@@ -142,7 +142,7 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 
 #### 失败即停
 
-- **REQ-FAILCLOSED-1** 下列情况非 0 退出：`approve contract` 没有 `loopx`，或契约锁定失败；`doctor` 没有 `loopx`；`check` 已经解析出 feature 或 `--goal-id`，但本机没有 `loopx`，或 `loopx change-quality verify` 的 `ok` 不是 `true`，或没有可解析的 Goal 身份；`merge` 没有 `loopx`，或合入锁失败，或 `goal-lifecycle stop` 失败，或 `retire-global-goal`/`sync-global`/archive 失败；`issue` 没有 `loopx` 或 `gh`，可行性命令失败，路由为空或不是三个合法值；`integrate` 与 `todo` 没有 `loopx`，或对应 LoopX 命令失败；`feature`/`approve` 的关键 `sync-global` 重试后仍失败。
+- **REQ-FAILCLOSED-1** 下列情况非 0 退出：`approve contract` 没有 `loopx`，或契约锁定失败；`doctor` 没有 `loopx`；`check` 已经解析出 feature 或 `--goal-id`，但本机没有 `loopx`，或 `loopx change-quality verify` 的 `ok` 不是 `true`，或没有可解析的 Goal 身份；`merge` 没有 `loopx`，或合入锁失败，或 `goal-lifecycle stop` 失败，或 `retire-global-goal`/`sync-global`/archive 失败；`issue` 没有 `loopx` 或 `gh`，可行性命令失败，路由为空或不是三个合法值；`integrate` 与 `todo` 没有 `loopx`，或对应 LoopX 命令失败；`todo claim` 无法确定唯一已注册 Agent 时不调用 `task-lease acquire`（`REQ-LEASE-1`）；`feature`/`approve` 的关键 `sync-global` 重试后仍失败。
 - **REQ-CHECK-IDENTITY-1** `check` 必须能从 `feature/<name>` 分支或显式参数解析 feature，或接受显式 `--goal-id`。两者都无时非 0，禁止跳过收据核验后打印成功。有 feature 胶囊且存在 `04-contract.md`（或归档副本）时，先运行 `gate verify contract`；无胶囊的 docs/治理交付可用 `--goal-id` 跳过契约门禁，但仍必须通过收据核验。
 - **REQ-FAILCLOSED-2** `feature` 无法创建或切换 `feature/<name>` 时非 0 退出，不在当前分支创建胶囊。
 - **REQ-CONTRACT-LOCK-1** `gate verify contract <feature>` 重算 `04-contract.md` 的 SHA256，并与 `.loopx/registry.json` 里该 Goal 的 `contract_revision` 比较。缺注册表、缺 Goal、缺指纹、指纹不一致，均非 0 退出。
@@ -177,6 +177,7 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 #### 控制面边界
 
 - **REQ-NATIVE-1** `todo claim` / `todo done` 的租约、`issue` 的 `route`、`integrate` 的 sync/status，以 LoopX 输出为准。编排器不在这三个结果上做第二套判断。
+- **REQ-LEASE-1** `todo claim` 调用 `loopx task-lease acquire` 时必须带 `--owner` 与稳定 `--idempotency-key`（ADR-0008）。owner 是该 Goal 已注册的 Agent：`LOOPX_AGENT_ID` 能对应到注册身份时用注册表拼写；否则仅在注册身份恰好一个时自动使用。没有注册身份、身份多于一个且未指定、或 `LOOPX_AGENT_ID` 未注册时，退出码为 1，打印可执行修复指令（缺注册时为带 `--execute` 的 `loopx register-agent`），并且不调用 `task-lease acquire`。幂等键由 goal、todo、owner 稳定派生，重试不变。acquire 本身的拒绝仍以 LoopX 输出为准。
 - **REQ-GOAL-1** 新特性的 LoopX 状态文件放在该特性胶囊内。`merge` 以可观测状态做幂等：已 `MERGED` 时跳过合并与 readiness，只补未完成步骤；stop/retire 的“已执行”识别为成功；stop/retire/sync/archive 任一失败非 0，并打印“已合入、未闭环”与重跑命令；只有全部步骤完成才打印完成。合入后刷新本地 base 分支并提交/推送 archive 移动，push 失败同样非 0。
 
 #### 明确不在本基线里的行为

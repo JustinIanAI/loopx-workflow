@@ -159,16 +159,25 @@ exit 0
 
 test('7. approve passes --registry to configure-goal', () => {
   const feature = 'fc-approve-registry';
+  const regPath = path.join(PROJECT_ROOT, '.loopx/registry.json');
+  const hadRegistry = fs.existsSync(regPath);
+  const originalRegistry = hadRegistry ? fs.readFileSync(regPath, 'utf8') : null;
   makeCapsule(feature);
   resetMock();
   const calls = path.join(MOCK_BIN, 'calls.log');
   writeScript('loopx', '#!/usr/bin/env bash\necho "$*" >> ' + JSON.stringify(calls) + '\nexit 0\n');
+  fs.mkdirSync(path.dirname(regPath), { recursive: true });
+  if (!hadRegistry) fs.writeFileSync(regPath, '{"goals":[]}\n');
   try {
     const r = runFlow(['approve', 'contract', feature]);
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     const log = fs.readFileSync(calls, 'utf8');
     assert.match(log, /--registry .*configure-goal/);
-  } finally { cleanupCapsule(feature); }
+  } finally {
+    if (hadRegistry) fs.writeFileSync(regPath, originalRegistry);
+    else fs.rmSync(regPath, { force: true });
+    cleanupCapsule(feature);
+  }
 });
 
 test('8. approve feature name cannot inject shell through cleanup trap', () => {
