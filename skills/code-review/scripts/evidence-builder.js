@@ -298,38 +298,56 @@ function buildHostValidationRow(ctx, modelValidation) {
   };
 }
 
-function buildChangedLineClassificationRow(ctx, modelRow) {
+const OBJECT_FACT_FIELDS = new Set(['compatibility_assessment']);
+
+function copyReviewerFactField(modelRow, key) {
+  if (!isPlainObject(modelRow) || isMissingValue(modelRow[key])) return undefined;
+  if (OBJECT_FACT_FIELDS.has(key) && !isPlainObject(modelRow[key])) return undefined;
+  return modelRow[key];
+}
+
+function factRowStatus(req, row) {
+  const fields = Array.isArray(req && req.fields) ? req.fields : [];
+  if (fields.some(field => isMissingValue(row[field]))) return 'unverified';
+  if (Array.isArray(req && req.verdict_values) && req.verdict_values.length && !req.verdict_values.includes(row.verdict)) {
+    return 'unverified';
+  }
+  return 'verified';
+}
+
+function buildChangedLineClassificationRow(ctx, req, modelRow) {
   const row = {
-    status: 'verified',
     files: ctx.files.slice(),
     additions: ctx.stats.additions,
     deletions: ctx.stats.deletions,
   };
-  if (isPlainObject(modelRow) && typeof modelRow.behavior_role === 'string' && modelRow.behavior_role.trim()) {
-    row.behavior_role = modelRow.behavior_role.trim();
-  }
+  const behaviorRole = copyReviewerFactField(modelRow, 'behavior_role');
+  if (behaviorRole !== undefined) row.behavior_role = behaviorRole;
+  row.status = factRowStatus(req, row);
   return row;
 }
 
-function buildCodeVolumeRow(ctx, modelRow) {
+function buildCodeVolumeRow(ctx, req, modelRow) {
   const row = {
-    status: 'verified',
     additions: ctx.stats.additions,
     deletions: ctx.stats.deletions,
     changed_line_shape: `${ctx.stats.additions} additions / ${ctx.stats.deletions} deletions`,
   };
-  if (isPlainObject(modelRow)) {
-    for (const key of [
-      'largest_production_hotspots',
-      'active_call_site_evidence',
-      'compatibility_assessment',
-      'verdict',
-      'highest_value_simplification',
-      'behavior_preserving_validation',
-    ]) {
-      if (!isMissingValue(modelRow[key])) row[key] = modelRow[key];
-    }
+  for (const key of [
+    'largest_production_hotspots',
+    'active_call_site_evidence',
+    'compatibility_assessment',
+    'verdict',
+    'highest_value_simplification',
+    'behavior_preserving_validation',
+  ]) {
+    const value = copyReviewerFactField(modelRow, key);
+    if (value !== undefined) row[key] = value;
   }
+  row.additions = ctx.stats.additions;
+  row.deletions = ctx.stats.deletions;
+  row.changed_line_shape = `${ctx.stats.additions} additions / ${ctx.stats.deletions} deletions`;
+  row.status = factRowStatus(req, row);
   return row;
 }
 
@@ -484,9 +502,9 @@ function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, val
     if (id === 'validation_matrix') {
       out[id] = buildHostValidationRow(ctx, modelRow);
     } else if (id === 'changed_line_classification') {
-      out[id] = buildChangedLineClassificationRow(ctx, modelRow);
+      out[id] = buildChangedLineClassificationRow(ctx, req, modelRow);
     } else if (id === 'code_volume') {
-      out[id] = buildCodeVolumeRow(ctx, modelRow);
+      out[id] = buildCodeVolumeRow(ctx, req, modelRow);
     } else if (id === 'symbol_map') {
       out[id] = buildSymbolMapRow(req, ctx, modelRow);
     } else {

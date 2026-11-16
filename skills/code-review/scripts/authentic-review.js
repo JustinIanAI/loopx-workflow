@@ -465,7 +465,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ).join('\n\n');
 
   const evdCmds = (evidenceCommands || []).map(c => `- \`${c}\``).join('\n');
-  const hostFactIds = new Set(['validation_matrix', 'changed_line_classification', 'code_volume', 'symbol_map']);
+  const hostFactIds = new Set(['validation_matrix', 'symbol_map']);
   const requiredIds = (reviewPlan.required_evidence_ids || []).join(', ');
   const evidenceRequirements = (evidenceContract && evidenceContract.evidence_requirements || [])
     .filter(r => (reviewPlan.required_evidence_ids || []).includes(r.evidence_id) && !hostFactIds.has(r.evidence_id))
@@ -496,7 +496,8 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     requiredIds,
     '',
     '## 结构化证据图（判断类由审查者填写，主机不预填占位句）',
-    '- 事实类 id（`validation_matrix`、`changed_line_classification`、`code_volume`、`symbol_map` 的 `path`/`line`）由主机按本次真实观测写入，允许保留 `unverified`，模型不得覆盖主机测得的退出码或行统计。',
+    '- 事实类 id（`validation_matrix`、`symbol_map` 的 `path`/`line`，以及 `changed_line_classification` / `code_volume` 的文件列表与增删统计）由主机按本次真实观测写入。模型不得覆盖主机测得的退出码、文件列表或行统计。',
+    '- `changed_line_classification` 与 `code_volume` 的其余 packet 必填字段由你填写。缺任一必填字段，或 `compatibility_assessment` 不是对象时，整行保持 `unverified`。主机不会把缺字段的行标成 `verified`。',
     '- `changed_invariant_positive` 与 `material_negative_or_failure` 默认 `unverified`（`npm test` 通过不证明改动不变量）；仅当你在 `evidence.validation_matrix` 中给出仓库内已存在的测试文件路径（如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），且主机执行 `node --test <该路径>` 退出码为 0 后才记为 `passed`。',
     '- 判断类 id 由你独立核实后在 `evidence` 中填写；未核实或形状不完整的项将保持 `status: "unverified"`，主机绝不预填或回填占位句：',
     evidenceRequirements || '(本 PR 无额外 evidence requirements)',

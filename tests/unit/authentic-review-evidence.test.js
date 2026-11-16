@@ -68,14 +68,14 @@ function build(extra = {}) {
   });
 }
 
-test('without model input, judgment ids stay unverified while host diff/gate facts are verified', () => {
+test('without model input, judgment ids and incomplete fact rows stay unverified', () => {
   const ev = build();
   assert.strictEqual(Object.keys(ev).length, PLAN.required_evidence_ids.length);
   for (const id of ['problem_context', 'architecture_flow', 'semantic_alignment', 'walkthroughs', 'change_proportionality']) {
     assert.deepStrictEqual(ev[id], { status: 'unverified' }, id + ' must stay unverified without model input');
   }
-  assert.strictEqual(ev.changed_line_classification.status, 'verified');
-  assert.strictEqual(ev.code_volume.status, 'verified');
+  assert.strictEqual(ev.changed_line_classification.status, 'unverified');
+  assert.strictEqual(ev.code_volume.status, 'unverified');
   assert.strictEqual(ev.validation_matrix.status, 'verified');
   assert.strictEqual(ev.symbol_map.status, 'unverified');
 });
@@ -115,18 +115,71 @@ test('changed_invariant_positive becomes passed only when reviewer supplies an e
   assert.strictEqual(byId.get('material_negative_or_failure').status, 'unverified');
 });
 
-test('changed_line_classification and code_volume omit host judgment placeholders', () => {
+test('changed_line_classification and code_volume omit host judgment placeholders and stay unverified', () => {
   const ev = build();
   assert.deepStrictEqual(ev.changed_line_classification, {
-    status: 'verified',
+    status: 'unverified',
     files: ['skills/code-review/scripts/authentic-review.js', 'tests/unit/authentic-review-evidence.test.js'],
     additions: 4,
     deletions: 1,
   });
   assert.strictEqual('behavior_role' in ev.changed_line_classification, false);
   assert.strictEqual('compatibility_assessment' in ev.code_volume, false);
+  assert.strictEqual(ev.code_volume.status, 'unverified');
   assert.strictEqual(ev.code_volume.additions, 4);
   assert.strictEqual(ev.code_volume.deletions, 1);
+});
+
+test('changed_line_classification and code_volume become verified only when required reviewer fields are present', () => {
+  const ev = build({
+    modelEvidence: {
+      changed_line_classification: {
+        files: ['fake.js'],
+        additions: 99,
+        deletions: 99,
+        behavior_role: 'review evidence assembly only',
+      },
+      code_volume: {
+        additions: 99,
+        deletions: 99,
+        changed_line_shape: 'fake',
+        largest_production_hotspots: 'skills/code-review/scripts/evidence-builder.js',
+        active_call_site_evidence: 'authentic-review.js calls buildEvidenceGraph',
+        compatibility_assessment: { decision: 'compatible', reason: 'review scripts only' },
+        verdict: 'necessary',
+        highest_value_simplification: 'do not mark a partial fact row verified',
+        behavior_preserving_validation: 'node --test tests/unit/authentic-review-evidence.test.js',
+      },
+    },
+  });
+  assert.strictEqual(ev.changed_line_classification.status, 'verified');
+  assert.deepStrictEqual(ev.changed_line_classification.files, [
+    'skills/code-review/scripts/authentic-review.js',
+    'tests/unit/authentic-review-evidence.test.js',
+  ]);
+  assert.strictEqual(ev.changed_line_classification.additions, 4);
+  assert.strictEqual(ev.changed_line_classification.deletions, 1);
+  assert.strictEqual(ev.changed_line_classification.behavior_role, 'review evidence assembly only');
+  assert.strictEqual(ev.code_volume.status, 'verified');
+  assert.strictEqual(ev.code_volume.additions, 4);
+  assert.strictEqual(ev.code_volume.deletions, 1);
+  assert.strictEqual(ev.code_volume.changed_line_shape, '4 additions / 1 deletions');
+  assert.strictEqual(ev.code_volume.verdict, 'necessary');
+
+  const rejected = build({
+    modelEvidence: {
+      code_volume: {
+        largest_production_hotspots: 'evidence-builder.js',
+        active_call_site_evidence: 'authentic-review.js',
+        compatibility_assessment: 'not-an-object',
+        verdict: 'necessary',
+        highest_value_simplification: 'none',
+        behavior_preserving_validation: 'node --test tests/unit/authentic-review-evidence.test.js',
+      },
+    },
+  });
+  assert.strictEqual(rejected.code_volume.status, 'unverified');
+  assert.strictEqual('compatibility_assessment' in rejected.code_volume, false);
 });
 
 test('symbol_map records only diff path+line without padding duplicates and stays unverified until judgment fields are complete', () => {
