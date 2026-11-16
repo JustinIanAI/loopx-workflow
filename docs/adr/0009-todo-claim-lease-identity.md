@@ -1,4 +1,4 @@
-# ADR-0008：todo claim 传递已注册 Agent 与稳定幂等键
+# ADR-0009：todo claim 传递已注册 Agent 与稳定幂等键
 
 - **状态**：Accepted
 - **日期**：2026-11-16

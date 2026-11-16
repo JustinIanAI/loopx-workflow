@@ -152,6 +152,7 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 
 - **REQ-GATE-1** `check` 按顺序执行 `npm run typecheck`、`npm run lint`、`npm run build`、`npm run test`。前一个失败则不继续。
 - **REQ-QUALITY-1** 默认审查由 `skills/code-review/scripts/ingest-to-loopx-quality.js` 写入 LoopX `change-quality` 收据，并回写 `05-evidence.md`。`--with-ocr` 才调用阿里 OCR。OCR 不是默认阻断项。收据的 `validation` 必须来自实际门禁结果；没有 feature 且没有 `--goal-id` 时非 0，不写任何胶囊。
+- **REQ-QUALITY-3** `check` 与 `ingest` 按 `origin/HEAD` → `origin/main` → `origin/master` 解析仓库实际存在的远程默认基线，并作为 `--base-ref` 透传给 `change-quality` prepare/record/verify 与 OCR；三者皆不存在时非 0 并提示修复命令，禁止伪造 `origin/main`。Goal 未启用 change-quality 资格时，`check` 在四大门禁之前 fail-closed，`doctor` 输出同类诊断卡，均给出 `loopx configure-goal --goal-id <goal> --change-quality-enabled --execute`。见 ADR-0008。
 - **REQ-ENV-1** `loopx-flow doctor` 必须前置暴露控制面路由问题：runtime root 与项目 `common_runtime_root`
   不一致、`~/.loopx` 半迁移残留、registry 中缺失 `state_file` 的 goal、运行时工件仍被 Git 跟踪。
   发现问题时给出“原因 / 影响 / 修复指令”，不因此阻断本地门禁，但必须可见。路由收敛只允许通过
@@ -177,7 +178,7 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 #### 控制面边界
 
 - **REQ-NATIVE-1** `todo claim` / `todo done` 的租约、`issue` 的 `route`、`integrate` 的 sync/status，以 LoopX 输出为准。编排器不在这三个结果上做第二套判断。
-- **REQ-LEASE-1** `todo claim` 调用 `loopx task-lease acquire` 时必须带 `--owner` 与稳定 `--idempotency-key`（ADR-0008）。owner 是该 Goal 已注册的 Agent：`LOOPX_AGENT_ID` 能对应到注册身份时用注册表拼写；否则仅在注册身份恰好一个时自动使用。没有注册身份、身份多于一个且未指定、或 `LOOPX_AGENT_ID` 未注册时，退出码为 1，打印可执行修复指令（缺注册时为带 `--execute` 的 `loopx register-agent`），并且不调用 `task-lease acquire`。幂等键由 goal、todo、owner 稳定派生，重试不变。acquire 本身的拒绝仍以 LoopX 输出为准。
+- **REQ-LEASE-1** `todo claim` 调用 `loopx task-lease acquire` 时必须带 `--owner` 与稳定 `--idempotency-key`（ADR-0009）。owner 是该 Goal 已注册的 Agent：`LOOPX_AGENT_ID` 能对应到注册身份时用注册表拼写；否则仅在注册身份恰好一个时自动使用。没有注册身份、身份多于一个且未指定、或 `LOOPX_AGENT_ID` 未注册时，退出码为 1，打印可执行修复指令（缺注册时为带 `--execute` 的 `loopx register-agent`），并且不调用 `task-lease acquire`。幂等键由 goal、todo、owner 稳定派生，重试不变。acquire 本身的拒绝仍以 LoopX 输出为准。
 - **REQ-GOAL-1** 新特性的 LoopX 状态文件放在该特性胶囊内。`merge` 以可观测状态做幂等：已 `MERGED` 时跳过合并与 readiness，只补未完成步骤；stop/retire 的“已执行”识别为成功；stop/retire/sync/archive 任一失败非 0，并打印“已合入、未闭环”与重跑命令；只有全部步骤完成才打印完成。合入后刷新本地 base 分支并提交/推送 archive 移动，push 失败同样非 0。
 
 #### 明确不在本基线里的行为

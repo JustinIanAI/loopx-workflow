@@ -12,7 +12,23 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync, spawnSync } = require('child_process');
+const { execSync, execFileSync, spawnSync } = require('child_process');
+
+// GitHub Issue #13：按仓库真实存在的远程默认基线解析，顺序 origin/HEAD → origin/main → origin/master。
+// 禁止伪造 origin/main；master 主干且无 origin/main 的仓库必须能生成质量收据。
+function discoverBaseRef(repoPath = process.cwd()) {
+  for (const ref of ['origin/HEAD', 'origin/main', 'origin/master']) {
+    try {
+      execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], {
+        stdio: 'ignore',
+      });
+      return ref;
+    } catch (_) {
+      // 该 ref 不存在，尝试下一个
+    }
+  }
+  throw new Error('无法解析远程默认基线：origin/HEAD / origin/main / origin/master 均不存在；请先 git fetch origin && git remote set-head origin -a');
+}
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -21,7 +37,7 @@ function parseArgs() {
     goalId: '',
     reviewJson: '',
     ocrJson: '',
-    baseRef: 'origin/main',
+    baseRef: '', // 空值表示在 main() 中按 discoverBaseRef() 解析真实基线
     strict: true
   };
 
@@ -61,13 +77,16 @@ function parseArgs() {
   return options;
 }
 
-function resolveExactScope(goalId) {
-  // Authoritative exact-scope resolution via LoopX prepare packet
+function resolveExactScope(goalId, baseRef) {
+  // Authoritative exact-scope resolution via LoopX prepare packet.
+  // 必须把解析出的真实基线传给原生命令，否则 loopx 默认值 origin/main 会在 master 主干仓库
+  // 以 `fatal: Needed a single rev` 失败（GitHub Issue #13）。
   try {
     const prep = spawnSync('loopx', [
       'change-quality', 'prepare',
       '--goal-id', goalId,
       '--repo-path', '.',
+      '--base-ref', baseRef,
       '--format', 'json'
     ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     if (prep.status === 0) {
@@ -77,7 +96,9 @@ function resolveExactScope(goalId) {
         return {
           fingerprint: scope.scope_fingerprint,
           baseCommit: scope.base_commit || '',
-          baseRef: scope.base_ref || 'origin/main'
+          baseRef: scope.base_ref || baseRef,
+          status: packet.status || '',
+          policyEnabled: packet.policy ? packet.policy.enabled : undefined
         };
       }
     } else {
@@ -87,6 +108,16 @@ function resolveExactScope(goalId) {
     console.warn(`[!] LoopX prepare failed: ${err.message}`);
   }
   return null;
+}
+
+// Goal 未启用 change-quality 资格时，fail-closed 输出诊断卡（原因 + 可执行修复命令）。
+function qualificationDiagnostic(goalId, scope) {
+  if (!scope || (scope.status !== 'disabled' && scope.policyEnabled !== false)) return false;
+  console.error(`\n[-] [FAIL-CLOSED] Goal '${goalId}' 未启用 change-quality 资格，无法生成质量收据。`);
+  console.error('[-] 为什么阻断？资格未启用时 loopx change-quality record 会以 "qualification is disabled for this goal" 拒绝。');
+  console.error('💡 原因：Goal 的 control_plane.change_quality_qualification.enabled 未打开，收据无法写入。');
+  console.error(`🛠️ 修复指令: loopx configure-goal --goal-id ${goalId} --change-quality-enabled --execute`);
+  return true;
 }
 
 function getScopeDiff(baseCommit) {
@@ -114,7 +145,7 @@ function isRuntimeArtifact(relPath) {
   return false;
 }
 
-// 仅取「已提交」的 exact-scope 变更文件（origin/main...HEAD），并过滤运行时工件。
+// 仅取「已提交」的 exact-scope 变更文件（<base-ref>...HEAD），并过滤运行时工件。
 // 与 getScopeDiff() 的差别：后者含工作区改动，会把锁文件/反向前进的分支基线算进证据。
 function committedScopeFiles(baseCommit) {
   if (!baseCommit) return [];
@@ -162,16 +193,28 @@ function main() {
   const opts = parseArgs();
   console.log(`[LoopX Quality Ingestion] Processing for feature: ${opts.feature || 'default'}, goal: ${opts.goalId || 'default'}`);
 
+  // 0. 解析真实远程默认基线（GitHub Issue #13）；显式 --base-ref 优先。
+  let baseRef;
+  try {
+    baseRef = opts.baseRef || discoverBaseRef(process.cwd());
+  } catch (err) {
+    console.error(`[BLOCKED] ${err.message}`);
+    process.exit(1);
+  }
+  console.log(`[✓] Trunk baseline resolved: ${baseRef}`);
+
   const risks = [];
   let reviewSource = 'Default Semantic Review';
   let blockerCount = 0;
   let warningCount = 0;
 
-  // 0. Resolve LoopX authoritative exact-scope (fingerprint + base) when goal is bound
-  const scope = opts.goalId ? resolveExactScope(opts.goalId) : null;
+  // 0.1 Resolve LoopX authoritative exact-scope (fingerprint + base) when goal is bound
+  const scope = opts.goalId ? resolveExactScope(opts.goalId, baseRef) : null;
   if (scope) {
     console.log(`[✓] Exact-scope resolved: fingerprint=${scope.fingerprint.slice(0, 12)}... base=${scope.baseRef}@${scope.baseCommit.slice(0, 10)}`);
   }
+  // 资格未启用时前置 fail-closed，不必等到 record 阶段才失败。
+  if (qualificationDiagnostic(opts.goalId, scope)) process.exit(1);
   const scopeDiff = getScopeDiff(scope && scope.baseCommit);
   const diffSha256 = crypto.createHash('sha256').update(scopeDiff || 'clean').digest('hex');
 
@@ -336,7 +379,7 @@ ${scope ? `- **LoopX Scope Fingerprint**: \`${scope.fingerprint}\`` : ''}
   const hasLoopX = spawnSync('which', ['loopx'], { encoding: 'utf8' }).status === 0;
   if (hasLoopX && opts.goalId) {
     try {
-      const finalScope = resolveExactScope(opts.goalId);
+      const finalScope = resolveExactScope(opts.goalId, baseRef);
       if (finalScope && (!scope || finalScope.fingerprint !== scope.fingerprint)) {
         qualityResult.scope_fingerprint = finalScope.fingerprint;
         fs.writeFileSync(tempResultPath, JSON.stringify(qualityResult, null, 2));
@@ -348,6 +391,7 @@ ${scope ? `- **LoopX Scope Fingerprint**: \`${scope.fingerprint}\`` : ''}
         'change-quality', 'record',
         '--goal-id', opts.goalId,
         '--repo-path', '.',
+        '--base-ref', baseRef,
         '--result-json', tempResultPath,
         '--execute',
         '--format', 'json'
@@ -367,6 +411,7 @@ ${scope ? `- **LoopX Scope Fingerprint**: \`${scope.fingerprint}\`` : ''}
         'change-quality', 'verify',
         '--goal-id', opts.goalId,
         '--repo-path', '.',
+        '--base-ref', baseRef,
         '--format', 'json'
       ], { encoding: 'utf8' });
 
@@ -400,4 +445,4 @@ ${scope ? `- **LoopX Scope Fingerprint**: \`${scope.fingerprint}\`` : ''}
 
 if (require.main === module) main();
 
-module.exports = { isRuntimeArtifact, committedScopeFiles };
+module.exports = { isRuntimeArtifact, committedScopeFiles, discoverBaseRef };

@@ -47,7 +47,8 @@ function cleanupCapsule(feature) {
 }
 
 test('1. feature does not pre-create ACTIVE_STATE.md before bootstrap (#17)', () => {
-  const feature = 'fc-boot-test';
+  // 工作区可能是多 worktree 共享仓库；固定分支名会被其它 worktree 占用，导致 checkout 失败。
+  const feature = `fc-boot-test-${process.pid}`;
   const originalBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: PROJECT_ROOT, encoding: 'utf8' }).trim();
   resetMock();
   writeScript('loopx', `#!/usr/bin/env bash
@@ -159,23 +160,25 @@ exit 0
 
 test('7. approve passes --registry to configure-goal', () => {
   const feature = 'fc-approve-registry';
-  const regPath = path.join(PROJECT_ROOT, '.loopx/registry.json');
-  const hadRegistry = fs.existsSync(regPath);
-  const originalRegistry = hadRegistry ? fs.readFileSync(regPath, 'utf8') : null;
   makeCapsule(feature);
   resetMock();
   const calls = path.join(MOCK_BIN, 'calls.log');
   writeScript('loopx', '#!/usr/bin/env bash\necho "$*" >> ' + JSON.stringify(calls) + '\nexit 0\n');
-  fs.mkdirSync(path.dirname(regPath), { recursive: true });
-  if (!hadRegistry) fs.writeFileSync(regPath, '{"goals":[]}\n');
+  // REGISTRY_FLAG 仅在 .loopx/registry.json 存在时注入；干净检出没有该 gitignored 文件，
+  // 测试必须自建临时 registry，否则断言会依赖开发者本机状态而 flaky。
+  const registry = path.join(PROJECT_ROOT, '.loopx/registry.json');
+  const hadRegistry = fs.existsSync(registry);
+  const originalRegistry = hadRegistry ? fs.readFileSync(registry, 'utf8') : null;
+  fs.mkdirSync(path.dirname(registry), { recursive: true });
+  if (!hadRegistry) fs.writeFileSync(registry, JSON.stringify({ goals: [] }));
   try {
     const r = runFlow(['approve', 'contract', feature]);
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     const log = fs.readFileSync(calls, 'utf8');
     assert.match(log, /--registry .*configure-goal/);
   } finally {
-    if (hadRegistry) fs.writeFileSync(regPath, originalRegistry);
-    else fs.rmSync(regPath, { force: true });
+    if (hadRegistry) fs.writeFileSync(registry, originalRegistry);
+    else fs.rmSync(registry, { force: true });
     cleanupCapsule(feature);
   }
 });
