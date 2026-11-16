@@ -119,6 +119,8 @@ function buildUnresolvedAttribution(command, exitCode, headOid, label) {
   };
 }
 
+const REPO_TEST_FILE = /^(?:\.\/)?tests\/.+\.test\.(?:js|mjs|cjs|ts)$/;
+
 function resolveRepoTestPath(candidate, repoRoot) {
   let raw = '';
   if (typeof candidate === 'string') {
@@ -132,16 +134,23 @@ function resolveRepoTestPath(candidate, repoRoot) {
   }
   if (!raw || /^npm\b/i.test(raw) || /^NOT_RUN$/i.test(raw) || raw.startsWith('-')) return null;
   if (!/^[A-Za-z0-9_./-]+$/.test(raw)) return null;
+  if (!REPO_TEST_FILE.test(raw.replace(/\\/g, '/'))) return null;
   const root = path.resolve(repoRoot || process.cwd());
   const abs = path.resolve(root, raw);
   const rel = path.relative(root, abs).replace(/\\/g, '/');
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || !REPO_TEST_FILE.test(rel)) return null;
+  let realRoot;
+  let realAbs;
   try {
     if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return null;
+    realRoot = fs.realpathSync(root);
+    realAbs = fs.realpathSync(abs);
   } catch (_) {
     return null;
   }
-  return { abs, rel, root };
+  const realRel = path.relative(realRoot, realAbs).replace(/\\/g, '/');
+  if (!realRel || realRel.startsWith('..') || path.isAbsolute(realRel) || !REPO_TEST_FILE.test(realRel)) return null;
+  return { abs: realAbs, rel: realRel, root: realRoot };
 }
 
 function buildInvariantRow(caseId, label, candidate, opts = {}) {
@@ -352,10 +361,11 @@ function buildCodeVolumeRow(ctx, req, modelRow) {
 }
 
 function buildSymbolMapRow(req, ctx, modelRow) {
-  const hostItems = ctx.files.slice(0, 5).map(file => ({
+  const anchors = ctx.files.map(file => ({
     path: file,
     line: firstChangedLineNumber(ctx.fileDiffs.get(file) || ''),
   }));
+  const byPath = new Map(anchors.map(item => [item.path, item]));
   const itemFields = Array.isArray(req.item_fields) && req.item_fields.length
     ? req.item_fields
     : [
@@ -373,25 +383,22 @@ function buildSymbolMapRow(req, ctx, modelRow) {
       ];
   const minItems = req.item_count && typeof req.item_count.minimum === 'number' ? req.item_count.minimum : 2;
   const maxItems = req.item_count && typeof req.item_count.maximum === 'number' ? req.item_count.maximum : 5;
+  const hostItems = anchors.slice(0, maxItems);
+  const unverified = { status: 'unverified', items: hostItems };
   if (!isPlainObject(modelRow) || modelRow.status !== 'verified' || !Array.isArray(modelRow.items)) {
-    return { status: 'unverified', items: hostItems };
+    return unverified;
   }
   const candidateItems = modelRow.items.slice(0, maxItems);
   if (candidateItems.length < minItems || candidateItems.some(it => !isPlainObject(it))) {
-    return { status: 'unverified', items: hostItems };
+    return unverified;
   }
-  const mergedItems = candidateItems.map((it, idx) => {
-    const byPath = hostItems.find(h => h.path === it.path);
-    const anchor = byPath || hostItems[idx] || null;
-    return {
-      ...it,
-      ...(anchor ? { path: anchor.path, line: anchor.line } : {}),
-    };
+  if (candidateItems.some(it => !byPath.has(it.path))) return unverified;
+  const mergedItems = candidateItems.map(it => {
+    const anchor = byPath.get(it.path);
+    return { ...it, path: anchor.path, line: anchor.line };
   });
   const complete = mergedItems.every(it => itemFields.every(f => !isMissingValue(it[f])));
-  if (!complete) {
-    return { status: 'unverified', items: hostItems };
-  }
+  if (!complete) return unverified;
   return { status: 'verified', items: mergedItems };
 }
 

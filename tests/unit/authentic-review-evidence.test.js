@@ -1,12 +1,19 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const {
   buildEvidenceGraph,
   buildValidationMatrix,
   describeFileFromDiff,
   scanDiff,
 } = require('../../skills/code-review/scripts/evidence-builder.js');
+const {
+  buildNativePrompt,
+  finalizeReviewBody,
+} = require('../../skills/code-review/scripts/authentic-review.js');
 
 const DIFF = [
   'diff --git a/skills/code-review/scripts/authentic-review.js b/skills/code-review/scripts/authentic-review.js',
@@ -182,6 +189,23 @@ test('changed_line_classification and code_volume become verified only when requ
   assert.strictEqual('compatibility_assessment' in rejected.code_volume, false);
 });
 
+function symbolItem(file, extra = {}) {
+  return {
+    path: file,
+    line: 99,
+    symbol: 'buildEvidenceGraph',
+    responsibility: 'assemble the evidence row',
+    before_after_behavior: 'partial rows stay unverified',
+    input_or_pre_state: 'the pull request diff',
+    critical_branch_or_invariant: 'path must belong to this diff',
+    callee_or_side_effect: 'none',
+    return_or_consumer: 'check-result',
+    failure_fallback_or_retry_owner: 'reviewer',
+    caller_evidence: 'authentic-review.js',
+    ...extra,
+  };
+}
+
 test('symbol_map records only diff path+line without padding duplicates and stays unverified until judgment fields are complete', () => {
   const singleFileDiff = [
     'diff --git a/skills/code-review/scripts/authentic-review.js b/skills/code-review/scripts/authentic-review.js',
@@ -195,6 +219,142 @@ test('symbol_map records only diff path+line without padding duplicates and stay
   assert.deepStrictEqual(ev.symbol_map.items, [
     { path: 'skills/code-review/scripts/authentic-review.js', line: 10 },
   ]);
+});
+
+test('symbol_map stays unverified when a model path is outside the diff instead of remapping by index', () => {
+  const ev = build({
+    modelEvidence: {
+      symbol_map: {
+        status: 'verified',
+        items: [
+          symbolItem('fake/nonexistent.js'),
+          symbolItem('also/missing.js'),
+        ],
+      },
+    },
+  });
+  assert.strictEqual(ev.symbol_map.status, 'unverified');
+  assert.ok(ev.symbol_map.items.every(item => item.path !== 'fake/nonexistent.js' && item.path !== 'also/missing.js'));
+  assert.ok(ev.symbol_map.items.every(item => !item.symbol));
+
+  const matched = build({
+    modelEvidence: {
+      symbol_map: {
+        status: 'verified',
+        items: [
+          symbolItem('tests/unit/authentic-review-evidence.test.js'),
+          symbolItem('skills/code-review/scripts/authentic-review.js'),
+        ],
+      },
+    },
+  });
+  assert.strictEqual(matched.symbol_map.status, 'verified');
+  assert.strictEqual(matched.symbol_map.items[0].path, 'tests/unit/authentic-review-evidence.test.js');
+  assert.strictEqual(matched.symbol_map.items[0].line, 1);
+  assert.strictEqual(matched.symbol_map.items[1].path, 'skills/code-review/scripts/authentic-review.js');
+  assert.strictEqual(matched.symbol_map.items[1].line, 1);
+});
+
+test('invariant rows stay unverified for non-test files and symlinks that leave the repo', () => {
+  const executed = [];
+  const source = build({
+    modelEvidence: {
+      validation_matrix: {
+        items: [{ case_id: 'changed_invariant_positive', test_path: 'skills/code-review/scripts/evidence-builder.js' }],
+      },
+    },
+    runNodeTest: (relPath) => {
+      executed.push(relPath);
+      return { status: 0, stdout: '', stderr: '' };
+    },
+  });
+  assert.deepStrictEqual(executed, []);
+  const sourceItems = new Map(source.validation_matrix.items.map(item => [item.case_id, item]));
+  assert.strictEqual(sourceItems.get('changed_invariant_positive').status, 'unverified');
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-invariant-'));
+  const outside = path.join(os.tmpdir(), `outside-${process.pid}.js`);
+  fs.mkdirSync(path.join(root, 'tests'));
+  fs.writeFileSync(outside, 'test("outside", () => {});\n');
+  fs.symlinkSync(outside, path.join(root, 'tests', 'escape.test.js'));
+  const escaped = build({
+    repoRoot: root,
+    modelEvidence: {
+      validation_matrix: {
+        items: [{ case_id: 'material_negative_or_failure', test_path: 'tests/escape.test.js' }],
+      },
+    },
+    runNodeTest: (relPath) => {
+      executed.push(relPath);
+      return { status: 0, stdout: '', stderr: '' };
+    },
+  });
+  const escapedItems = new Map(escaped.validation_matrix.items.map(item => [item.case_id, item]));
+  assert.strictEqual(escapedItems.get('material_negative_or_failure').status, 'unverified');
+  assert.ok(!executed.includes('tests/escape.test.js'));
+});
+
+test('review prompt lists symbol_map fields and publication adds the author-owned title plus remaining_gap', () => {
+  const prompt = buildNativePrompt({
+    pr: 16,
+    headOid: 'a'.repeat(40),
+    branch: 'fix/issue-15',
+    motivation: 'm',
+    reviewTemplate: { sections: [], output_hint: '' },
+    reviewPlan: { required_evidence_ids: ['symbol_map', 'validation_matrix'] },
+    evidenceCommands: [],
+    evidenceText: '',
+    diff: 'diff',
+    priorFindings: [],
+    evidenceContract: {
+      evidence_requirements: [
+        { evidence_id: 'symbol_map', items_field: 'items', item_fields: ['path', 'symbol'] },
+        { evidence_id: 'validation_matrix', fields: ['items'] },
+      ],
+    },
+  });
+  assert.match(prompt, /`symbol_map`: fields=\(none\); items_field=items; item_fields=path, symbol/);
+  assert.doesNotMatch(prompt, /`validation_matrix`:/);
+
+  const sections = [
+    '## 动机',
+    '审查者会遇到未核实结论被写成 verified。',
+    '## 改动思路',
+    '主机只记录自己量到的事实。',
+    '## 具体改动',
+    '证据装配不再回填占位句。',
+    '## 对主干的风险',
+    '缺字段时审查不能批准。',
+    '## 我的整体评价',
+    '这是证据规则收口。',
+  ].join('\n');
+  const body = finalizeReviewBody(sections, {
+    headOid: 'a'.repeat(40),
+    verdict: 'REQUEST_CHANGES',
+    reviewer: { declared_model: 'codex', declared_provider: 'openai', declaration_source: 'self_reported' },
+    motivation: '',
+    authorOwned: true,
+    problemContext: {
+      verdict: 'justified_increment',
+      affected_caller_or_operator: '运行 review 的审查者',
+      before_after_scenario: '变更前缺字段仍标 verified',
+      observable_outcome: '缺字段保持 unverified',
+      non_goals: '不放宽 check-result',
+      remaining_gap: '判断类证据仍要审查者自己填写',
+    },
+  });
+  assert.match(body, /Request changes conclusion \(author-owned PR; GitHub blocks formal self-review\)/);
+  const motivation = body.split('## 改动思路')[0];
+  assert.match(motivation, /判断类证据仍要审查者自己填写/);
+  const plain = finalizeReviewBody(sections, {
+    headOid: 'a'.repeat(40),
+    verdict: 'REQUEST_CHANGES',
+    reviewer: { declared_model: 'codex', declared_provider: 'openai', declaration_source: 'self_reported' },
+    motivation: '',
+    authorOwned: false,
+    problemContext: null,
+  });
+  assert.doesNotMatch(plain, /author-owned PR/);
 });
 
 test('model evidence cannot overwrite host validation_matrix exit codes', () => {

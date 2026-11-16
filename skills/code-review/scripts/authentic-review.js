@@ -380,6 +380,7 @@ function extractPacketReview(packet, pr, headOid) {
     evidenceCommands: match && Array.isArray(match.evidence_commands) ? match.evidence_commands : [],
     motivation: match && typeof match.motivation === 'string' ? match.motivation : '',
     behaviorBearing: !!(plan.applicability && plan.applicability.behavior_bearing_change),
+    authorOwned: !!(match && match.author_owned === true),
   };
 }
 
@@ -465,7 +466,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ).join('\n\n');
 
   const evdCmds = (evidenceCommands || []).map(c => `- \`${c}\``).join('\n');
-  const hostFactIds = new Set(['validation_matrix', 'symbol_map']);
+  const hostFactIds = new Set(['validation_matrix']);
   const requiredIds = (reviewPlan.required_evidence_ids || []).join(', ');
   const evidenceRequirements = (evidenceContract && evidenceContract.evidence_requirements || [])
     .filter(r => (reviewPlan.required_evidence_ids || []).includes(r.evidence_id) && !hostFactIds.has(r.evidence_id))
@@ -496,9 +497,10 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     requiredIds,
     '',
     '## 结构化证据图（判断类由审查者填写，主机不预填占位句）',
-    '- 事实类 id（`validation_matrix`、`symbol_map` 的 `path`/`line`，以及 `changed_line_classification` / `code_volume` 的文件列表与增删统计）由主机按本次真实观测写入。模型不得覆盖主机测得的退出码、文件列表或行统计。',
+    '- 事实类 id（`validation_matrix`，以及 `changed_line_classification` / `code_volume` 的文件列表与增删统计、`symbol_map` 的 `path`/`line`）由主机按本次真实观测写入。模型不得覆盖主机测得的退出码、文件列表或行统计。',
     '- `changed_line_classification` 与 `code_volume` 的其余 packet 必填字段由你填写。缺任一必填字段，或 `compatibility_assessment` 不是对象时，整行保持 `unverified`。主机不会把缺字段的行标成 `verified`。',
-    '- `changed_invariant_positive` 与 `material_negative_or_failure` 默认 `unverified`（`npm test` 通过不证明改动不变量）；仅当你在 `evidence.validation_matrix` 中给出仓库内已存在的测试文件路径（如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），且主机执行 `node --test <该路径>` 退出码为 0 后才记为 `passed`。',
+    '- `symbol_map` 的语义字段由你按 packet 的 `item_fields` 填写。主机只接受本次 diff 中的精确 `path`，并覆盖 `line`。任一 `path` 不在本次 diff 中时，整行保持 `unverified`，不会按条目下标改写成别的文件。',
+    '- `changed_invariant_positive` 与 `material_negative_or_failure` 默认 `unverified`（`npm test` 通过不证明改动不变量）；仅当你在 `evidence.validation_matrix` 中给出仓库内已存在的测试文件路径（如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），且该路径位于 `tests/` 下、文件名匹配 `.test.js` / `.test.mjs` / `.test.cjs` / `.test.ts`，主机执行 `node --test <该路径>` 退出码为 0 后才记为 `passed`。普通源码文件不会被执行。',
     '- 判断类 id 由你独立核实后在 `evidence` 中填写；未核实或形状不完整的项将保持 `status: "unverified"`，主机绝不预填或回填占位句：',
     evidenceRequirements || '(本 PR 无额外 evidence requirements)',
     '',
@@ -522,10 +524,10 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     diff.length > 240000 ? `${diff.slice(0, 240000)}\n\n[TRUNCATED]` : diff,
     '',
     '## 输出格式（请输出单一 fenced json 块）',
-    '结构如下（仅填写你已独立核实的判断类 evidence，未核实项保持或省略为 unverified；其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals` 四个非空字符串并写入「动机」段）：',
+    '结构如下（仅填写你已独立核实的判断类 evidence，未核实项保持或省略为 unverified；其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals` 四个非空字符串并写入「动机」段。`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap`，并写入同一段）：',
     '```json',
     JSON.stringify({
-      review_body: 'Markdown 字符串：首行必须是 `Reviewer: model_agent · model=<model> · provider=<provider> · declaration=<declaration_source> · head=<headOid>`（declaration_source 默认 self_reported）；随后依次出现五个一级章节（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价），各章达到字数下限；「具体改动」下必须含 `### 关键代码讲解`；正文内须含精确 head oid；结尾须有一行 `English verdict: APPROVE` 或 `English verdict: REQUEST_CHANGES`。',
+      review_body: 'Markdown 字符串：首行必须是 `Reviewer: model_agent · model=<model> · provider=<provider> · declaration=<declaration_source> · head=<headOid>`（declaration_source 默认 self_reported）；随后依次出现五个二级标题（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价），各章达到字数下限；「具体改动」下必须含 `### 关键代码讲解`；正文内须含精确 head oid；结尾须有一行 `English verdict: APPROVE` 或 `English verdict: REQUEST_CHANGES`。',
       verdict: 'APPROVE 或 REQUEST_CHANGES（大写，须与 review_body 中的 English verdict 完全一致）',
       findings: [{ file: '路径', line: '整数或 null', severity: 'P0|P1|P2|P3|blocker|major|minor|advisory', summary: '...', repro: '可选复现步骤' }],
       reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-high', declared_provider: '如 openai' },
@@ -598,7 +600,12 @@ function normalizeFindings(findings) {
 //  - 保证恰好一行 English verdict:
 //  - 保证精确 head oid 出现在可见文本
 //  - 把原生 motivation 原样发布进「动机」段（满足 native problem_context 发布校验）
-function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, problemContext, carryoverSection }) {
+const AUTHOR_OWNED_REVIEW_TITLES = {
+  APPROVE: 'Approval conclusion (author-owned PR; GitHub blocks formal self-approval)',
+  REQUEST_CHANGES: 'Request changes conclusion (author-owned PR; GitHub blocks formal self-review)',
+};
+
+function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, problemContext, carryoverSection, authorOwned }) {
   let text = String(body || '');
   const modelName = String((reviewer && reviewer.declared_model) || 'codex').replace(/[\/:@]/g, '-');
   const provider = String((reviewer && reviewer.declared_provider) || 'openai').replace(/[\/:@]/g, '-');
@@ -623,14 +630,19 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, prob
     text = text.replace(/(^|\n)(#+\s*动机[\s\S]*?)(?=\n#+\s*改动思路)/,
       (m, p1, p2) => `${p1}${p2}\n\n> 问题背景（LoopX 抽取，原生发布）：\n>\n> ${motivation.trim().replace(/\n/g, '\n> ')}`);
   }
+  if (authorOwned && AUTHOR_OWNED_REVIEW_TITLES[verdict] && !text.includes(AUTHOR_OWNED_REVIEW_TITLES[verdict])) {
+    text = `${AUTHOR_OWNED_REVIEW_TITLES[verdict]}\n\n${text}`;
+  }
   if (problemContext) {
     const pcItems = [
       problemContext.affected_caller_or_operator,
       problemContext.before_after_scenario,
       problemContext.observable_outcome,
-      problemContext.non_goals
-    ].filter(s => typeof s === "string" && s.trim());
-    const missing = pcItems.filter(s => !text.includes(s));
+      problemContext.non_goals,
+    ];
+    if (problemContext.verdict === 'justified_increment') pcItems.push(problemContext.remaining_gap);
+    const published = pcItems.filter(s => typeof s === 'string' && s.trim());
+    const missing = published.filter(s => !text.includes(s));
     if (missing.length > 0) {
       const pcBlock = missing.map(s => `> - ${s}`).join("\n");
       text = text.replace(/(^|\n)(#+\s*动机[\s\S]*?)(?=\n#+\s*改动思路)/,
@@ -968,7 +980,10 @@ function main() {
   });
   const problemContext = autoEvidence.problem_context || null;
   const carryoverSection = buildCarryoverSection(carryover, priorFindings);
-  let reviewBody = finalizeReviewBody(modelOut.review_body, { headOid, verdict, reviewer, motivation: pkt.motivation, problemContext, carryoverSection });
+  let reviewBody = finalizeReviewBody(modelOut.review_body, {
+    headOid, verdict, reviewer, motivation: pkt.motivation, problemContext, carryoverSection,
+    authorOwned: pkt.authorOwned,
+  });
   // 发布 architecture_assessment 的 reason/current_pr_boundary（原生 check-result 要求可读）
   const archAssessment = autoEvidence.change_proportionality && autoEvidence.change_proportionality.architecture_assessment;
   if (archAssessment && archAssessment.reason && !reviewBody.includes(archAssessment.reason)) {
@@ -1110,4 +1125,6 @@ function main() {
   process.exit(0);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { finalizeReviewBody, buildNativePrompt };
