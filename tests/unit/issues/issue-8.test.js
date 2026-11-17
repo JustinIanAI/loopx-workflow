@@ -18,7 +18,7 @@ const { spawnSync } = require('node:child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const INGEST = path.join(PROJECT_ROOT, 'skills/code-review/scripts/ingest-to-loopx-quality.js');
-const { allocateTempArtifactPath } = require(INGEST);
+const { allocateTempArtifactPath, resolveTmpDir } = require(INGEST);
 
 const SCAN_ROOTS = ['bin', 'scripts', 'skills'].map((dir) => path.join(PROJECT_ROOT, dir));
 const SCAN_EXTENSIONS = new Set(['.js', '.sh']);
@@ -153,5 +153,18 @@ test('4. loopx-flow init 创建项目本地沙箱，PR 正文不再回退系统 
     assert.strictEqual(res.status, 0, `宿主 mktemp 必须成功创建无后缀模板: ${res.stderr}`);
   } finally {
     fs.rmSync(probeDir, { recursive: true, force: true });
+  }
+});
+
+test('5. resolveTmpDir 锚定在仓库根目录 .loopx/tmp，不受 process.cwd() 偏移影响', () => {
+  const prevOverride = process.env.LOOPX_TMP_DIR;
+  const prevCwd = process.cwd();
+  delete process.env.LOOPX_TMP_DIR;
+  try {
+    process.chdir(path.join(PROJECT_ROOT, 'skills/code-review'));
+    assert.strictEqual(resolveTmpDir(), path.join(PROJECT_ROOT, '.loopx/tmp'));
+  } finally {
+    process.chdir(prevCwd);
+    if (prevOverride !== undefined) process.env.LOOPX_TMP_DIR = prevOverride;
   }
 });

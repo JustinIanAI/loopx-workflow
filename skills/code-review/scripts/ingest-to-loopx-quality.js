@@ -36,7 +36,8 @@ function discoverBaseRef(repoPath = process.cwd()) {
 // macOS /private/tmp 与 Windows %TEMP% 不可移植）。LOOPX_TMP_DIR 可覆盖该目录（CI/隔离测试）。
 function resolveTmpDir() {
   const override = process.env.LOOPX_TMP_DIR;
-  return override ? path.resolve(override) : path.join(process.cwd(), '.loopx/tmp');
+  const repoRoot = path.resolve(__dirname, '../../..');
+  return override ? path.resolve(override) : path.join(repoRoot, '.loopx/tmp');
 }
 
 // 唯一临时工件路径：<tmpDir>/<prefix>-<pid>-<rand>.json，保证并行进程零覆写。
@@ -668,4 +669,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { isRuntimeArtifact, committedScopeFiles, discoverBaseRef, allocateTempArtifactPath };
+module.exports = { isRuntimeArtifact, committedScopeFiles, discoverBaseRef, resolveTmpDir, allocateTempArtifactPath };
