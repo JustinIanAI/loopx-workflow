@@ -648,8 +648,26 @@ find_gate1_independent_comment() {
     node -e '
 const fs = require("fs");
 const executor = process.argv[1], feature = process.argv[2], preSha = process.argv[3];
-let rows = [];
-try { rows = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(1); }
+const raw = fs.readFileSync(0, "utf8").trim();
+const rows = [];
+try {
+  let i = 0;
+  while (i < raw.length) {
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (i >= raw.length) break;
+    if (raw[i] !== "[") process.exit(1);
+    let depth = 0, inStr = false, esc = false, start = i;
+    for (; i < raw.length; i++) {
+      const c = raw[i];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
+      if (c === "\"") { inStr = true; continue; }
+      if (c === "[") depth++;
+      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
+    }
+    if (depth !== 0) process.exit(1);
+    rows.push(...JSON.parse(raw.slice(start, i)));
+  }
+} catch (_) { process.exit(1); }
 const marker = "<!-- loopx-flow:gate1-authorization:" + feature + "@" + preSha + " -->";
 for (const row of rows) {
   const body = String(row.body || ""), login = String((row.user || {}).login || "");
@@ -738,10 +756,31 @@ agent_comment_ok() {
     if node -e '
 const fs = require("fs");
 const head = process.argv[1];
-let rows = [];
-try { rows = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(1); }
+const raw = fs.readFileSync(0, "utf8").trim();
+const rows = [];
+try {
+  let i = 0;
+  while (i < raw.length) {
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (i >= raw.length) break;
+    if (raw[i] !== "[") process.exit(1);
+    let depth = 0, inStr = false, esc = false, start = i;
+    for (; i < raw.length; i++) {
+      const c = raw[i];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
+      if (c === "\"") { inStr = true; continue; }
+      if (c === "[") depth++;
+      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
+    }
+    if (depth !== 0) process.exit(1);
+    rows.push(...JSON.parse(raw.slice(start, i)));
+  }
+} catch (_) { process.exit(1); }
 if (!Array.isArray(rows)) process.exit(1);
-const ok = rows.some((r) => String(r.state || "").toUpperCase() === "COMMENT" && String(r.commit_id || (r.commit || {}).oid || "") === head);
+const ok = rows.some((r) => {
+  const st = String(r.state || "").toUpperCase();
+  return (st === "COMMENTED" || st === "COMMENT") && String(r.commit_id || (r.commit || {}).oid || "") === head;
+});
 process.exit(ok ? 0 : 1);
 ' "$head_oid" <<< "$reviews"; then
         return 0
@@ -750,8 +789,26 @@ process.exit(ok ? 0 : 1);
     node -e '
 const fs = require("fs");
 const marker = process.argv[1];
-let rows = [];
-try { rows = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(1); }
+const raw = fs.readFileSync(0, "utf8").trim();
+const rows = [];
+try {
+  let i = 0;
+  while (i < raw.length) {
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (i >= raw.length) break;
+    if (raw[i] !== "[") process.exit(1);
+    let depth = 0, inStr = false, esc = false, start = i;
+    for (; i < raw.length; i++) {
+      const c = raw[i];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
+      if (c === "\"") { inStr = true; continue; }
+      if (c === "[") depth++;
+      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
+    }
+    if (depth !== 0) process.exit(1);
+    rows.push(...JSON.parse(raw.slice(start, i)));
+  }
+} catch (_) { process.exit(1); }
 if (!Array.isArray(rows)) process.exit(1);
 process.exit(rows.some((r) => String(r.body || "").includes(marker)) ? 0 : 1);
 ' "$marker" <<< "$comments"
@@ -771,8 +828,26 @@ release_authorization_ok() {
     node -e '
 const fs = require("fs");
 const pr = process.argv[1], head = process.argv[2], acceptedBy = process.argv[3], contractSha = process.argv[4], risk = process.argv[5];
-let rows = [];
-try { rows = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(1); }
+const raw = fs.readFileSync(0, "utf8").trim();
+const rows = [];
+try {
+  let i = 0;
+  while (i < raw.length) {
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (i >= raw.length) break;
+    if (raw[i] !== "[") process.exit(1);
+    let depth = 0, inStr = false, esc = false, start = i;
+    for (; i < raw.length; i++) {
+      const c = raw[i];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
+      if (c === "\"") { inStr = true; continue; }
+      if (c === "[") depth++;
+      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
+    }
+    if (depth !== 0) process.exit(1);
+    rows.push(...JSON.parse(raw.slice(start, i)));
+  }
+} catch (_) { process.exit(1); }
 const marker = "<!-- loopx-flow:release-authorization:" + pr + "@" + head + " -->";
 for (const row of rows) {
   const body = String(row.body || ""), login = String((row.user || {}).login || "");
@@ -1553,7 +1628,7 @@ HELPTXT
 }
 
 cmd_release_approve() {
-    local pr_id="$1" yes="false" arg
+    local pr_id="${1:-}" yes="false" arg
     shift || true
     for arg in "$@"; do [[ "$arg" == "--yes" ]] && yes="true"; done
     if [[ -z "$pr_id" ]]; then
@@ -1580,10 +1655,11 @@ cmd_release_approve() {
     [[ "$is_draft" != "true" ]] || { echo "[-] [FAIL-CLOSED] PR #$pr_id 仍为 Draft：先 pr ready，再签发 release-approve。" >&2; exit 1; }
     local feature=""
     if [[ "$head_ref" =~ ^feature/(.+) ]]; then feature="${BASH_REMATCH[1]}"; fi
-    [[ -n "$feature" ]] || { echo "[-] [FAIL-CLOSED] PR 分支不是 feature/<name>" >&2; exit 1; }
-    local contract_sha
-    contract_sha="$(contract_sha_for "$feature" || true)"
-    [[ -n "$contract_sha" ]] || { echo "[-] [FAIL-CLOSED] 缺少 feature $feature 的 04-contract.md" >&2; exit 1; }
+    local contract_sha="none"
+    if [[ -n "$feature" ]]; then
+        contract_sha="$(contract_sha_for "$feature" || true)"
+        [[ -n "$contract_sha" ]] || { echo "[-] [FAIL-CLOSED] 缺少 feature $feature 的 04-contract.md" >&2; exit 1; }
+    fi
     local timestamp
     timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     local body
@@ -1597,7 +1673,7 @@ gate=2;mode=single_owner;head=$head_oid;contract_sha=$contract_sha;principal=$pr
 }
 
 cmd_status_next() {
-    local feature="$1"
+    local feature="${1:-}"
     if [[ -z "$feature" ]]; then
         local branch
         branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
@@ -1666,9 +1742,11 @@ cmd_merge() {
         # ADR-0012 T9：网页/管理员绕过 loopx-flow merge 时无法阻止，但必须留审计告警
         if [[ -n "$auth_mode_val" ]]; then
             if [[ "$auth_mode_val" == "single_owner" ]]; then
-                local merged_contract_sha
-                merged_contract_sha="$(contract_sha_for "$feature" 2>/dev/null || true)"
-                if [[ -z "$feature" || -z "$merged_contract_sha" ]] || ! release_authorization_ok "$pr_id" "$head_oid" "$merged_contract_sha"; then
+                local merged_contract_sha="none"
+                if [[ -n "$feature" ]]; then
+                    merged_contract_sha="$(contract_sha_for "$feature" 2>/dev/null || true)"
+                fi
+                if [[ -z "$merged_contract_sha" ]] || ! release_authorization_ok "$pr_id" "$head_oid" "$merged_contract_sha"; then
                     echo -e "${YELLOW}[WARN] 审计告警：PR #$pr_id 已 MERGED，但缺少绑定当前 head 的 release-authorization；可能为网页/管理员绕过 loopx-flow merge（Mode B 挡不住该路径，仅记录告警）。${NC}" >&2
                 fi
             elif [[ "$auth_mode_val" == "independent" ]] && ! mode_a_review_ok "$pr_id" "$head_oid"; then
@@ -1681,21 +1759,19 @@ cmd_merge() {
     else
         echo -e "${BOLD}[1/4] 正在校验 GitHub PR 决议与 HEAD SHA...${NC}"
         if [[ -n "$auth_mode_val" ]]; then
-            if [[ -z "$feature" ]]; then
-                echo -e "${RED}[-] [FAIL-CLOSED] 已配置 authorization_mode，但无法从 PR 分支解析 feature/<name>，Gate2 缺少绑定对象。${NC}" >&2
-                exit 1
-            fi
             if pr_is_draft "$pr_id"; then
                 echo -e "${RED}[-] [FAIL-CLOSED] PR #$pr_id 仍为 Draft：先 loopx-flow pr ready，再走 Gate2。${NC}" >&2
                 exit 1
             fi
         fi
         if [[ "$auth_mode_val" == "single_owner" ]]; then
-            local current_contract_sha
-            current_contract_sha="$(contract_sha_for "$feature" || true)"
-            if [[ -z "$current_contract_sha" ]]; then
-                echo -e "${RED}[-] [FAIL-CLOSED] 缺少 specs/features/$feature/04-contract.md，无法核验 release-authorization 的 contract_sha。${NC}" >&2
-                exit 1
+            local current_contract_sha="none"
+            if [[ -n "$feature" ]]; then
+                current_contract_sha="$(contract_sha_for "$feature" || true)"
+                if [[ -z "$current_contract_sha" ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 缺少 specs/features/$feature/04-contract.md，无法核验 release-authorization 的 contract_sha。${NC}" >&2
+                    exit 1
+                fi
             fi
             if ! release_authorization_ok "$pr_id" "$head_oid" "$current_contract_sha"; then
                 echo -e "${RED}[-] [FAIL-CLOSED] Mode B 缺少 release-authorization 评论，或 head/contract_sha/principal/risk_acceptance 与当前 PR 不一致${NC}" >&2
@@ -2832,7 +2908,7 @@ case "$ACTION" in
     doctor) cmd_doctor "$@" ;;
     init) cmd_init "$@" ;;
     status)
-        if [[ "$1" == "--next" ]]; then shift; cmd_status_next "$@"; else cmd_status "$@"; fi ;;
+        if [[ "${1:-}" == "--next" ]]; then shift; cmd_status_next "${1:-}"; else cmd_status "$@"; fi ;;
     todo) cmd_todo "$@" ;;
     help|--help|-h) usage ;;
     *)

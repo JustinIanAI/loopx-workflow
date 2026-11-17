@@ -24,6 +24,7 @@ function setup(opts = {}) {
   fs.writeFileSync(path.join(dir, 'bp-exit'), String(opts.bpExit || 0));
 
   const head = opts.head || HEAD;
+  const headRef = opts.headRef || ('feature/' + FEATURE);
   const draft = opts.draft === true ? 'true' : 'false';
   const decision = opts.decision || 'APPROVED';
   const state = opts.state || 'OPEN';
@@ -46,7 +47,7 @@ function setup(opts = {}) {
     'if [[ "$1" == "pr" && "$2" == "view" ]]; then',
     '  args="$*"',
     '  if [[ "$args" == *"reviews,author,reviewDecision,isDraft"* ]]; then cat "' + files.reviews + '"; exit 0; fi',
-    '  if [[ "$args" == *"state,mergedAt,reviewDecision,headRefOid,headRefName,baseRefName"* ]]; then echo "' + state + '%%' + decision + '%' + head + '%feature/' + FEATURE + '%main"; exit 0; fi',
+    '  if [[ "$args" == *"state,mergedAt,reviewDecision,headRefOid,headRefName,baseRefName"* ]]; then echo "' + state + '%%' + decision + '%' + head + '%' + headRef + '%main"; exit 0; fi',
     '  if [[ "$args" == *"isDraft"* ]]; then echo "' + draft + '"; exit 0; fi',
     '  if [[ "$args" == *"headRefOid"* ]]; then echo "' + head + '"; exit 0; fi',
     '  exit 0',
@@ -250,4 +251,45 @@ test('Mode B 接受 Agent review issue comment（当前发布通道）作为 hea
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     assert.match(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), /merged/);
   } finally { h.cleanup(dir); }
+});
+
+test('Mode B 兼容 GitHub formal review COMMENTED 状态与多页 --paginate 输出', () => {
+  const paginatedReviews = JSON.stringify([{ state: 'COMMENTED', commit_id: HEAD, user: { login: 'agent' } }])
+    + '\n' + JSON.stringify([{ state: 'DISMISSED', commit_id: OLD, user: { login: 'other' } }]);
+  const { dir, contractSha } = setup({
+    mode: 'single_owner',
+    pullReviews: paginatedReviews,
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  const paginatedComments = releaseComment(contractSha) + '\n' + JSON.stringify([]);
+  fs.writeFileSync(path.join(dir, 'comments.json'), paginatedComments);
+  try {
+    const r = h.run(dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), /merged/);
+  } finally { h.cleanup(dir); }
+});
+
+test('Mode B 支持非 feature/* 分支（fix/issue-* / fast-fix/*）走 Gate2 merge（contract_sha=none）', () => {
+  const { dir } = setup({
+    mode: 'single_owner',
+    headRef: 'fix/issue-19',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment('none'));
+  try {
+    const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), /merged/);
+  } finally { h.cleanup(dir); }
+});
+
+test('set -u 下无参调用 status --next / release-approve 不会报 unbound variable', () => {
+  const root = path.resolve(__dirname, '../..');
+  const r1 = h.run(root, ['status', '--next']);
+  assert.doesNotMatch(r1.stderr, /unbound variable/i);
+  const r2 = h.run(root, ['release-approve']);
+  assert.strictEqual(r2.status, 1);
+  assert.doesNotMatch(r2.stderr, /unbound variable/i);
+  assert.match(r2.stderr, /请指定 PR 编号/);
 });
