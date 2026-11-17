@@ -2,7 +2,7 @@
 
 - **产品需求**：[docs/prd/loopx-workflow.md](../prd/loopx-workflow.md)
 - **增量决策**：[docs/adr/README.md](../adr/README.md)
-- **状态**：目标设计（ADR-0002~0005 已收紧失败条件；R1/R2/R3/R4 代码落地前，现行为差异见对应 ADR 与 issue #15）
+- **状态**：目标设计（ADR-0002~0005、ADR-0007、ADR-0008、ADR-0009 已收紧失败条件；R1/R2/R3/R4 代码落地前，现行为差异见对应 ADR 与 issue #15）
 
 本文是命令、阶段、资产和失败条件的唯一设计正文。`docs/guides/loopx-workflow-architecture.html` 是展示页，不参与需求或设计裁决。原 `docs/design/coding-workflow-tools-spec.md` 已删除，管线内容在这里。
 
@@ -56,7 +56,7 @@ flowchart LR
 | `approve contract <feature>` | `cmd_approve` | `REQ-CHECKPOINT-1` | 缺契约文件、缺 `loopx`、`configure-goal` 失败均非 0；先锁最终内容 SHA256，成功后才原子写入批准标记 |
 | `gate verify decisions\|contract` | `cmd_gate` | `REQ-GATE-DECISIONS-1`、`REQ-CONTRACT-LOCK-1` | 见第 5 节。没有 `pr` 这个 stage |
 | `check [feature] [--goal-id] [--with-ocr]` | `cmd_check` | `REQ-GATE-1`、`REQ-QUALITY-1`、`REQ-CHECK-IDENTITY-1`、`REQ-FAILCLOSED-1` | 无 feature 且无 `--goal-id` 则非 0；有胶囊时先 `gate verify contract`；四门禁后必须收据 `ok=true` 才打印成功 |
-| `todo list\|claim\|done` | `cmd_todo` | `REQ-NATIVE-1` | 没有 `loopx` 则退出。`claim` / `done` 走租约，冲突由 LoopX 拒绝 |
+| `todo list\|claim\|done` | `cmd_todo` | `REQ-NATIVE-1`、`REQ-LEASE-1` | 没有 `loopx` 则退出。`claim` 先按 `next_cursor` 读完 `agent-directory`，再解析已注册 owner，并 `task-lease inspect` 后 `task-lease acquire --owner --idempotency-key`。身份缺失、歧义、目录未读全或 `LOOPX_AGENT_ID` 未注册时非 0，且不申领。无租约时幂等键为 `loopx-flow:claim:` 加 SHA256(goal、todo、owner)。活动且同一 owner 复用当前键；过期或释放后换入 `lease_epoch` 与 `version` 的下一把键。显式 `--idempotency-key` 原样透传。`done` 走完成回写与 release，冲突由 LoopX 拒绝 |
 | `issue <id>` | `cmd_issue` | `REQ-NATIVE-1`、`REQ-FAILCLOSED-1` | 只打印路由，不执行修复 |
 | `integrate [--execute\|--status]` | `cmd_integrate` | `REQ-NATIVE-1` | 默认 preview，不落盘。`--execute` 才 sync 落盘 |
 | `pr create\|preview\|update` | `cmd_pr` | `REQ-PR-BODY-1` | 调用 `authentic-review.js --generate-pr-body` |
@@ -223,6 +223,12 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | 有 feature 但无 `loopx` 或收据 `ok !== true` | `check` | 非 0 |
 | 无 feature 且无 `--goal-id` | `check` | 非 0，不执行收据核验 |
 | 无 `loopx` | `todo` / `issue` / `integrate` / `merge` | 非 0 |
+| Goal 无已注册 Agent，或 `LOOPX_AGENT_ID` 未注册 | `todo claim` | 非 0，打印带 `--execute` 的 `register-agent`（占位符不被 `%q` 转义），不调用 `task-lease acquire` |
+| 多个已注册 Agent 且未设置 `LOOPX_AGENT_ID` | `todo claim` | 非 0，列出读完分页后的身份并要求设置 `LOOPX_AGENT_ID`，不申领 |
+| `agent-directory` 游标重复，或翻页后仍少于 `registered_agent_count` | `todo claim` | 非 0，不把残页报成缺失或歧义，不申领 |
+| 活动租约且 owner 相同 | `todo claim` | 复用 inspect 读到的当前代际幂等键 |
+| 租约已过期或已释放 | `todo claim` | 使用纳入 `lease_epoch` 与 `version` 的下一把幂等键 |
+| `task-lease acquire` 被 LoopX 拒绝 | `todo claim` | 非 0，保留 LoopX 的拒绝结果；`idempotency_key_reuse` 原样输出，不用“其他 Agent 持有”概括 |
 | 无 `loopx` | `doctor` | 非 0，输出诊断卡 |
 | `reviewDecision != APPROVED` | `merge` | 非 0，不调用 `gh pr merge` |
 | 合入锁失败或 HEAD 在锁后变化 | `merge` | 非 0 |
@@ -256,6 +262,7 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | `REQ-QUALITY-1` | `change-quality-failclosed` | `ingest-to-loopx-quality.js`、`change-quality verify` |
 | `REQ-REVIEW-1` `REQ-PR-BODY-1` `REQ-RESPOND-1` | `authentic-review-pipeline`、`loopx-ecosystem-alignment` | `authentic-review.js`、`respond-report.js`、`cmd_pr`、`cmd_respond` |
 | `REQ-NATIVE-1` | `native-dispatch-deep-integration` | `cmd_todo`、`cmd_issue`、`cmd_integrate` |
+| `REQ-LEASE-1` | 本次修复 GitHub #12，无新胶囊 | `resolve_claim_owner`、`claim_idempotency_key`、`cmd_todo_lease` 的 claim |
 | `REQ-GOAL-1` | `loopx-ecosystem-alignment`、`fail-closed-hardening` | `cmd_merge` 的 goal stop/retire/sync/archive 补偿 |
 | `REQ-CHECK-IDENTITY-1` | `fail-closed-hardening` | `cmd_check`、`ingest-to-loopx-quality.js` |
 | `REQ-QUALITY-2` | `change-quality-failclosed` | `ingest-to-loopx-quality.js`、`authentic-review.js` 的 PR body |

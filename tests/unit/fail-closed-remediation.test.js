@@ -168,6 +168,8 @@ test('7. approve passes --registry to configure-goal', () => {
   // 测试必须自建临时 registry，否则断言会依赖开发者本机状态而 flaky。
   const registry = path.join(PROJECT_ROOT, '.loopx/registry.json');
   const hadRegistry = fs.existsSync(registry);
+  const originalRegistry = hadRegistry ? fs.readFileSync(registry, 'utf8') : null;
+  fs.mkdirSync(path.dirname(registry), { recursive: true });
   if (!hadRegistry) fs.writeFileSync(registry, JSON.stringify({ goals: [] }));
   try {
     const r = runFlow(['approve', 'contract', feature]);
@@ -175,7 +177,8 @@ test('7. approve passes --registry to configure-goal', () => {
     const log = fs.readFileSync(calls, 'utf8');
     assert.match(log, /--registry .*configure-goal/);
   } finally {
-    if (!hadRegistry) fs.rmSync(registry, { force: true });
+    if (hadRegistry) fs.writeFileSync(registry, originalRegistry);
+    else fs.rmSync(registry, { force: true });
     cleanupCapsule(feature);
   }
 });

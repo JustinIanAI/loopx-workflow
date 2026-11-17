@@ -18,6 +18,16 @@ function setupMocks() {
 echo "$*" >> ${CALLS_LOG}
 args="$*"
 
+if [[ "$args" == *"agent-directory"* ]]; then
+  echo '{"ok":true,"registered_agent_count":1,"rows":[{"agent_id":"native-dispatch-agent","registered":true}]}'
+  exit 0
+fi
+
+if [[ "$args" == *"task-lease inspect"* ]]; then
+  echo '{"ok":true,"action":"inspect","active":false,"lease":null}'
+  exit 0
+fi
+
 if [[ "$args" == *"task-lease acquire"* ]]; then
   if [[ "\${MOCK_TASK_LEASE_FAIL:-}" == "1" ]]; then
     echo "[Mock LoopX] lease conflict: held by another agent" >&2
@@ -89,6 +99,7 @@ function runFlow(args, extraEnv = {}) {
     env: {
       ...process.env,
       PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
+      LOOPX_AGENT_ID: '',
       ...extraEnv
     }
   });
