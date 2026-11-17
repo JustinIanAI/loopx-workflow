@@ -50,7 +50,7 @@ while IFS= read -r jf; do
             JS_ERRORS=$((JS_ERRORS + 1))
         fi
     fi
-done < <(find "$PROJECT_ROOT/skills" "$PROJECT_ROOT/tests" -type f -name "*.js" 2>/dev/null)
+done < <(find "$PROJECT_ROOT/skills" "$PROJECT_ROOT/tests" "$PROJECT_ROOT/scripts" -type f -name "*.js" 2>/dev/null)
 
 if [[ $JS_ERRORS -eq 0 ]]; then
     echo -e "${GREEN}PASS${NC} (所有 JS 文件 AST 编译合法)"
