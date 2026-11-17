@@ -185,3 +185,42 @@ test('missing policy_revision fails closed when the runtime probe cannot supply 
   assert.match(got.error, /policy_revision/);
   assert.match(got.error, /fail-closed/);
 });
+
+test('env shebang python probe prefers sibling python next to CONDA_PREFIX loopx over PATH', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'issue19-sibling-py-'));
+  const condaBin = path.join(root, 'conda', 'bin');
+  const loopxBin = path.join(condaBin, 'loopx');
+  const siblingPy = path.join(condaBin, 'python3');
+  const pathBin = path.join(root, 'sysbin');
+  const sysPy = path.join(pathBin, 'python3');
+
+  writeExe(loopxBin, '#!/usr/bin/env -S python3\nimport sys\nsys.exit(1)\n');
+  writeExe(siblingPy, '#!/bin/bash\necho 26\nexit 0\n');
+  writeExe(sysPy, '#!/bin/bash\necho "wrong python" >&2\nexit 1\n');
+
+  const got = resolveReviewPolicyRevision({
+    packet: { pull_requests: [{ number: 7, head_oid: HEAD }] },
+    pr: 7,
+    headOid: HEAD,
+    loopxBin,
+    env: isolatedEnv({ PATH: pathBin, CONDA_PREFIX: path.join(root, 'conda') }),
+  });
+  assert.strictEqual(got.ok, true, got.error);
+  assert.strictEqual(got.revision, 26);
+  assert.match(got.source, /REVIEW_POLICY_REVISION/);
+});
+
+test('policyRevisionFromPacket ignores mismatched PRs in pull_requests instead of falling back to prs[0]', () => {
+  const got = resolveReviewPolicyRevision({
+    packet: {
+      pull_requests: [{ number: 1, head_oid: 'other', result_template: { review_policy_revision: 22 } }],
+    },
+    pr: 7,
+    headOid: HEAD,
+    loopxBin: '/nonexistent',
+    probe: () => ({ ok: true, revision: 26, source: 'probe' }),
+  });
+  assert.strictEqual(got.ok, true, got.error);
+  assert.strictEqual(got.revision, 26);
+  assert.strictEqual(got.source, 'probe');
+});

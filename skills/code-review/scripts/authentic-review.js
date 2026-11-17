@@ -306,10 +306,18 @@ function readShebangProgram(filePath) {
   }
 }
 
-function resolveShebangProgram(shebang, env) {
+function resolveShebangProgram(shebang, env, loopxBin) {
   const parts = String(shebang || '').split(/\s+/).filter(Boolean);
   if (!parts.length) return null;
-  if (path.basename(parts[0]) === 'env' && parts[1]) return findOnPath(parts[1], env.PATH);
+  if (path.basename(parts[0]) === 'env') {
+    const prog = parts.slice(1).find(arg => !arg.startsWith('-'));
+    if (!prog) return null;
+    if (loopxBin) {
+      const sibling = path.join(path.dirname(loopxBin), prog);
+      if (isExecutableFile(sibling)) return sibling;
+    }
+    return findOnPath(prog, env.PATH);
+  }
   return isExecutableFile(parts[0]) ? parts[0] : null;
 }
 
@@ -324,7 +332,7 @@ function clipDiag(text) {
 
 function probeLoopxPolicyRevision(loopxBin, env) {
   const attempts = [];
-  const interp = resolveShebangProgram(readShebangProgram(loopxBin), env || {});
+  const interp = resolveShebangProgram(readShebangProgram(loopxBin), env || {}, loopxBin);
   if (interp && /python/i.test(path.basename(interp))) {
     const r = sh(interp, ['-c', [
       'from loopx.capabilities.pr_review_queue.review_contract import REVIEW_POLICY_REVISION',
@@ -351,6 +359,15 @@ function matchPacketPullRequest(packet, pr, headOid) {
   return prs.find(p => `${p.number}@${String(p.head_oid || '').toLowerCase()}` === `${pr}@${head}`) || prs[0] || null;
 }
 
+function matchExactPacketPullRequest(packet, pr, headOid) {
+  const prs = packet && Array.isArray(packet.pull_requests) ? packet.pull_requests : [];
+  if (pr && headOid) {
+    const head = String(headOid).toLowerCase();
+    return prs.find(p => `${p.number}@${String(p.head_oid || '').toLowerCase()}` === `${pr}@${head}`) || null;
+  }
+  return prs.length === 1 ? prs[0] : null;
+}
+
 function policyRevisionFromPacket(packet, pr, headOid) {
   if (!packet || typeof packet !== 'object') return null;
   const contract = packet.agent_response_contract && packet.agent_response_contract.review_execution_contract;
@@ -361,7 +378,7 @@ function policyRevisionFromPacket(packet, pr, headOid) {
       source: 'agent_response_contract.review_execution_contract.policy_revision',
     };
   }
-  const match = matchPacketPullRequest(packet, pr, headOid);
+  const match = matchExactPacketPullRequest(packet, pr, headOid);
   if (!match) return null;
   const fromResult = parsePolicyRevision(match.result_template && match.result_template.review_policy_revision);
   if (fromResult) {
