@@ -73,10 +73,12 @@ exit 0
   try {
     const r = runFlow(['feature', feature]);
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
-    assert.strictEqual(fs.existsSync(path.join(PROJECT_ROOT, 'specs/features', feature, 'ACTIVE_STATE.md')), true);
+    assert.strictEqual(fs.existsSync(path.join(PROJECT_ROOT, '.loopx/goals', `${feature}-goal`, 'ACTIVE_GOAL_STATE.md')), true);
+    assert.strictEqual(fs.existsSync(path.join(PROJECT_ROOT, 'specs/features', feature, 'ACTIVE_STATE.md')), false);
   } finally {
     try { execSync(`git checkout ${originalBranch}`, { cwd: PROJECT_ROOT, stdio: 'ignore' }); } catch (_) {}
     try { execSync(`git branch -D feature/${feature}`, { cwd: PROJECT_ROOT, stdio: 'ignore' }); } catch (_) {}
+    fs.rmSync(path.join(PROJECT_ROOT, '.loopx/goals', `${feature}-goal`), { recursive: true, force: true });
     cleanupCapsule(feature);
   }
 });

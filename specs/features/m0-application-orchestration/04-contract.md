@@ -20,9 +20,13 @@
 
 ### 1.3 Gate2 `merge <pr> [feature]`
 - Mode A（`independent`）：非作者 APPROVED formal review 且 `commit_id==headRefOid`、`reviewDecision=APPROVED`、PR 非 Draft；readiness JSON `ready===true`。
-- Mode B（`single_owner`）：`<!-- loopx-flow:release-authorization:<pr>@<head> -->` 评论的 `head/contract_sha/principal/risk_acceptance` 与当前 PR 一致，且当前 head 存在 Agent review 证据；readiness 按 `blocking_reasons` 三档判定（允许列表 → 非 0；忽略列表 → 跳过；未知/缺失/解析失败 → 非 0）。
+- Mode B（`single_owner`）：`<!-- loopx-flow:release-authorization:<pr>@<head> -->` 评论的 `head/contract_sha/principal/risk_acceptance` 与当前 PR 一致，且当前 head 存在 Agent review 证据；readiness 按 `blocking_reasons` 三档判定（`repository_merge_state_blocked` 归入允许列表阻断，不忽略；忽略列表仅限 `current_head_review_missing_or_invalid`、`current_head_conclusion_not_approval`、`github_review_decision_not_approved`；未知/缺失/解析失败 → 非 0）。
 - 分支保护：`scripts/setup-branch-protection.sh --check --mode <mode>` 退出 0 才继续；required check context 固定 `Four Gates`。
 - 合入前二次读 HEAD；不一致非 0；已 MERGED 时只做前向补偿并对绕过路径记审计告警。
+
+### 1.6 运行态与归档快照边界（ADR-0008）
+- `cmd_feature` 将 `--state-file` 绑定至 `.loopx/goals/${goal_id}/ACTIVE_GOAL_STATE.md`（不落胶囊、不入 Git）。
+- `cmd_merge` / `cmd_archive` 归档时清理残留 `ACTIVE_STATE.md(.lock)`，并在 `specs/archive/<feature>/ACTIVE_STATE.snapshot.md` 生成只读历史快照（`historical_snapshot: true`）。
 
 ### 1.4 `release-approve <pr>`
 - 仅 `single_owner`；拒绝非 TTY、`--yes`、Draft、`principal != accepted_by`。

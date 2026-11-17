@@ -78,6 +78,10 @@ test('1. already MERGED: skip merge/readiness, compensate stop/retire/sync/archi
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     const calls = fs.readFileSync(CALLS, 'utf8');
     assert.doesNotMatch(calls, /pr merge/);
+    const snap = path.join(PROJECT_ROOT, 'specs/archive', feature, 'ACTIVE_STATE.snapshot.md');
+    assert.strictEqual(fs.existsSync(snap), true, 'archive must emit ACTIVE_STATE.snapshot.md');
+    assert.match(fs.readFileSync(snap, 'utf8'), /historical_snapshot.*true/);
+    assert.strictEqual(fs.existsSync(path.join(PROJECT_ROOT, 'specs/archive', feature, 'ACTIVE_STATE.md')), false, 'runtime ACTIVE_STATE.md must not remain in archive');
     assert.doesNotMatch(calls, /check-merge-readiness/);
     assert.match(calls, /goal-lifecycle/);
     assert.match(calls, /retire-global-goal/);

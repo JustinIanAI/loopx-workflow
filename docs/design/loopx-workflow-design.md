@@ -330,4 +330,4 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 - 改一条命令的失败条件：改 PRD 里对应 `REQ-*` 或新增编号，改本文矩阵的同一行，删掉与之矛盾的句子。不要在 README 再写一遍。
 - 退役一条命令：从 `usage()`、本文第 3 节和 PRD `REQ-FACADE-1` 一起删。
 - 不要把产品需求写回某个 `02-prd.md` 来“补充正文”。那个文件只加编号。
-- 仍暴露的 LoopX 原生命令封装按 issue #15 的清单逐步收敛；每关闭一条，同步更新本节、PRD `REQ-FACADE-*` 与 usage。
+- 仍暴露的 LoopX 原生命令封装按 issue #6 的清单逐步收敛；每关闭一条，同步更新本节、PRD `REQ-FACADE-*` 与 usage。

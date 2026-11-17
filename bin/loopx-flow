@@ -500,12 +500,12 @@ EVIEEOF
     echo -e "    ${GREEN}[✓] 已生成自包含资产包: specs/features/$feature/${NC}"
 
     echo -e "${BLUE}==> [3/3] 注册 LoopX Goal 实体与持久化状态 (Capsule State Bound)...${NC}"
-    local state_file="specs/features/$feature/ACTIVE_STATE.md"
+    local state_file=".loopx/goals/${goal_id}/ACTIVE_GOAL_STATE.md"
 
     if command -v loopx >/dev/null 2>&1; then
         # LoopX 2.0 只有在 --state-file 不存在时才会创建 canonical authority；
-        # 因此这里严禁在 bootstrap 前预创建 ACTIVE_STATE.md（issue #17）。
-        if ! loopx $REGISTRY_FLAG bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" --state-file "specs/features/$feature/ACTIVE_STATE.md"; then
+        # 因此这里严禁在 bootstrap 前预创建 state_file（issue #17 / ADR-0008 归 LoopX runtime）。
+        if ! loopx $REGISTRY_FLAG bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" --state-file "$state_file"; then
             echo -e "${RED}[-] [FAIL-CLOSED] 注册 LoopX Goal $goal_id 失败，流程已阻断！${NC}" >&2
             echo -e "💡 为什么阻断？目标实体注册失败将导致任务无法被正确追踪与审计。" >&2
             echo -e "🛠️ 修复指令: 运行 loopx doctor 排查本地注册表健康状态。" >&2
@@ -520,6 +520,7 @@ EVIEEOF
         fi
     else
         if [[ ! -f "$PROJECT_ROOT/$state_file" ]]; then
+            mkdir -p "$(dirname "$PROJECT_ROOT/$state_file")"
             cat << STATEEOF > "$PROJECT_ROOT/$state_file"
 # Active Goal State: $goal_id
 - **Feature**: $feature
@@ -835,8 +836,8 @@ mode_b_readiness_ok() {
     out="$(loopx $REGISTRY_FLAG pr-review --goal-id "$goal_id" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
     parsed="$(readiness_json_field "$out")" || return 1
     node -e '
-const allow = new Set(["pull_request_not_open","draft_pull_request","remote_head_mismatch","status_checks_missing","status_checks_failed","status_checks_pending","status_checks_incomplete","review_threads_incomplete","unresolved_review_threads","merge_state_requires_update","merge_state_unverified"]);
-const ignore = new Set(["current_head_review_missing_or_invalid","current_head_conclusion_not_approval","github_review_decision_not_approved","repository_merge_state_blocked"]);
+const allow = new Set(["pull_request_not_open","draft_pull_request","remote_head_mismatch","status_checks_missing","status_checks_failed","status_checks_pending","status_checks_incomplete","review_threads_incomplete","unresolved_review_threads","merge_state_requires_update","merge_state_unverified","repository_merge_state_blocked"]);
+const ignore = new Set(["current_head_review_missing_or_invalid","current_head_conclusion_not_approval","github_review_decision_not_approved"]);
 let d = {};
 try { d = JSON.parse(process.argv[1]); } catch (_) { process.exit(1); }
 const obs = (d.readiness_observation && typeof d.readiness_observation === "object") ? d.readiness_observation : {};
@@ -1353,7 +1354,7 @@ ${marker}"
     local existing_comment_id=""
     if [[ "${REVIEW_UPSERT_PUBLISH:-1}" == "1" ]]; then
         if existing_comment_id="$(gh api "repos/${repo}/issues/${pr_id}/comments?per_page=100" 2>/dev/null \
-            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const a=JSON.parse(d);const m=a.find(c=>c.body&&c.body.includes(process.argv[1]));process.stdout.write(m?String(m.id):'')}catch(_){process.stdout.write('')}}") "$marker" 2>/dev/null || true)"; then
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const a=JSON.parse(d);const m=a.find(c=>c.body&&c.body.includes(process.argv[1]));process.stdout.write(m?String(m.id):'')}catch(_){process.stdout.write('')}})" "$marker" 2>/dev/null || true)"; then
             if [[ -n "$existing_comment_id" ]]; then
                 echo -e "${YELLOW}[THROTTLE-UPSERT] 复用既有 respond comment id=${existing_comment_id}（PATCH 更新，不再新增）${NC}"
                 if gh api -X PATCH "repos/${repo}/issues/comments/${existing_comment_id}" -F body=@"$posted_file" >/dev/null 2>&1; then
@@ -1828,6 +1829,7 @@ cmd_merge() {
         if [[ -d "$PROJECT_ROOT/specs/features/$feature" ]]; then
             mkdir -p "$PROJECT_ROOT/specs/archive"
             if mv "$PROJECT_ROOT/specs/features/$feature" "$PROJECT_ROOT/specs/archive/$feature"; then
+                write_archive_state_snapshot "$feature" "$goal_id" "$PROJECT_ROOT/specs/archive/$feature"
                 step_names+=("archive"); step_states+=("done"); step_details+=("")
                 echo -e "    ${GREEN}[✓] 资产包已原子迁移至归档区: specs/archive/$feature/${NC}"
             else
@@ -1835,6 +1837,7 @@ cmd_merge() {
                 step_names+=("archive"); step_states+=("failed"); step_details+=("mv failed")
             fi
         elif [[ -d "$PROJECT_ROOT/specs/archive/$feature" ]]; then
+            write_archive_state_snapshot "$feature" "$goal_id" "$PROJECT_ROOT/specs/archive/$feature"
             step_names+=("archive"); step_states+=("skipped"); step_details+=("already archived")
             echo -e "    ${YELLOW}[i] 资产包已在归档区，跳过。${NC}"
         else
@@ -2024,6 +2027,64 @@ cmd_context() {
     fi
 }
 
+write_archive_state_snapshot() {
+    local feature="$1" goal_id="$2" archive_dir="$3"
+    local reg_file="${LOOPX_REGISTRY:-$PROJECT_ROOT/.loopx/registry.json}"
+    node -e '
+const fs = require("fs");
+const path = require("path");
+const [projectRoot, feature, goalId, archiveDir, regFile] = process.argv.slice(1);
+if (!fs.existsSync(archiveDir)) process.exit(0);
+let stateFile = "";
+let goalStatus = "stopped";
+try {
+  const reg = JSON.parse(fs.readFileSync(regFile, "utf8"));
+  const g = (reg.goals || []).find((item) => item && (item.id === goalId || item.goal_id === goalId || item.id === feature + "-feature"));
+  if (g) {
+    if (g.state_file) stateFile = g.state_file;
+    if (g.status) goalStatus = String(g.status);
+  }
+} catch (_) {}
+const candidates = [
+  stateFile ? (path.isAbsolute(stateFile) ? stateFile : path.join(projectRoot, stateFile)) : "",
+  path.join(projectRoot, ".loopx", "goals", goalId, "ACTIVE_GOAL_STATE.md"),
+  path.join(archiveDir, "ACTIVE_STATE.md")
+].filter(Boolean);
+let sourcePath = "";
+let raw = "";
+for (const p of candidates) {
+  if (fs.existsSync(p)) {
+    sourcePath = p;
+    raw = fs.readFileSync(p, "utf8");
+    break;
+  }
+}
+for (const stray of ["ACTIVE_STATE.md", "ACTIVE_STATE.md.lock"]) {
+  const p = path.join(archiveDir, stray);
+  if (fs.existsSync(p)) fs.rmSync(p, { force: true });
+}
+const snapPath = path.join(archiveDir, "ACTIVE_STATE.snapshot.md");
+const excerpt = raw ? raw.trim().split("\n").slice(0, 40).join("\n") : "_No runtime state file found at archive time._";
+const body = [
+  "# Historical Goal State Snapshot: " + goalId,
+  "",
+  "- **historical_snapshot**: `true`",
+  "- **authority**: `none (read-only archive snapshot; do not recover runtime authority from this file)`",
+  "- **feature**: `" + feature + "`",
+  "- **goal_id**: `" + goalId + "`",
+  "- **goal_status**: `" + goalStatus + "`",
+  "- **generated_at**: `" + new Date().toISOString() + "`",
+  "- **runtime_source**: `" + (sourcePath ? path.relative(projectRoot, sourcePath) : "not_found") + "`",
+  "",
+  "## State Summary",
+  "",
+  excerpt,
+  ""
+].join("\n");
+fs.writeFileSync(snapPath, body, "utf8");
+' "$PROJECT_ROOT" "$feature" "$goal_id" "$archive_dir" "$reg_file"
+}
+
 cmd_archive() {
     local feature="${1:-}"
     if [[ -z "$feature" ]]; then
@@ -2037,6 +2098,7 @@ cmd_archive() {
     if [[ -d "$source_dir" ]]; then
         mkdir -p "$PROJECT_ROOT/specs/archive"
         mv "$source_dir" "$archive_dir"
+        write_archive_state_snapshot "$feature" "${feature}-goal" "$archive_dir"
         echo -e "${GREEN}[✓] 特性 $feature 已成功归档至: specs/archive/$feature/${NC}"
     else
         echo -e "${YELLOW}未找到特性目录: $source_dir${NC}"

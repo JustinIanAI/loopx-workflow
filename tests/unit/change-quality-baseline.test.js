@@ -114,9 +114,19 @@ describe('discoverBaseRef：远程默认基线解析（GitHub Issue #13）', () 
 describe('ingest 适配器：--base-ref 透传与资格前置诊断', () => {
   test('prepare/record/verify 均收到解析出的 --base-ref origin/master', () => {
     const repo = makeTrunkRepo(['master']);
+    const gateFile = path.join(repo, '.loopx-gate-results.json');
+    fs.writeFileSync(gateFile, JSON.stringify({
+      schema_version: 'loopx_flow_gate_results_v0',
+      gates: [
+        { name: 'typecheck', command: 'npm run typecheck', exit_code: 0, status: 'passed' },
+        { name: 'lint', command: 'npm run lint', exit_code: 0, status: 'passed' },
+        { name: 'build', command: 'npm run build', exit_code: 0, status: 'passed' },
+        { name: 'test', command: 'npm run test', exit_code: 0, status: 'passed' }
+      ]
+    }));
     try {
       withMockLoopx(repo, REVIEW_REQUIRED, ({ env, logFile }) => {
-        const res = spawnSync(process.execPath, [INGEST_SCRIPT, '--goal-id', 'issue-13-goal'], {
+        const res = spawnSync(process.execPath, [INGEST_SCRIPT, '--goal-id', 'issue-13-goal', '--gate-results', gateFile], {
           cwd: repo, env, encoding: 'utf8',
         });
         assert.strictEqual(res.status, 0, `ingest 应通过: ${res.stderr}${res.stdout}`);

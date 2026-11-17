@@ -192,6 +192,7 @@ test('6. 已跟踪的 05-evidence 再 ingest 一次不得改字节', () => {
     fs.writeFileSync(path.join(dir, 'README.md'), '# stable\n');
     execSync('git add -A && git commit -qm init', { cwd: dir });
     const base = execSync('git rev-parse HEAD', { cwd: dir, encoding: 'utf8' }).trim();
+    execSync('git update-ref refs/remotes/origin/main HEAD', { cwd: dir });
     const mock = [
       '#!/usr/bin/env bash',
       'if [[ "$*" == *prepare* ]]; then',

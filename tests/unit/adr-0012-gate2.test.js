@@ -153,6 +153,16 @@ test('T8 Mode B readiness 命中允许列表 → merge 非 0', () => {
   } finally { h.cleanup(dir); }
 });
 
+test('T8b Mode B readiness 命中 repository_merge_state_blocked → merge 非 0（不再忽略）', () => {
+  const { dir, contractSha } = setup({ mode: 'single_owner', readiness: JSON.stringify({ blocking_reasons: ['repository_merge_state_blocked'] }) });
+  fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment(contractSha));
+  try {
+    const r = h.run(dir, ['merge', '1', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /repository_merge_state_blocked/);
+  } finally { h.cleanup(dir); }
+});
+
 test('T9 Mode B readiness blocking_reasons 缺失 → merge 非 0', () => {
   const { dir, contractSha } = setup({ mode: 'single_owner', readiness: JSON.stringify({ ready: true }) });
   fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment(contractSha));
