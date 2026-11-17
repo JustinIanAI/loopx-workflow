@@ -55,8 +55,14 @@ function isCommentOrAllowedTempApi(line) {
   ) {
     return true;
   }
-  // mktemp / os.tmpdir() / TMPDIR 是唯一命名的合规手段，允许出现在实现里。
-  return ALLOWED_HOST_TEMP_APIS.some((token) => trimmed.includes(token));
+  // os.tmpdir() / TMPDIR 是唯一命名的合规手段；mktemp 仅当模板本身不是硬编码 /tmp/ 固定路径时放行。
+  if (trimmed.includes('os.tmpdir') || trimmed.includes('TMPDIR')) {
+    return true;
+  }
+  if (trimmed.includes('mktemp')) {
+    return !HARDCODED_TMP_PATH.test(trimmed) || /XXXXXX/.test(trimmed);
+  }
+  return false;
 }
 
 test('1. 生产源码零硬编码 /tmp 固定文件名（静态治理扫描）', () => {
@@ -131,4 +137,21 @@ test('4. loopx-flow init 创建项目本地沙箱，PR 正文不再回退系统 
   assert.match(script, /LOOPX_TMP_DIR="\$\{LOOPX_TMP_DIR:-\$PROJECT_ROOT\/\.loopx\/tmp\}"/, '应支持 LOOPX_TMP_DIR 覆盖沙箱目录');
   assert.strictEqual(script.includes('${TMPDIR:-/tmp}'), false, 'PR 正文临时文件不得回退到系统 /tmp');
   assert.match(script, /mktemp "\$\{LOOPX_TMP_DIR\}\/pr-body-/, 'PR 正文必须落在项目沙箱内且文件名唯一');
+
+  // BSD mktemp (macOS) 要求模板末尾必须以 X 结尾，不能带 .log / .md 后缀。
+  const fastPush = fs.readFileSync(path.join(PROJECT_ROOT, 'scripts/fast-fix-push.sh'), 'utf8');
+  for (const [label, src] of [['bin/loopx-flow', script], ['scripts/fast-fix-push.sh', fastPush]]) {
+    const badTemplates = [...src.matchAll(/mktemp\s+(?:-d\s+)?["']([^"']*XXXXXX[^"']+)["']/g)]
+      .map((m) => m[1])
+      .filter((tpl) => !tpl.endsWith('X'));
+    assert.deepStrictEqual(badTemplates, [], `${label} 的 mktemp 模板必须以 X 结尾以兼容 macOS BSD mktemp`);
+  }
+
+  const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bsd-mktemp-probe-'));
+  try {
+    const res = spawnSync('mktemp', [path.join(probeDir, 'pr-body-test.XXXXXX')], { encoding: 'utf8' });
+    assert.strictEqual(res.status, 0, `宿主 mktemp 必须成功创建无后缀模板: ${res.stderr}`);
+  } finally {
+    fs.rmSync(probeDir, { recursive: true, force: true });
+  }
 });

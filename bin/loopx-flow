@@ -1564,7 +1564,7 @@ HELPTXT
 
             local tmp_body
             ensure_loopx_tmp_dir
-            tmp_body="$(mktemp "${LOOPX_TMP_DIR}/pr-body-${feature}-XXXXXX.md")"
+            tmp_body="$(mktemp "${LOOPX_TMP_DIR}/pr-body-${feature}.XXXXXX")"
             node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature" --output-file "$tmp_body"
 
             echo -e "${BLUE}==> [PR 提交] 正在通过 GitHub CLI 创建 PR (对齐 PR #7545 双语 4-Part 体系)...${NC}"
@@ -1602,7 +1602,7 @@ HELPTXT
 
             local tmp_body
             ensure_loopx_tmp_dir
-            tmp_body="$(mktemp "${LOOPX_TMP_DIR}/pr-body-${feature}-XXXXXX.md")"
+            tmp_body="$(mktemp "${LOOPX_TMP_DIR}/pr-body-${feature}.XXXXXX")"
             node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature" --output-file "$tmp_body"
 
             echo -e "${BLUE}==> [PR 更新] 正在更新 PR #${pr_id} 描述 (对齐 PR #7545 双语 4-Part 体系)...${NC}"
