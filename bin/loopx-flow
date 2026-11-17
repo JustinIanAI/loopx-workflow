@@ -2489,7 +2489,8 @@ NODE
 resolve_claim_owner() {
     local goal_id="$1"
     local page_dir cursor="" page_index=0 meta next_cursor
-    page_dir="$(mktemp -d "${TMPDIR:-/tmp}/loopx-flow-agents.XXXXXX")"
+    ensure_loopx_tmp_dir
+    page_dir="$(mktemp -d "${LOOPX_TMP_DIR}/loopx-flow-agents.XXXXXX")"
 
     while true; do
         page_index=$((page_index + 1))
