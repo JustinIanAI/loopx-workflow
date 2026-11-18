@@ -605,3 +605,52 @@ describe('R3 carryover integrity', () => {
     assert.ok(r.out.includes('NOT_VERIFIED') || r.out.includes('carryover status'));
   });
 });
+
+describe('P0-A1 gates env isolation', () => {
+  test('gates() strips cmd_review REVIEW_* throttle vars before spawning npm', () => {
+    const { isolatedGateEnv, gates } = require(SCRIPT);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'auth-gates-env-'));
+    const dumpFile = path.join(dir, 'env.log');
+    const mockNpm = path.join(dir, 'npm');
+    fs.writeFileSync(mockNpm, [
+      '#!/usr/bin/env bash',
+      'printf "%s:%s:%s:%s\\n" "${REVIEW_SHORTCIRCUIT:-UNSET}" "${REVIEW_DEBOUNCE_SECONDS:-UNSET}" "${REVIEW_UPSERT_PUBLISH:-UNSET}" "$*" >> ' + JSON.stringify(dumpFile),
+      'exit 0',
+    ].join('\n'), { mode: 0o755 });
+
+    const prevBin = process.env.AUTHENTIC_REVIEW_GATES_BIN;
+    process.env.AUTHENTIC_REVIEW_GATES_BIN = mockNpm;
+    try {
+      const clean = isolatedGateEnv({
+        PATH: process.env.PATH,
+        REVIEW_SHORTCIRCUIT: '1',
+        REVIEW_DEBOUNCE_SECONDS: '60',
+        REVIEW_UPSERT_PUBLISH: '1',
+        REVIEW_BACKOFF_BASE_MS: '1000',
+        REVIEW_MAX_RETRIES: '3',
+      });
+      assert.strictEqual(clean.REVIEW_SHORTCIRCUIT, undefined);
+      assert.strictEqual(clean.REVIEW_DEBOUNCE_SECONDS, undefined);
+      assert.strictEqual(clean.REVIEW_UPSERT_PUBLISH, undefined);
+      const res = gates({
+        noCache: true,
+        env: {
+          ...process.env,
+          REVIEW_SHORTCIRCUIT: '1',
+          REVIEW_DEBOUNCE_SECONDS: '60',
+          REVIEW_UPSERT_PUBLISH: '1',
+        },
+      });
+      assert.strictEqual(res.test, 'PASSED');
+      const lines = fs.readFileSync(dumpFile, 'utf8').trim().split('\n');
+      assert.strictEqual(lines.length, 4);
+      for (const line of lines) {
+        assert.match(line, /^UNSET:UNSET:UNSET:run (typecheck|lint|build|test)$/);
+      }
+    } finally {
+      if (prevBin === undefined) delete process.env.AUTHENTIC_REVIEW_GATES_BIN;
+      else process.env.AUTHENTIC_REVIEW_GATES_BIN = prevBin;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -212,8 +212,13 @@ function parseArgs(argv) {
   return o;
 }
 
-function sh(bin, args, timeoutMs) {
-  return spawnSync(bin, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs || 120000 });
+function sh(bin, args, timeoutMs, env) {
+  return spawnSync(bin, args, {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: timeoutMs || 120000,
+    ...(env ? { env } : {}),
+  });
 }
 
 // policy_revision 属于本机已安装 loopx 的运行时契约。禁止写死旧修订号，
@@ -516,16 +521,27 @@ function buildBody(feature, diff) {
 }
 
 let GATES_CACHE = null;
-function gates() {
-  if (GATES_CACHE) return GATES_CACHE;
+function isolatedGateEnv(baseEnv = process.env) {
+  const clean = { ...baseEnv };
+  delete clean.REVIEW_SHORTCIRCUIT;
+  delete clean.REVIEW_DEBOUNCE_SECONDS;
+  delete clean.REVIEW_UPSERT_PUBLISH;
+  delete clean.REVIEW_BACKOFF_BASE_MS;
+  delete clean.REVIEW_MAX_RETRIES;
+  return clean;
+}
+
+function gates(opts = {}) {
+  if (!opts.noCache && GATES_CACHE) return GATES_CACHE;
   const bin = process.env.AUTHENTIC_REVIEW_GATES_BIN || 'npm';
   const names = ['typecheck', 'lint', 'build', 'test'];
   const out = {};
+  const gateEnv = isolatedGateEnv(opts.env || process.env);
   for (const g of names) {
-    const r = sh(bin, ['run', g], 300000);
+    const r = sh(bin, ['run', g], 300000, gateEnv);
     out[g] = r.status === 0 ? 'PASSED' : `FAILED (exit ${r.status})`;
   }
-  GATES_CACHE = out;
+  if (!opts.noCache) GATES_CACHE = out;
   return out;
 }
 
@@ -1344,4 +1360,6 @@ module.exports = {
   parsePolicyRevision,
   resolveLoopxExecutable,
   resolveReviewPolicyRevision,
+  isolatedGateEnv,
+  gates,
 };
