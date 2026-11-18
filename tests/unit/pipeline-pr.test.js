@@ -5,7 +5,7 @@ const path = require('node:path');
 const { spawnSync, execSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const h = require('./helpers/m0-sandbox');
-const { detachRepoConfig } = require('./helpers/repo-isolation');
+const { detachRepoConfig, withoutRepoConfig } = require('./helpers/repo-isolation');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
@@ -122,6 +122,13 @@ if [[ "$args" == *"change-quality verify"* ]]; then
   exit 0
 fi
 
+if [[ "$args" == *"todo list"* ]]; then
+  if [[ -f "${MOCK_BIN_DIR}/user-gate-todos.json" ]]; then
+    cat "${MOCK_BIN_DIR}/user-gate-todos.json"
+    exit 0
+  fi
+fi
+
 echo "[Mock LoopX] $args"
 exit 0
 `;
@@ -170,9 +177,6 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
   const currentHeadSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
   setupMockGh(currentHeadSha);
   setupMockLoopx();
-  // e2e 覆盖 feature/check/review/legacy merge 接线；临时移开仓库级授权配置，
-  // Gate1/Gate2 模式行为由 adr-0009 / adr-0012 专项测试覆盖。
-  const restoreConfig = detachRepoConfig();
 
   const testEnv = {
     ...process.env,
@@ -210,6 +214,21 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
 
     // 3. Step 3: Run Quality Gate Check and Review Ingestion
     registerE2eGoal(featureDir);
+    const cfg = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'loopx-workflow.config.json'), 'utf8'));
+    const acc = cfg.single_owner_risk_acceptance || { accepted_by: 'JustinIanAI', accepted_at: '2026-11-12T09:43:44Z' };
+    const contractSha = crypto.createHash('sha256').update(fs.readFileSync(contractPath)).digest('hex');
+    const gate1Ev = cfg.authorization_mode === 'single_owner'
+      ? `authorization_mode=single_owner;contract_sha=${contractSha};spec_commit=${currentHeadSha};feature=${featureName};principal=${acc.accepted_by};risk_acceptance=${acc.accepted_by}@${acc.accepted_at}`
+      : `authorization_mode=${cfg.authorization_mode};contract_sha=${contractSha};spec_commit=${currentHeadSha};feature=${featureName};principal=reviewer`;
+    fs.writeFileSync(path.join(MOCK_BIN_DIR, 'user-gate-todos.json'), JSON.stringify({
+      todos: [{
+        task_class: 'user_gate',
+        decision_outcome: 'approve',
+        decision_scope: { scope_key: contractSha },
+        superseded_by: null,
+        evidence: gate1Ev
+      }]
+    }));
     console.log('[Test E2E] 3. Running loopx-flow check...');
     const checkRes = spawnSync(LOOPX_FLOW, ['check', featureName], {
       encoding: 'utf8',
@@ -229,10 +248,10 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
 
     // 5. Step 5: Checkpoint 2 Merge Verification & Atomic Archival
     console.log('[Test E2E] 5. Running loopx-flow merge for PR #101...');
-    const mergeRes = spawnSync(LOOPX_FLOW, ['merge', '101', featureName], {
+    const mergeRes = withoutRepoConfig(() => spawnSync(LOOPX_FLOW, ['merge', '101', featureName], {
       encoding: 'utf8',
       env: testEnv
-    });
+    }));
     assert.strictEqual(mergeRes.status, 0, `Merge must succeed: ${mergeRes.stderr}`);
     assert.strictEqual(mergeRes.stdout.includes('GitHub 审查决议确认: APPROVED'), true);
     assert.strictEqual(mergeRes.stdout.includes('GitHub PR 已成功 Squash 合入主干'), true);
@@ -245,7 +264,6 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
     console.log('[Test E2E] 6. End-to-end PR Review & Merge pipeline simulation completed successfully!');
   } finally {
     cleanupMockGh();
-    restoreConfig();
     if (hadReg && originalReg !== null) fs.writeFileSync(REG_PATH, originalReg);
     else if (!hadReg && fs.existsSync(REG_PATH)) fs.unlinkSync(REG_PATH);
     if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });

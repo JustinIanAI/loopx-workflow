@@ -52,7 +52,7 @@ function setup(opts = {}) {
     '  if [[ "$args" == *"headRefOid"* ]]; then echo "' + head + '"; exit 0; fi',
     '  exit 0',
     'fi',
-    'if [[ "$1" == "pr" && "$2" == "merge" ]]; then echo "merged" >> "' + files.mergeLog + '"; exit 0; fi',
+    'if [[ "$1" == "pr" && "$2" == "merge" ]]; then echo "merged $*" >> "' + files.mergeLog + '"; exit 0; fi',
     'if [[ "$1" == "api" && "$2" == *"/issues/"* && "$2" == *"/comments"* ]]; then cat "' + files.comments + '"; exit 0; fi',
     'if [[ "$1" == "api" && "$2" == *"/pulls/"* && "$2" == *"/reviews"* ]]; then cat "' + files.pullReviews + '"; exit 0; fi',
     'exit 0'
@@ -293,4 +293,37 @@ test('set -u 下无参调用 status --next / release-approve 不会报 unbound v
   assert.strictEqual(r2.status, 1);
   assert.doesNotMatch(r2.stderr, /unbound variable/i);
   assert.match(r2.stderr, /请指定 PR 编号/);
+});
+
+test('P0-B：gh pr merge 携带 --match-head-commit，single_owner 校验操作者与 read -r 交互确认', () => {
+  const { dir, contractSha } = setup({
+    mode: 'single_owner',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment(contractSha));
+  try {
+    const r = h.run(dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    const mergeLog = fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8');
+    assert.match(mergeLog, new RegExp(`--match-head-commit ${HEAD}`));
+  } finally { h.cleanup(dir); }
+
+  // Operator login != accepted_by must fail closed in single_owner merge
+  const mismatch = setup({
+    mode: 'single_owner',
+    login: 'someone-else',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  fs.writeFileSync(path.join(mismatch.dir, 'comments.json'), releaseComment(mismatch.contractSha));
+  try {
+    const r = h.run(mismatch.dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /操作者身份校验失败/);
+    assert.strictEqual(fs.readFileSync(path.join(mismatch.dir, 'gh-merge.log'), 'utf8'), '');
+  } finally { h.cleanup(mismatch.dir); }
+
+  // P2-1 source invariant: single_owner approve & release-approve enforce explicit read -r prompt
+  const flowSrc = fs.readFileSync(path.join(h.PROJECT_ROOT, 'bin/loopx-flow'), 'utf8');
+  assert.match(flowSrc, /签署 Gate1 契约授权[\s\S]*read -r confirm_reply/);
+  assert.match(flowSrc, /签发 Gate2 发布授权[\s\S]*read -r confirm_reply/);
 });

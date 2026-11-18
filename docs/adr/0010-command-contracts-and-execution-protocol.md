@@ -75,3 +75,18 @@ DB6 已决议：保留场景命令门面，但每条命令必须是「研发最�
 - 不新增第二状态库/checkpoint 日志；不改 LoopX 原生判定。
 - 不改变现有命令的退出码契约（0/非 0）；六结果是语义视图。
 - 不处理 Gate1/Gate2 授权实现细节（ADR-0009/0012）。
+
+---
+
+## 增补决策：`REQ-LEASE-1` Todo 租约身份解析、代际幂等键与 `todo done` 释放契约（原 Issue #12 / P0-B 收敛）
+
+1. **`todo claim` 已注册身份解析（`resolve_claim_owner`）**：
+   - 申领前必须完整分页读取 `loopx agent-directory --format json`（跟随 `next_cursor` 直到无下一页；检测重复/停滞游标与 `registered_agent_count` 不一致并立即 fail-closed）。
+   - 仅将 `registered: true` 的 `agent_id` 视为合法 owner；设置 `LOOPX_AGENT_ID` 时必须折叠匹配到已注册身份并按注册表拼写传递，未设置时仅当恰好存在 1 个已注册身份才自动选用；缺失或歧义时直接阻断并打印可执行 `loopx register-agent ... --execute` 修复指令。
+2. **代际隔离与 public-safe SHA256 幂等键（`claim_idempotency_key`）**：
+   - 未传 `--idempotency-key` 时先调用 `task-lease inspect`：无租约记录生成 `loopx-flow:claim:<sha256(goal_id\ntodo_id\nowner)>`；存在有效且同 owner 的活动租约（`task_lease_v0`、`active`、未过期）时复用其 `idempotency_key`；已过期/已释放或异主租约则按 `(goal_id, todo_id, owner, lease_epoch, version, next)` 生成下一代 SHA256 幂等键，避免 `idempotency_key_reuse`。
+   - 显式传入 `--idempotency-key` 时原样透传并校验 LoopX public-safe token 语法。
+3. **`todo done` 先检后改与安全释放（P0-B / P1-3）**：
+   - 未传 `--owner`/`--agent-id` 时复用 `resolve_claim_owner` 解析已注册身份，禁止回退硬编码默认名。
+   - 必须在调用 `loopx todo --status done` **之前**先执行 `task-lease inspect`：校验 `lease_version` 存在且（若租约仍为 `active`）持有者与当前身份一致，防止 Todo 已被标为 `done` 而后续租约释放失败。
+   - 释放租约的默认幂等键同样采用 public-safe SHA256：`loopx-flow:release:<sha256(goal_id\ntodo_id\nowner\nlease_version)>`，再依次执行 `todo --status done` 与 `task-lease release --expected-version <lease_version>`。

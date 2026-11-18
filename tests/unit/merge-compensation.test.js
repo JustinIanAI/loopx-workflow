@@ -2,8 +2,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, execSync } = require('node:child_process');
 const { withoutRepoConfig } = require('./helpers/repo-isolation');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
@@ -161,4 +162,74 @@ test('7. OPEN without APPROVED: fail before merge', () => {
     const calls = fs.readFileSync(CALLS, 'utf8');
     assert.doesNotMatch(calls, /pr merge/);
   } finally { cleanup(feature); }
+});
+
+test('8. P0-B：真实 git-sync 归档先 pull main 再 git mv，远端拦截直推 main 时自动建 chore/archive PR 且不留双份目录', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-p0b-archive-'));
+  const remote = path.join(root, 'remote.git');
+  const seed = path.join(root, 'seed');
+  const work = path.join(root, 'work');
+  const mockBin = path.join(root, 'mockbin');
+  const feature = 'p0b-archive-demo';
+  try {
+    execSync(`git init --bare -q -b main "${remote}"`);
+    execSync(`git clone -q "${remote}" "${seed}"`);
+    execSync('git config user.email t@example.com && git config user.name test', { cwd: seed });
+    fs.mkdirSync(path.join(seed, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(seed, 'scripts'), { recursive: true });
+    fs.copyFileSync(LOOPX_FLOW, path.join(seed, 'bin/loopx-flow'));
+    fs.chmodSync(path.join(seed, 'bin/loopx-flow'), 0o755);
+    fs.writeFileSync(path.join(seed, 'README.md'), '# seed\n');
+    execSync('git add -A && git commit -qm init && git push -q -u origin main', { cwd: seed });
+
+    execSync(`git clone -q "${remote}" "${work}"`);
+    execSync('git config user.email t@example.com && git config user.name test', { cwd: work });
+    execSync(`git checkout -qb "feature/${feature}"`, { cwd: work });
+
+    // Simulate PR #14 merge having landed specs/features/<feature> onto origin/main
+    fs.mkdirSync(path.join(seed, 'specs/features', feature), { recursive: true });
+    fs.writeFileSync(path.join(seed, 'specs/features', feature, '00-INDEX.md'), '# demo capsule\n');
+    execSync('git add -A && git commit -qm "squash feature onto main" && git push -q origin main', { cwd: seed });
+
+    // Bare-repo pre-receive hook blocks direct push to refs/heads/main (simulating enforce_admins)
+    const hookPath = path.join(remote, 'hooks/pre-receive');
+    fs.writeFileSync(hookPath, '#!/usr/bin/env bash\nwhile read o n ref; do\n  if [[ "$ref" == "refs/heads/main" ]]; then echo "protected main" >&2; exit 1; fi\ndone\n', { mode: 0o755 });
+
+    fs.mkdirSync(mockBin, { recursive: true });
+    const prLog = path.join(root, 'pr-create.log');
+    fs.writeFileSync(path.join(mockBin, 'gh'), `#!/usr/bin/env bash
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
+  if [[ "$*" == *"state,mergedAt,reviewDecision"* ]]; then
+    echo "MERGED%2026-11-18T00:00:00Z%APPROVED%${'a'.repeat(40)}%feature/${feature}%main"
+    exit 0
+  fi
+  echo "${'a'.repeat(40)}"; exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "create" ]]; then
+  echo "$*" >> "${prLog}"
+  echo "https://github.com/owner/repo/pull/999"
+  exit 0
+fi
+exit 0
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(mockBin, 'loopx'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+
+    const r = spawnSync(path.join(work, 'bin/loopx-flow'), ['merge', '88', feature], {
+      cwd: work,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${mockBin}:${process.env.PATH}` },
+    });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /已创建归档 PR: https:\/\/github\.com\/owner\/repo\/pull\/999/);
+    assert.match(fs.readFileSync(prLog, 'utf8'), new RegExp(`--head chore/archive-${feature}`));
+    // Local main is reset back to origin/main without leaving duplicate features+archive dirs
+    assert.strictEqual(fs.existsSync(path.join(work, 'specs/archive', feature)), false);
+    const remoteBranches = execSync(`git --git-dir="${remote}" branch`, { encoding: 'utf8' });
+    assert.match(remoteBranches, new RegExp(`chore/archive-${feature}`));
+    const archivedTree = execSync(`git --git-dir="${remote}" ls-tree -r --name-only "chore/archive-${feature}" specs/`, { encoding: 'utf8' });
+    assert.match(archivedTree, new RegExp(`specs/archive/${feature}/ACTIVE_STATE\\.snapshot\\.md`));
+    assert.doesNotMatch(archivedTree, new RegExp(`specs/features/${feature}/`));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const HOOK_SCRIPT = path.join(PROJECT_ROOT, 'scripts/git-hooks/pre-commit');
-const { withoutRepoConfig } = require('./helpers/repo-isolation');
+const CONFIG_PATH = path.join(PROJECT_ROOT, 'loopx-workflow.config.json');
 
 test('1. Stage Signature Gate: decisions check in specs/features/<feat>/01-decisions.md', () => {
   // Test non-existent feature
@@ -51,11 +51,30 @@ test('2. Stage Signature Gate: contract check in specs/features/<feat>/04-contra
   fs.writeFileSync(regPath, JSON.stringify(reg, null, 2));
 
   // Test feature with FROZEN & APPROVED marker in 04-contract.md
-  const resApproved = withoutRepoConfig(() => spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'hard-guard'], {
-    encoding: 'utf8',
-    env: { ...process.env, LOOPX_REGISTRY: regPath },
+  const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  const acc = cfg.single_owner_risk_acceptance || { accepted_by: 'JustinIanAI', accepted_at: '2026-11-12T09:43:44Z' };
+  const evidence = cfg.authorization_mode === 'single_owner'
+    ? `authorization_mode=single_owner;contract_sha=${contractSha};spec_commit=${'b'.repeat(40)};feature=hard-guard;principal=${acc.accepted_by};risk_acceptance=${acc.accepted_by}@${acc.accepted_at}`
+    : `authorization_mode=${cfg.authorization_mode};contract_sha=${contractSha};spec_commit=${'b'.repeat(40)};feature=hard-guard;principal=reviewer`;
+  const mockBin = path.join(tmpDir, 'bin');
+  fs.mkdirSync(mockBin, { recursive: true });
+  const todosFile = path.join(tmpDir, 'todos.json');
+  fs.writeFileSync(todosFile, JSON.stringify({
+    todos: [{
+      task_class: 'user_gate',
+      decision_outcome: 'approve',
+      decision_scope: { scope_key: contractSha },
+      superseded_by: null,
+      evidence
+    }]
   }));
-  assert.strictEqual(resApproved.status, 0, 'Approved contract file must pass gate check');
+  fs.writeFileSync(path.join(mockBin, 'loopx'), `#!/usr/bin/env bash\nif [[ "$*" == *"todo list"* ]]; then cat "${todosFile}"; exit 0; fi\nexit 0\n`, { mode: 0o755 });
+
+  const resApproved = spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'hard-guard'], {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${mockBin}:${process.env.PATH}`, LOOPX_REGISTRY: regPath },
+  });
+  assert.strictEqual(resApproved.status, 0, `Approved contract file must pass gate check: ${resApproved.stderr}`);
 });
 
 test('3. Pre-commit hook: must reject commit if on main branch', () => {
