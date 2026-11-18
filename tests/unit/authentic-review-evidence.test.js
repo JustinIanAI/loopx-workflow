@@ -9,10 +9,12 @@ const {
   buildValidationMatrix,
   describeFileFromDiff,
   scanDiff,
+  formatDiffForPrompt,
 } = require('../../skills/code-review/scripts/evidence-builder.js');
 const {
   buildNativePrompt,
   finalizeReviewBody,
+  capVerdictInBody,
 } = require('../../skills/code-review/scripts/authentic-review.js');
 
 const DIFF = [
@@ -424,4 +426,149 @@ test('scanDiff finds high-signal additions only', () => {
   assert.ok(findings.some(f => f.rule === 'dynamic-eval'));
   assert.ok(findings.some(f => f.rule === 'tracked-todo'));
   assert.strictEqual(findings.filter(f => f.rule === 'tracked-todo').length, 1);
+});
+
+test('formatDiffForPrompt preserves tail test files and file inventory when diff exceeds maxChars (P0-A2)', () => {
+  const hugeProd = [
+    'diff --git a/bin/huge-prod.js b/bin/huge-prod.js',
+    '--- a/bin/huge-prod.js',
+    '+++ b/bin/huge-prod.js',
+    '@@ -1,1 +1,5000 @@',
+    ...Array.from({ length: 4500 }, (_, i) => `+const line_${i} = "padding_payload_${'x'.repeat(50)}";`),
+  ].join('\n');
+  const tailTest = [
+    'diff --git a/tests/unit/tail-invariant.test.js b/tests/unit/tail-invariant.test.js',
+    '--- /dev/null',
+    '+++ b/tests/unit/tail-invariant.test.js',
+    '@@ -0,0 +1,4 @@',
+    '+const test = require("node:test");',
+    '+test("tail invariant preserved", () => {});',
+  ].join('\n');
+  const full = `${hugeProd}\n${tailTest}`;
+  assert.ok(full.length > 240000);
+  const formatted = formatDiffForPrompt(full, 240000);
+  assert.match(formatted, /Diff File Inventory/);
+  assert.match(formatted, /bin\/huge-prod\.js/);
+  assert.match(formatted, /tests\/unit\/tail-invariant\.test\.js/);
+  assert.match(formatted, /tail invariant preserved/);
+  assert.match(formatted, /FILE_DIFF_COMPACTED/);
+  assert.ok(formatted.length <= 240000);
+
+  const manySmall = Array.from({ length: 50 }, (_, i) => [
+    `diff --git a/src/mod-${i}.js b/src/mod-${i}.js`,
+    `--- a/src/mod-${i}.js`,
+    `+++ b/src/mod-${i}.js`,
+    '@@ -1,1 +1,10 @@',
+    `+const x${i} = "${'a'.repeat(1800)}";`,
+  ].join('\n')).join('\n');
+  const bounded = formatDiffForPrompt(manySmall, 72000);
+  assert.ok(bounded.length <= 72000, `expected <= 72000, got ${bounded.length}`);
+});
+
+test('buildValidationMatrix maps remoteChecks into repository_required_checks and diagnostic rows (P0-A2)', () => {
+  const rows = buildValidationMatrix(
+    { typecheck: 'PASSED', lint: 'PASSED', build: 'PASSED', test: 'PASSED' },
+    {
+      headOid: 'd'.repeat(40),
+      remoteChecks: [
+        { name: 'Four Gates', state: 'SUCCESS', bucket: 'pass' },
+        { name: 'Optional Canary', state: 'PENDING', bucket: 'pending' },
+      ],
+    },
+  );
+  const repoRow = rows.find(r => r.case_id === 'repository_required_checks');
+  assert.strictEqual(repoRow.status, 'passed');
+  assert.match(repoRow.command_or_check, /gh pr checks/);
+  assert.match(repoRow.result, /Four Gates=pass/);
+  const diagRow = rows.find(r => r.case_id === 'remote_check_optional_canary');
+  assert.ok(diagRow);
+  assert.strictEqual(diagRow.required, false);
+  assert.strictEqual(diagRow.status, 'pending');
+});
+
+test('buildNativePrompt includes nested evidence specs, remote checks, and capVerdictInBody swaps author-owned title (P0-A2)', () => {
+  const prompt = buildNativePrompt({
+    pr: 24,
+    headOid: 'e'.repeat(40),
+    branch: 'fix/issue-24',
+    motivation: 'fix prompt alignment',
+    reviewTemplate: { sections: [], output_hint: '' },
+    reviewPlan: { required_evidence_ids: ['problem_context', 'change_proportionality', 'observable_semantics', 'semantic_alignment', 'validation_matrix'] },
+    evidenceCommands: [],
+    evidenceText: '',
+    diff: 'diff --git a/a.js b/a.js\n+const x = 1;',
+    priorFindings: [],
+    remoteChecks: [{ name: 'Four Gates', state: 'SUCCESS', bucket: 'pass' }],
+    evidenceContract: {
+      evidence_requirements: [
+        {
+          evidence_id: 'problem_context',
+          fields: ['goal_basis', 'outcome_impact', 'spec_basis'],
+          verdict_values: ['goal_achieved', 'justified_increment'],
+          fields_by_verdict: { justified_increment: ['remaining_gap'] },
+          outcome_impact: { dimensions: ['long_horizon', 'user_experience'], fields: ['decision', 'reason'], decision_values: ['improved'], applicable_fields: ['before_after', 'evidence_refs'], visual_review: { fields: ['decision', 'reason'], decision_values: ['not_applicable', 'inspected'], applicable_fields: ['unverified_scope'] } },
+        },
+        {
+          evidence_id: 'change_proportionality',
+          fields: ['architecture_assessment', 'verdict'],
+          verdict_values: ['proportionate'],
+          architecture_assessment: { fields: ['decision', 'reason'], decision_values: ['retain'], applicable_fields: ['mechanisms'], mechanism_fields: ['mechanism'], responsibility_values: ['invariant'] },
+        },
+        {
+          evidence_id: 'observable_semantics',
+          fields: ['scope_coverage', 'decision_text_assessment', 'verdict'],
+          verdict_values: ['equivalent'],
+          scope_coverage: { fields: ['decision', 'reason'], decision_values: ['not_applicable'], applicable_fields: ['cases'], case_ids: ['covered_subject'], case_fields: ['case_id'], case_statuses: ['passed'] },
+          decision_text_assessment: { fields: ['verdict', 'checked_scope', 'reason'], verdict_values: ['not_applicable', 'intentional_change_validated'], fields_by_verdict: { intentional_change_validated: ['authorization_basis'] }, applicable_fields: ['clause_comparisons'], clause_fields: ['baseline_clause'], counterfactual_fields: ['status'] },
+        },
+        {
+          evidence_id: 'semantic_alignment',
+          fields: ['checked_scope', 'impact_reason', 'verdict'],
+          verdict_values: ['aligned', 'not_applicable'],
+          candidate_decisions: ['reuse_existing', 'local_only'],
+        },
+      ],
+    },
+  });
+  assert.match(prompt, /outcome_impact\.user_experience\.visual_review/);
+  assert.match(prompt, /spec_basis \(object\)/);
+  assert.match(prompt, /symbol_or_path, validation_ref/);
+  assert.match(prompt, /architecture_assessment \(object\)/);
+  assert.match(prompt, /scope_coverage \(object\)/);
+  assert.match(prompt, /intentional_change_validated=\[authorization_basis\]/);
+  assert.match(prompt, /candidate_decisions: reuse_existing\|local_only/);
+  assert.match(prompt, /Four Gates.*bucket=pass/);
+
+  const approvedBody = finalizeReviewBody([
+    '## 动机\n修复问题\n## 改动思路\n方案\n## 具体改动\n### 关键代码讲解\n代码\n## 对主干的风险\n无\n## 我的整体评价\n好',
+  ].join('\n'), {
+    headOid: 'e'.repeat(40),
+    verdict: 'APPROVE',
+    reviewer: { declared_model: 'codex', declared_provider: 'openai', declaration_source: 'self_reported' },
+    motivation: '',
+    authorOwned: true,
+    problemContext: {
+      affected_caller_or_operator: 'caller',
+      before_after_scenario: 'before/after',
+      observable_outcome: 'outcome',
+      non_goals: 'non-goals',
+      outcome_impact: {
+        user_experience: {
+          visual_review: { decision: 'inspected', reason: 'checked page layout', unverified_scope: 'none' },
+        },
+      },
+      spec_basis: {
+        decision: 'mapped',
+        spec_ref: 'docs/adr/0010.md',
+        spec_revision: 'f'.repeat(40),
+        criteria: [{ criterion_id: 'REQ-REVIEW-1' }],
+      },
+    },
+  });
+  assert.match(approvedBody, /checked page layout/);
+  assert.match(approvedBody, /REQ-REVIEW-1/);
+  const capped = capVerdictInBody(approvedBody, { authorOwned: true });
+  assert.doesNotMatch(capped, /Approval conclusion \(author-owned PR/);
+  assert.match(capped, /Request changes conclusion \(author-owned PR/);
+  assert.match(capped, /^English verdict:\s*REQUEST_CHANGES\s*$/m);
 });
