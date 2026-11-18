@@ -1167,7 +1167,8 @@ cmd_check() {
     fi
 
     echo -e "${BOLD}[1/3] 正在运行本地四大硬门禁 (Typecheck, Lint, Build, Test)...${NC}"
-    gate_results_file="$(mktemp "${TMPDIR:-/tmp}/loopx-flow-gate-results.XXXXXX")"
+    ensure_loopx_tmp_dir
+    gate_results_file="$(mktemp "${LOOPX_TMP_DIR}/loopx-flow-gate-results.XXXXXX")"
     trap 'rm -f -- "$gate_results_file"' EXIT
     node -e '
 const fs = require("fs");
