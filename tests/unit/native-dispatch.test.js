@@ -138,7 +138,7 @@ test('1. Todo lease claim: must acquire exclusive lease via task-lease acquire a
   }
 });
 
-test('2. Todo lease done: must complete todo then release the lease', () => {
+test('2. Todo lease done: must inspect lease and resolve owner before todo done, then release with SHA256 key', () => {
   cleanupMocks();
   setupMocks();
 
@@ -146,13 +146,21 @@ test('2. Todo lease done: must complete todo then release the lease', () => {
     const res = runFlow(['todo', 'done', 'todo_ab12cd34ef56', '--goal-id', 'native-dispatch-deep-integration-goal']);
     assert.strictEqual(res.status, 0, `done must succeed: ${res.stderr}`);
     const calls = fs.readFileSync(CALLS_LOG, 'utf8').trim().split('\n');
-    const completeCall = calls.find(c => c.includes('--status done'));
-    const releaseCall = calls.find(c => c.includes('task-lease release'));
-    assert.ok(completeCall, `must call todo --status done, got: ${calls.join(' | ')}`);
-    assert.ok(releaseCall, `must call task-lease release, got: ${calls.join(' | ')}`);
+    const agentIdx = calls.findIndex(c => c.includes('agent-directory'));
+    const inspectIdx = calls.findIndex(c => c.includes('task-lease inspect'));
+    const completeIdx = calls.findIndex(c => c.includes('--status done'));
+    const releaseIdx = calls.findIndex(c => c.includes('task-lease release'));
+    assert.ok(agentIdx >= 0, `must resolve registered owner via agent-directory, got: ${calls.join(' | ')}`);
+    assert.ok(inspectIdx >= 0, `must inspect lease before todo done, got: ${calls.join(' | ')}`);
+    assert.ok(completeIdx > inspectIdx, `task-lease inspect must precede todo --status done, got: ${calls.join(' | ')}`);
+    assert.ok(releaseIdx > completeIdx, `todo --status done must precede task-lease release, got: ${calls.join(' | ')}`);
+    const completeCall = calls[completeIdx];
+    const releaseCall = calls[releaseIdx];
     assert.strictEqual(completeCall.includes('--todo-id todo_ab12cd34ef56'), true, 'complete must target the todo');
     assert.strictEqual(releaseCall.includes('--todo-id todo_ab12cd34ef56'), true, 'release must target the todo');
+    assert.strictEqual(releaseCall.includes('--owner native-dispatch-agent'), true, 'release must use resolved registered owner');
     assert.strictEqual(releaseCall.includes('--expected-version 1'), true, 'release must use inspect version CAS');
+    assert.match(releaseCall, /--idempotency-key loopx-flow:release:[0-9a-f]{64}/, 'release must use public-safe SHA256 idempotency key');
   } finally {
     cleanupMocks();
   }

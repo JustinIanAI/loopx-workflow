@@ -64,3 +64,14 @@
 - 不改变 LoopX Receipt schema；只在 Workflow 证据索引层扩展字段。
 - 不新建质量引擎或第二套 blocker 判定。
 - 不在本 ADR 实现代码（M4 落地）。
+
+---
+
+## 增补决策：`REQ-QUALITY-3` `change-quality` 基线动态解析与 Goal 资格前置诊断（原 Issue #13 收敛）
+
+1. **单一基线解析源（`discoverBaseRef()`）**：
+   - 以 `skills/code-review/scripts/ingest-to-loopx-quality.js#discoverBaseRef()` 作为唯一基线解析入口，按 `origin/HEAD` → `origin/main` → `origin/master` 顺序解析当前仓库真实存在的远程默认主干；`bin/loopx-flow` 通过 Node 调用该函数，禁止另写第二套解析逻辑或硬编码 `origin/main`。
+   - 将解析得到的 `--base-ref` 显式透传给 `loopx change-quality prepare / record / verify` 与 OCR 审计脚本；三种基线均不存在时立即非 0 并提示 `git fetch origin && git remote set-head origin -a`。
+2. **Goal 资格前置 Fail-Closed 与 `doctor` 诊断**：
+   - `check` 在运行质量链路前置检查 `prepare` 返回的 `status === "disabled"` 或 `policy.enabled === false` 时立即 fail-closed，避免跑完耗时的测试后再在 `record` 阶段失败。
+   - `doctor` 对同款资格状态保持非阻断 `WARN`，两者统一给出带 `--execute` 的可执行修复指令：`loopx configure-goal --goal-id <goal> --change-quality-enabled --execute`。

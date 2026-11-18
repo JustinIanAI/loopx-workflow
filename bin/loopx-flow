@@ -617,28 +617,35 @@ gate1_spec_complete() {
     local contract="$PROJECT_ROOT/specs/features/$feature/04-contract.md"
     local stories="$PROJECT_ROOT/specs/features/$feature/03-stories.md"
     [[ -f "$contract" ]] || return 1
-    grep -qi 'AC' "$contract" || return 1
-    grep -qi 'Scope' "$contract" || return 1
-    grep -qi 'Verification' "$contract" || return 1
+    grep -Eqi '(^|[^A-Za-z])AC([^A-Za-z]|$)|AC[[:space:]]*矩阵|Acceptance Criteria' "$contract" || return 1
+    grep -Eqi '\bScope\b' "$contract" || return 1
+    grep -Eqi '\bVerification\b' "$contract" || return 1
     grep -Eqi '依赖|Dependency|Order' "$contract" || return 1
     grep -Eq 'REQ-|ADR-' "$contract" || return 1
     if [[ -f "$stories" ]] && grep -qi 'Story' "$stories"; then
-        grep -qi 'AC' "$stories" || return 1
+        grep -Eqi '(^|[^A-Za-z])AC([^A-Za-z]|$)|Acceptance Criteria' "$stories" || return 1
         # ADR-0009 决策 5③：每个 story id 必须在契约 AC 矩阵里占一行，不能只在故事文件里搜到 AC。
         node -e '
 const fs = require("fs");
 const stories = fs.readFileSync(process.argv[1], "utf8");
 const contract = fs.readFileSync(process.argv[2], "utf8");
-const ids = [...new Set([...stories.matchAll(/\bStory-\d+\b/g)].map((m) => m[0]))];
+const ids = [...new Set([...stories.matchAll(/\bStory-[A-Za-z0-9_-]+\b/g)].map((m) => m[0]))];
 if (!ids.length) process.exit(0);
 let matrix = "";
-const heading = contract.search(/^#{1,6}[^\n]*AC\s*矩阵/im);
+const heading = contract.search(/^#{1,6}[^\n]*(?:AC\s*矩阵|Acceptance Criteria)/im);
 if (heading >= 0) {
   const rest = contract.slice(heading);
   const next = rest.slice(1).search(/\n#{1,6} /);
   matrix = next >= 0 ? rest.slice(0, next + 1) : rest;
 } else {
-  matrix = contract.split(/\n/).filter((line) => /\bAC\b/i.test(line)).join("\n");
+  const acHeading = contract.search(/^#{1,6}[^\n]*\bAC\b/im);
+  if (acHeading >= 0) {
+    const rest = contract.slice(acHeading);
+    const next = rest.slice(1).search(/\n#{1,6} /);
+    matrix = next >= 0 ? rest.slice(0, next + 1) : rest;
+  } else {
+    matrix = contract.split(/\n/).filter((line) => /\*\*AC\*\*|\bAC-\d+/i.test(line)).join("\n");
+  }
 }
 const missing = ids.filter((id) => !new RegExp("\\b" + id + "\\b").test(matrix));
 if (missing.length) {
@@ -708,8 +715,8 @@ process.stdout.write(String(rows[rows.length - 1].evidence || ""));
 }
 
 gate1_verify_authorization() {
-    # 未采用 Gate1 授权配置的存量仓库仍只做 SHA 双重锚定；采用配置后强制解析 evidence（ADR-0009 决策 7）
-    [[ -f "$(auth_config_path)" ]] || return 0
+    # Gate1 强制启用授权配置校验：缺失或非法配置即 fail-closed（P1-1 / ADR-0009）
+    auth_require_config
     local feature="$1" sha="$2" mode evidence accepted_by accepted_at risk
     mode="$(auth_mode)"
     evidence="$(gate1_user_gate_evidence "$feature" "$sha" || true)"
@@ -947,16 +954,16 @@ process.exit(0);
 
 # CI/分支保护是 Gate2 前置；缺失时 merge fail-closed（ADR-0012 决策 5）
 branch_protection_ok() {
-    local mode="$1" script="$PROJECT_ROOT/scripts/setup-branch-protection.sh" out
+    local mode="$1" branch="${2:-main}" script="$PROJECT_ROOT/scripts/setup-branch-protection.sh" out
     if [[ ! -f "$script" ]]; then
         echo "[-] [FAIL-CLOSED] 缺少分支保护检查脚本: $script" >&2
         return 1
     fi
-    if out="$(bash "$script" --check --mode "$mode" 2>&1)"; then
+    if out="$(bash "$script" --check --mode "$mode" --branch "$branch" 2>&1)"; then
         return 0
     fi
-    echo "[-] [FAIL-CLOSED] 分支保护未满足 authorization_mode=$mode: ${out:-<no output>}" >&2
-    echo "🛠️ 修复指令: bash scripts/setup-branch-protection.sh --apply" >&2
+    echo "[-] [FAIL-CLOSED] 分支保护未满足 authorization_mode=$mode (branch=$branch): ${out:-<no output>}" >&2
+    echo "🛠️ 修复指令: bash scripts/setup-branch-protection.sh --apply --branch $branch" >&2
     return 1
 }
 
@@ -1029,6 +1036,16 @@ fs.writeFileSync(dst, text);
         accepted_by="$(auth_accepted_by)"
         [[ "$executor" == "$accepted_by" ]] || { echo "[-] [FAIL-CLOSED] 当前 gh login ($executor) 与 accepted_by ($accepted_by) 不一致" >&2; exit 1; }
         principal="$executor"
+        local confirm_reply=""
+        printf '确认以 single_owner (%s) 签署 Gate1 契约授权 [%s]? 请输入 yes 继续: ' "$principal" "$feature"
+        if ! IFS= read -r confirm_reply; then
+            echo "[-] [FAIL-CLOSED] 未收到交互确认输入，已取消。" >&2
+            exit 1
+        fi
+        if [[ "$confirm_reply" != "yes" && "$confirm_reply" != "y" && "$confirm_reply" != "YES" ]]; then
+            echo "[-] [FAIL-CLOSED] Gate1 授权已取消（需输入 yes 确认）。" >&2
+            exit 1
+        fi
     else
         command -v gh >/dev/null 2>&1 || { echo "[-] [FAIL-CLOSED] independent approve 需要 gh" >&2; exit 1; }
         executor="$(gh_login)"
@@ -1090,8 +1107,8 @@ fs.writeFileSync(file,text);
     if [[ -f "$index_file" ]]; then
         node -e '
 const fs=require("fs");const file=process.argv[1];let text=fs.readFileSync(file,"utf8");
-if (/Contract Status:/.test(text)) text=text.replace(/.*Contract Status:.*$/m,"- **Contract Status**: FROZEN & APPROVED");
-if (/Current Status:/.test(text)) text=text.replace(/.*Current Status:.*$/m,"- **Current Status**: APPROVED (Stage 5 TDD Ready)");
+if (/\*{0,2}Contract Status\*{0,2}\s*[:：]/.test(text)) text=text.replace(/^.*\*{0,2}Contract Status\*{0,2}\s*[:：].*$/m,"- **Contract Status**: FROZEN & APPROVED");
+if (/\*{0,2}Current Status\*{0,2}\s*[:：]/.test(text)) text=text.replace(/^.*\*{0,2}Current Status\*{0,2}\s*[:：].*$/m,"- **Current Status**: APPROVED (Stage 5 TDD Ready)");
 fs.writeFileSync(file,text);
 ' "$index_file"
     fi
@@ -1666,6 +1683,16 @@ cmd_release_approve() {
     [[ -n "$principal" ]] || { echo "[-] [FAIL-CLOSED] 无法读取 gh api user login" >&2; exit 1; }
     [[ "$principal" == "$accepted_by" ]] || { echo "[-] [FAIL-CLOSED] principal ($principal) != accepted_by ($accepted_by)" >&2; exit 1; }
     [[ -t 0 ]] || { echo "[-] [FAIL-CLOSED] release-approve 必须 TTY 交互确认" >&2; exit 1; }
+    local confirm_reply=""
+    printf '确认以 single_owner (%s) 签发 Gate2 发布授权 PR #%s? 请输入 yes 继续: ' "$principal" "$pr_id"
+    if ! IFS= read -r confirm_reply; then
+        echo "[-] [FAIL-CLOSED] 未收到交互确认输入，已取消。" >&2
+        exit 1
+    fi
+    if [[ "$confirm_reply" != "yes" && "$confirm_reply" != "y" && "$confirm_reply" != "YES" ]]; then
+        echo "[-] [FAIL-CLOSED] Gate2 发布授权已取消（需输入 yes 确认）。" >&2
+        exit 1
+    fi
 
     local pr_view head_oid head_ref is_draft
     pr_view="$(gh pr view "$pr_id" --json headRefOid,headRefName,isDraft --jq '[.headRefOid, .headRefName, ((.isDraft // false) | tostring)] | join("%")' 2>/dev/null || true)"
@@ -1784,6 +1811,13 @@ cmd_merge() {
             fi
         fi
         if [[ "$auth_mode_val" == "single_owner" ]]; then
+            local merge_operator accepted_owner
+            merge_operator="$(gh_login || true)"
+            accepted_owner="$(auth_accepted_by)"
+            if [[ -z "$merge_operator" || "$merge_operator" != "$accepted_owner" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] Mode B 操作者身份校验失败: 当前 gh login (${merge_operator:-<empty>}) != accepted_by ($accepted_owner)${NC}" >&2
+                exit 1
+            fi
             local current_contract_sha="none"
             if [[ -n "$feature" ]]; then
                 current_contract_sha="$(contract_sha_for "$feature" || true)"
@@ -1823,7 +1857,7 @@ cmd_merge() {
             exit 1
         fi
         if [[ -n "$auth_mode_val" ]]; then
-            if ! branch_protection_ok "$auth_mode_val"; then
+            if ! branch_protection_ok "$auth_mode_val" "${base_ref:-main}"; then
                 exit 1
             fi
             echo -e "    ${GREEN}[✓] 分支保护满足 ${auth_mode_val}（必须走 PR + Four Gates）${NC}"
@@ -1861,7 +1895,7 @@ cmd_merge() {
         fi
         echo -e "    ${GREEN}[✓] 物理防偷跑核验通过 (Lock: UNLOCKED @ $head_oid)。${NC}"
         echo -e "\n${BOLD}[3/4] 执行原子 Squash 合并并删除特性分支...${NC}"
-        if ! gh pr merge "$pr_id" --squash --delete-branch; then
+        if ! gh pr merge "$pr_id" --squash --delete-branch --match-head-commit "$head_oid"; then
             echo -e "${RED}[-] [FAIL-CLOSED] gh pr merge 失败，禁止继续补偿。${NC}" >&2
             exit 1
         fi
@@ -1923,52 +1957,93 @@ cmd_merge() {
     fi
 
     if [[ "$failed" -eq 0 && -n "$feature" ]]; then
-        if [[ -d "$PROJECT_ROOT/specs/features/$feature" ]]; then
-            mkdir -p "$PROJECT_ROOT/specs/archive"
-            if mv "$PROJECT_ROOT/specs/features/$feature" "$PROJECT_ROOT/specs/archive/$feature"; then
-                write_archive_state_snapshot "$feature" "$goal_id" "$PROJECT_ROOT/specs/archive/$feature"
-                step_names+=("archive"); step_states+=("done"); step_details+=("")
-                echo -e "    ${GREEN}[✓] 资产包已原子迁移至归档区: specs/archive/$feature/${NC}"
-            else
-                failed=1
-                step_names+=("archive"); step_states+=("failed"); step_details+=("mv failed")
-            fi
-        elif [[ -d "$PROJECT_ROOT/specs/archive/$feature" ]]; then
-            write_archive_state_snapshot "$feature" "$goal_id" "$PROJECT_ROOT/specs/archive/$feature"
-            step_names+=("archive"); step_states+=("skipped"); step_details+=("already archived")
-            echo -e "    ${YELLOW}[i] 资产包已在归档区，跳过。${NC}"
-        else
-            step_names+=("archive"); step_states+=("skipped"); step_details+=("no capsule")
-        fi
-    fi
-
-    if [[ "$failed" -eq 0 && -n "$feature" && "${LOOPX_FLOW_MERGE_SKIP_GIT_SYNC:-0}" != "1" ]]; then
-        local base_branch="${base_ref:-main}"
-        local dirty
-        dirty="$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=no 2>/dev/null | grep -vE "^(..) (specs/archive/$feature/|specs/features/$feature/|\.loopx/)" || true)"
-        if [[ -n "$dirty" ]]; then
-            failed=1
-            step_names+=("push"); step_states+=("failed"); step_details+=("dirty worktree; base checkout skipped")
-            echo -e "${RED}[-] 工作区存在 unrelated 未提交文件，跳过 base 切换（不冒险覆盖）:${NC}" >&2
-            echo "$dirty" | sed 's/^/    /' >&2
-        elif (cd "$PROJECT_ROOT" && git fetch origin "$base_branch" && git checkout "$base_branch" && git pull --ff-only origin "$base_branch") >/dev/null 2>&1; then
-            if (cd "$PROJECT_ROOT" && git add -A --ignore-unmatch -- "specs/archive/$feature" "specs/features/$feature" >/dev/null 2>&1 && ! git diff --cached --quiet); then
-                if (cd "$PROJECT_ROOT" && git commit -m "chore($feature): archive capsule after merge" >/dev/null 2>&1 && git push origin "$base_branch" >/dev/null 2>&1); then
-                    step_names+=("push"); step_states+=("done"); step_details+=("")
-                    echo -e "    ${GREEN}[✓] 本地 $base_branch 已同步并推送 archive 移动。${NC}"
+        if [[ "${LOOPX_FLOW_MERGE_SKIP_GIT_SYNC:-0}" == "1" ]]; then
+            if [[ -d "$PROJECT_ROOT/specs/features/$feature" ]]; then
+                mkdir -p "$PROJECT_ROOT/specs/archive"
+                if mv "$PROJECT_ROOT/specs/features/$feature" "$PROJECT_ROOT/specs/archive/$feature"; then
+                    write_archive_state_snapshot "$feature" "$goal_id" "$PROJECT_ROOT/specs/archive/$feature"
+                    step_names+=("archive"); step_states+=("done"); step_details+=("")
+                    echo -e "    ${GREEN}[✓] 资产包已原子迁移至归档区: specs/archive/$feature/${NC}"
                 else
                     failed=1
-                    step_names+=("push"); step_states+=("failed"); step_details+=("commit/push failed")
+                    step_names+=("archive"); step_states+=("failed"); step_details+=("mv failed")
                 fi
+            elif [[ -d "$PROJECT_ROOT/specs/archive/$feature" ]]; then
+                write_archive_state_snapshot "$feature" "$goal_id" "$PROJECT_ROOT/specs/archive/$feature"
+                step_names+=("archive"); step_states+=("skipped"); step_details+=("already archived")
+                echo -e "    ${YELLOW}[i] 资产包已在归档区，跳过。${NC}"
             else
-                step_names+=("push"); step_states+=("skipped"); step_details+=("no archive diff")
-            fi
-            if [[ -n "$original_branch" && "$original_branch" != "$base_branch" ]] && git -C "$PROJECT_ROOT" rev-parse --verify "$original_branch" >/dev/null 2>&1; then
-                git -C "$PROJECT_ROOT" checkout "$original_branch" >/dev/null 2>&1 || true
+                step_names+=("archive"); step_states+=("skipped"); step_details+=("no capsule")
             fi
         else
-            failed=1
-            step_names+=("push"); step_states+=("failed"); step_details+=("base refresh failed")
+            local base_branch="${base_ref:-main}"
+            local dirty
+            dirty="$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=no 2>/dev/null | grep -vE "^(..) (specs/archive/$feature/|specs/features/$feature/|\.loopx/)" || true)"
+            if [[ -n "$dirty" ]]; then
+                failed=1
+                step_names+=("archive"); step_states+=("failed"); step_details+=("dirty worktree; base checkout skipped")
+                echo -e "${RED}[-] 工作区存在 unrelated 未提交文件，跳过 base 切换与归档（不冒险覆盖）:${NC}" >&2
+                echo "$dirty" | sed 's/^/    /' >&2
+            elif (cd "$PROJECT_ROOT" && git fetch origin "$base_branch" && git checkout "$base_branch" && git pull --ff-only origin "$base_branch") >/dev/null 2>&1; then
+                if [[ -d "$PROJECT_ROOT/specs/features/$feature" && ! -d "$PROJECT_ROOT/specs/archive/$feature" ]]; then
+                    mkdir -p "$PROJECT_ROOT/specs/archive"
+                    if (cd "$PROJECT_ROOT" && (git mv "specs/features/$feature" "specs/archive/$feature" 2>/dev/null || mv "specs/features/$feature" "specs/archive/$feature")); then
+                        write_archive_state_snapshot "$feature" "$goal_id" "$PROJECT_ROOT/specs/archive/$feature"
+                        step_names+=("archive"); step_states+=("done"); step_details+=("")
+                        echo -e "    ${GREEN}[✓] 资产包已原子迁移至归档区: specs/archive/$feature/${NC}"
+                    else
+                        failed=1
+                        step_names+=("archive"); step_states+=("failed"); step_details+=("mv failed")
+                    fi
+                elif [[ -d "$PROJECT_ROOT/specs/archive/$feature" ]]; then
+                    write_archive_state_snapshot "$feature" "$goal_id" "$PROJECT_ROOT/specs/archive/$feature"
+                    step_names+=("archive"); step_states+=("skipped"); step_details+=("already archived")
+                    echo -e "    ${YELLOW}[i] 资产包已在归档区，跳过。${NC}"
+                else
+                    step_names+=("archive"); step_states+=("skipped"); step_details+=("no capsule")
+                fi
+
+                if [[ "$failed" -eq 0 ]]; then
+                    (cd "$PROJECT_ROOT" && git add -A -- "specs/archive/$feature" >/dev/null 2>&1 || true)
+                    (cd "$PROJECT_ROOT" && git ls-files --error-unmatch "specs/features/$feature" >/dev/null 2>&1 && git rm -r -q --cached --ignore-unmatch "specs/features/$feature" || true)
+                    if (cd "$PROJECT_ROOT" && ! git diff --cached --quiet); then
+                        if (cd "$PROJECT_ROOT" && git commit -m "chore($feature): archive capsule after merge" >/dev/null 2>&1); then
+                            if (cd "$PROJECT_ROOT" && git push origin "$base_branch" >/dev/null 2>&1); then
+                                step_names+=("push"); step_states+=("done"); step_details+=("")
+                                echo -e "    ${GREEN}[✓] 本地 $base_branch 已同步并推送 archive 移动。${NC}"
+                            else
+                                local archive_branch="chore/archive-$feature" archive_pr_url=""
+                                if (cd "$PROJECT_ROOT" && git checkout -B "$archive_branch" >/dev/null 2>&1 && git push -f -u origin "$archive_branch" >/dev/null 2>&1); then
+                                    archive_pr_url="$(cd "$PROJECT_ROOT" && gh pr create --base "$base_branch" --head "$archive_branch" --title "chore($feature): archive capsule after merge" --body "Automated capsule archival after PR #$pr_id squash merge." 2>/dev/null || true)"
+                                    (cd "$PROJECT_ROOT" && git checkout "$base_branch" >/dev/null 2>&1 && git reset --hard "origin/$base_branch" >/dev/null 2>&1 || true)
+                                    if [[ -n "$archive_pr_url" ]]; then
+                                        step_names+=("push"); step_states+=("pr_created"); step_details+=("$archive_pr_url")
+                                        echo -e "    ${YELLOW}[i] 远端 $base_branch 受保护拦截直推，已创建归档 PR: $archive_pr_url${NC}"
+                                    else
+                                        failed=1
+                                        step_names+=("push"); step_states+=("failed"); step_details+=("archive PR create failed")
+                                    fi
+                                else
+                                    (cd "$PROJECT_ROOT" && git checkout "$base_branch" >/dev/null 2>&1 && git reset --hard "origin/$base_branch" >/dev/null 2>&1 || true)
+                                    failed=1
+                                    step_names+=("push"); step_states+=("failed"); step_details+=("push and archive branch push failed")
+                                fi
+                            fi
+                        else
+                            failed=1
+                            step_names+=("push"); step_states+=("failed"); step_details+=("archive commit failed")
+                        fi
+                    else
+                        step_names+=("push"); step_states+=("skipped"); step_details+=("no archive diff")
+                    fi
+                fi
+                if [[ -n "$original_branch" && "$original_branch" != "$base_branch" ]] && git -C "$PROJECT_ROOT" rev-parse --verify "$original_branch" >/dev/null 2>&1; then
+                    git -C "$PROJECT_ROOT" checkout "$original_branch" >/dev/null 2>&1 || true
+                fi
+            else
+                failed=1
+                step_names+=("archive"); step_states+=("failed"); step_details+=("base refresh failed")
+            fi
         fi
     fi
 
@@ -2882,23 +2957,63 @@ NODE
         rm -f "$acquire_log"
         echo -e "${GREEN}[✓] 排他租约已获取 (ACQUIRED): $todo_id${NC}"
     else
-        agent_id="${agent_id:-${LOOPX_AGENT_ID:-loopx-flow-agent}}"
-        local identity_key="${idempotency_key:-loopx-flow:${mode}:${goal_id}:${todo_id}:${agent_id}}"
+        if [[ -z "$agent_id" ]]; then
+            agent_id="$(resolve_claim_owner "$goal_id")" || exit 1
+        fi
+        local inspect_json lease_meta lease_version lease_owner lease_status
+        inspect_json="$(loopx --format json $REGISTRY_FLAG task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || {
+            echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的租约状态，拒绝变更 Todo 状态: $inspect_json${NC}" >&2
+            exit 1
+        }
+        lease_meta="$(node -e '
+const raw = process.argv[1] || "";
+const start = raw.indexOf("{");
+let d = {};
+if (start >= 0) {
+  try { d = JSON.parse(raw.slice(start)); } catch (_) { process.exit(1); }
+} else {
+  process.exit(1);
+}
+const lease = d.lease && typeof d.lease === "object" ? d.lease : null;
+const v = d.version ?? (lease && lease.version) ?? d.lease_version ?? (d.lease_state && d.lease_state.version) ?? "";
+const owner = (lease && lease.owner) || d.owner || "";
+const status = (lease && lease.status) || "";
+process.stdout.write([v === null || v === undefined ? "" : String(v), String(owner), String(status)].join("|"));
+' "$inspect_json" 2>/dev/null)" || {
+            echo -e "${RED}[-] [FAIL-CLOSED] task-lease inspect 输出不可解析，拒绝变更 Todo 状态。${NC}" >&2
+            exit 1
+        }
+        IFS="|" read -r lease_version lease_owner lease_status <<< "$lease_meta"
+        if [[ -z "$lease_version" ]]; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 无法从 task-lease inspect 读取租约版本，拒绝变更 Todo 状态与盲释放。${NC}" >&2
+            exit 1
+        fi
+        if [[ "$lease_status" == "active" && -n "$lease_owner" && "$lease_owner" != "$agent_id" ]]; then
+            echo -e "${RED}[-] [FAIL-CLOSED] Todo ${todo_id} 活动租约由 ${lease_owner} 持有，与当前身份 ${agent_id} 不一致，拒绝完成与释放。${NC}" >&2
+            exit 1
+        fi
+        local identity_key=""
+        identity_key="$(node - "$goal_id" "$todo_id" "$agent_id" "$lease_version" "$idempotency_key" <<'NODE'
+const crypto = require("crypto");
+const [goalId, todoId, owner, version, explicit] = process.argv.slice(2);
+const token = /^[A-Za-z0-9_.:@\/-]{1,160}$/;
+if (explicit) {
+  if (!token.test(explicit)) {
+    process.stderr.write("幂等键不是 LoopX public-safe token\n");
+    process.exit(3);
+  }
+  process.stdout.write(explicit);
+  process.exit(0);
+}
+const digest = crypto.createHash("sha256")
+  .update(`${goalId}\n${todoId}\n${owner}\n${version}`, "utf8")
+  .digest("hex");
+process.stdout.write(`loopx-flow:release:${digest}`);
+NODE
+)" || exit 1
         echo -e "${BLUE}==> [租约流转] 正在完成 Todo 并释放租约: $todo_id @ $goal_id (owner=$agent_id)...${NC}"
         if ! loopx $REGISTRY_FLAG todo --goal-id "$goal_id" --todo-id "$todo_id" --status done; then
             echo -e "${RED}[-] [FAIL-CLOSED] Todo 完成回写失败: $todo_id，租约保留以便重试。${NC}" >&2
-            exit 1
-        fi
-        local inspect_json lease_version
-        inspect_json="$(loopx --format json $REGISTRY_FLAG task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>/dev/null || true)"
-        lease_version="$(node -e '
-let d = {};
-try { d = JSON.parse(process.argv[1]); } catch (_) { process.exit(0); }
-const v = d.version ?? (d.lease && d.lease.version) ?? d.lease_version ?? (d.lease_state && d.lease_state.version) ?? "";
-process.stdout.write(v === null || v === undefined ? "" : String(v));
-' "$inspect_json" 2>/dev/null || true)"
-        if [[ -z "$lease_version" ]]; then
-            echo -e "${RED}[-] [FAIL-CLOSED] 无法从 task-lease inspect 读取租约版本，拒绝盲释放。${NC}" >&2
             exit 1
         fi
         if ! loopx $REGISTRY_FLAG task-lease release --goal-id "$goal_id" --todo-id "$todo_id" --owner "$agent_id" --idempotency-key "$identity_key" --expected-version "$lease_version"; then
