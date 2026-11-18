@@ -5,10 +5,19 @@
 # ==============================================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# 项目本地临时沙箱（issue #8）：报告默认落在项目内已 gitignore 的 .loopx/tmp/，
+# 禁止硬编码系统 /tmp 固定文件名（多 Agent/多进程互相覆写、重启/清理后证据丢失）。
+# LOOPX_TMP_DIR 可覆盖沙箱目录；仍允许第 2 个 CLI 参数显式指定报告路径。
+LOOPX_TMP_DIR="${LOOPX_TMP_DIR:-$PROJECT_ROOT/.loopx/tmp}"
+mkdir -p "$LOOPX_TMP_DIR"
+
 export PATH="$PATH:$HOME/.npm-global/bin"
 
 BASE_REF="${1:-origin/main}"
-REPORT_FILE="${2:-/tmp/ocr-audit-report.json}"
+REPORT_FILE="${2:-$LOOPX_TMP_DIR/ocr-audit-report-$$.json}"
 
 echo "==> [L1 Audit] 启动阿里 Open Code Review 代码级扫描..."
 echo "    - 比较基准: $BASE_REF -> HEAD"
@@ -25,10 +34,11 @@ ocr review --audience agent --repo . --from "$BASE_REF" --to HEAD --format json 
 
 echo "==> [L1 Audit] 扫描完成，执行结构化缺陷判定..."
 
-python3 - << 'PYEOF'
+python3 - "$REPORT_FILE" << 'PYEOF'
 import json, sys
 
-report_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/ocr-audit-report.json"
+# 报告路径由编排器单点解析（项目沙箱 / CLI 显式覆盖），脚本内不再硬编码系统 /tmp。
+report_path = sys.argv[1]
 
 try:
     with open(report_path, "r", encoding="utf-8") as f:

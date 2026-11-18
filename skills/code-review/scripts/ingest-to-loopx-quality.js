@@ -31,6 +31,22 @@ function discoverBaseRef(repoPath = process.cwd()) {
   throw new Error('无法解析远程默认基线：origin/HEAD / origin/main / origin/master 均不存在；请先 git fetch origin && git remote set-head origin -a');
 }
 
+// 项目本地临时沙箱：临时工件必须写入项目内已 gitignore 的 .loopx/tmp/，
+// 禁止硬编码系统 /tmp 固定文件名（多 Agent/多进程会互相覆写、重启或清理后证据丢失、
+// macOS /private/tmp 与 Windows %TEMP% 不可移植）。LOOPX_TMP_DIR 可覆盖该目录（CI/隔离测试）。
+function resolveTmpDir() {
+  const override = process.env.LOOPX_TMP_DIR;
+  const repoRoot = path.resolve(__dirname, '../../..');
+  return override ? path.resolve(override) : path.join(repoRoot, '.loopx/tmp');
+}
+
+// 唯一临时工件路径：<tmpDir>/<prefix>-<pid>-<rand>.json，保证并行进程零覆写。
+function allocateTempArtifactPath(prefix = 'change-quality-agent-result', ext = 'json') {
+  const tmpDir = resolveTmpDir();
+  fs.mkdirSync(tmpDir, { recursive: true });
+  return path.join(tmpDir, `${prefix}-${process.pid}-${crypto.randomBytes(6).toString('hex')}.${ext}`);
+}
+
 function parseArgs() {
   const args = process.argv.slice(2);
   const options = {
@@ -559,9 +575,12 @@ function main() {
     qualityResult.scope_fingerprint = scope.fingerprint;
   }
 
-  // 独立临时目录：并行运行（如 Lead 同时跑 check 与单测）时互不覆盖 payload。
-  const tempResultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-change-quality-'));
-  const tempResultPath = path.join(tempResultDir, 'change-quality-agent-result.json');
+  const tempResultPath = allocateTempArtifactPath();
+  // 注意：process.exit() 不会展开 finally 块，因此用 exit 钩子保证沙箱临时工件
+  // 在成功/失败/异常等所有退出路径上都被清理（record/verify 期间文件必须存活）。
+  process.on('exit', () => {
+    try { fs.rmSync(tempResultPath, { force: true }); } catch (_) {}
+  });
   fs.writeFileSync(tempResultPath, JSON.stringify(qualityResult, null, 2));
   console.log(`[✓] Generated standardized quality payload: ${tempResultPath}`);
 
@@ -650,4 +669,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { isRuntimeArtifact, committedScopeFiles, discoverBaseRef };
+module.exports = { isRuntimeArtifact, committedScopeFiles, discoverBaseRef, resolveTmpDir, allocateTempArtifactPath };

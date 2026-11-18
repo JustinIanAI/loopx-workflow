@@ -38,7 +38,8 @@
 6. **Code Review 深度融入 LoopX 质量门禁 (Receipt Binding & Optional OCR)**：
    - 阿里 OCR 为**选配能力**，仅在用户显式要求时在 `open-code-review` 技能内部进行自检、安装与扫描，不作为默认阻塞。
    - 默认执行基于跨边界语义契约的 `code-review` 技能。
-   - 审查交付物严禁割裂存放在 `/tmp/`：必须通过 `skills/code-review/scripts/ingest-to-loopx-quality.js` 统一编译为 LoopX `change_quality_agent_result_v2`，写入带有确切 Git Diff SHA 签名的不可篡改 Receipt，并同步沉淀在 `specs/features/<feature>/05-evidence.md`。
+   - **临时文件与交付物沙箱 (Temp & Artifact Sandbox)**：业务脚本严禁硬编码系统 `/tmp/<固定名>`（多 Agent/多进程会互相覆写，重启或清理后证据丢失，macOS `/private/tmp`、Linux `/tmp`、Windows `%TEMP%` 不可移植）。临时工件一律写入项目本地已忽略沙箱 `.loopx/tmp/`（`loopx-flow init` 创建，可用 `LOOPX_TMP_DIR` 覆盖），文件名必须带 PID/UUID/feature 唯一标识；持久化审查/PR/Issue 交付物写入 `specs/features/<feature>/` 或 `specs/archive/<feature>/`；单测使用 `os.tmpdir()` + `fs.mkdtempSync()` 并在 `after`/`finally` 清理。详见 `docs/agents/temp-artifacts.md`。
+   - 审查交付物严禁割裂存放在系统临时目录：必须通过 `skills/code-review/scripts/ingest-to-loopx-quality.js` 统一编译为 LoopX `change_quality_agent_result_v2`，写入带有确切 Git Diff SHA 签名的不可篡改 Receipt，并同步沉淀在 `specs/features/<feature>/05-evidence.md`。
    - `loopx change-quality verify` 严格检验：若存在未解决的 Blocker 缺陷或代码偷跑篡改，一票否决阻断交付。
    - `05-evidence.md` 由 `ingest` 生成：Evidence Ref 用既有 REQ/Story/AC/Test 拼接；六状态 `passed/failed/blocked/not_run/not_applicable/deferred`；四门禁不得标 `not_applicable`；`ingest` 只消费 `check` 的退出码，缺结果拒绝写 `passed`；LoopX `validation` 只映射 `passed/failed/skipped`。
 7. **PR 执行期命令治理 (LoopX-Workflow First & LoopX Fallback Disclosure)**：
