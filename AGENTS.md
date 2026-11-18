@@ -1,6 +1,6 @@
 # AGENTS.md: LoopX AI-Native 场景化研发与交付协议 (v2.0)
 
-本项目遵循 **LoopX 原生能力引擎 + Feature 自包含资产胶囊 + 场景化双管线 + 质量门禁收据融合** 的端到端标准化研发管线。所有在此仓库工作的 Agent 必须严格遵守以下工程规范。
+本项目是研发场景的**应用编排层**：Git 管版本化规格与决策，LoopX 管 Agent 执行控制，GitHub/CI 管代码交付与审批事实；编排器只做跨来源绑定、校验与投影。Conductor（规划中的 `skills/workflow-conductor`；落地前由本文件管线规程承担）作为调度层选择下一步并路由领域 Skill，执行由对应 Skill/Agent 完成；任何实现都不能另建并行的权威执行状态。所有在此仓库工作的 Agent 必须严格遵守以下工程规范。
 
 ---
 
@@ -22,12 +22,12 @@
      - `03-stories.md`（阶段 3 故事拆分与排期）
      - `04-contract.md`（阶段 4 TypeScript 契约与任务图）
      - `05-evidence.md`（阶段 5/6 门禁实测与 LoopX 质量凭据）
-   - 规则来源是 `docs/adr/0001-product-source-of-truth.md`。`approve` / `gate` 尚未检查胶囊是否引用了 `REQ-*`（见 PRD `REQ-TRACE-2`）。
+   - 规则来源是 `docs/adr/0001-product-source-of-truth.md`。**ADR 准入矩阵**：仅改变权威所有者/默认行为/非纯增量状态或 Schema/不可逆迁移/共享契约才立 ADR；普通 Feature/Bug/测试/文档不立，引用既有 `REQ-*`/ADR。`approve`/`gate verify contract` 已按 `REQ-TRACE-2` 检查契约至少引用一条 REQ/ADR；完整追溯按 `REQ-TRACE-3` 分级执行。
 3. **断点 1 契约冻结与审批先行 (Contract Freeze & Checkpoint 1 Approval)**：
    - 在 `specs/features/<feature>/04-contract.md` 顶部必须冻结不可变 TypeScript 接口签名与断言不变量。
-   - 必须通过 `loopx-flow approve contract <feature>` 由人类决策者执行审批放行，系统自动将状态标记为 `Contract-Status: FROZEN & APPROVED` 并通过 `loopx configure-goal --progress-review-contract-revision <sha256>` 物理锁定契约指纹后，方可进入编码实现。
+   - Gate1 = **Specification Authorization**：`loopx-flow approve contract <feature>` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；`single_owner` 需 TTY 确认 + 风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 story id 在契约 AC 矩阵中的一行、至少一条 REQ/ADR；锁定 04-contract SHA256（`configure-goal --progress-review-contract-revision`）并写 `user_gate` 授权记录后，才写 `Contract-Status: FROZEN & APPROVED`。任一步失败非 0，不得留批准标记。
 4. **多 Agent 任务排他锁与反熵增 (Multi-Agent Concurrency & Anti-Entropy)**：
-   - 并行工作时，必须先调用 `loopx task-lease acquire --goal-id <gid> --todo-id <tid>` 锁定租约，严禁争抢同一任务。
+   - 并行工作时，必须先通过 `loopx-flow todo claim <todo-id> --goal-id <gid>` 锁定租约（内部完成 register-agent + task-lease acquire --owner --idempotency-key），严禁争抢同一任务。
    - 多特性分支开发时，合并前必须通过 `loopx integration-branch` 在本地隔离 worktree 提前探测并解决冲突。
    - **反熵增与代码退役 (anti-entropy-governance)**：替换旧逻辑时严格执行 `delete-first`，彻底清理废弃变量、旧分支与孤儿代码，严禁堆砌无意义的第 4 套兜底层。
 5. **本地四大硬门禁与新鲜证据链 (Verifiable Gates & Fresh Evidence)**：
@@ -40,9 +40,10 @@
    - 默认执行基于跨边界语义契约的 `code-review` 技能。
    - 审查交付物严禁割裂存放在 `/tmp/`：必须通过 `skills/code-review/scripts/ingest-to-loopx-quality.js` 统一编译为 LoopX `change_quality_agent_result_v2`，写入带有确切 Git Diff SHA 签名的不可篡改 Receipt，并同步沉淀在 `specs/features/<feature>/05-evidence.md`。
    - `loopx change-quality verify` 严格检验：若存在未解决的 Blocker 缺陷或代码偷跑篡改，一票否决阻断交付。
+   - `05-evidence.md` 由 `ingest` 生成：Evidence Ref 用既有 REQ/Story/AC/Test 拼接；六状态 `passed/failed/blocked/not_run/not_applicable/deferred`；四门禁不得标 `not_applicable`；`ingest` 只消费 `check` 的退出码，缺结果拒绝写 `passed`；LoopX `validation` 只映射 `passed/failed/skipped`。
 7. **PR 执行期命令治理 (LoopX-Workflow First & LoopX Fallback Disclosure)**：
    - 整个 PR 生命周期（`gate` → `check` → `pr` → `review` → `respond` → `merge`）必须优先通过 `bin/loopx-flow` 场景化命令管理；禁止绕过编排器直接用 ad-hoc 脚本拼接状态变更。
-   - 当 loopx-flow 流程尚不完备、命令缺失或暂不支持某项能力时，允许降级使用 LoopX 原生 `loopx` CLI 完成，但必须在交付报告与 PR 评论中**显式披露两点**：(a) 实际执行的命令；(b) 为什么 loopx-flow 未支持该项能力（能力缺口）。
+   - 当 loopx-flow 场景封装缺少能力时，允许**受控降级**到 LoopX 原生 `loopx` CLI，但必须在交付报告与 PR 评论中披露：(a) 实际命令与结果；(b) 能力缺口与绕过原因；且**不得绕过 Goal/Gate/Receipt/Review/Merge 权威约束**。`issue-fix.feasibility`/`integration-branch` 缺失时 `issue`/`integrate` 直接非 0，不得降级为静默成功。
    - 降级是临时手段而非终点：一旦确认能力缺口，必须在同一次交付中补上 `loopx-flow` 场景化命令或登记该缺口，逐步收敛降级路径（anti-entropy）。
    - 评审报告格式以 LoopX `pr-review` 返回的 `review_template`（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价）为唯一权威，严禁任何自造 Block 模板；代码类变更必须在「具体改动」下提供 `### 关键代码讲解`。`loopx-flow review` 与 `loopx-flow respond` 均复用该原生格式。
 
@@ -50,15 +51,15 @@
 
 ## 管线 A: Feature 研发管线 (8 阶段场景化闭环)
 
-- **阶段 0：前置体检** ➔ 运行 `loopx-flow doctor` 确保 Git、CLI、认证、四大门禁与目录就绪。
+- **阶段 0：前置体检** ➔ 运行 `loopx-flow doctor` 确保 Git、CLI、认证、四大门禁与目录就绪；首次接入由 `loopx-flow init` 确认 `authorization_mode`（`independent`/`single_owner`）与风险接受，`doctor` 校验配置。
 - **阶段 1：方案研讨** ➔ 调用 `design-grill` 排除事实疑问。产品级取舍写入 `docs/adr/` 并修订 `docs/prd/loopx-workflow.md` 与必要时的详细设计。`specs/features/<feature>/01-decisions.md` 只记录本胶囊的实现取舍并链接该 ADR。
 - **阶段 2：需求切片** ➔ 对照产品 PRD 列出本胶囊要满足的 `REQ-*`。行为不在 PRD 中则先完成阶段 1 的 ADR，禁止在 `02-prd.md` 另立产品需求。`strategy-red-team` 只攻击本切片的承重假设。
 - **阶段 3：特性拆分** ➔ `user-stories` / `prioritize-features`，控制单 Feature Diff ≤ 500 行，产出 `specs/features/<feature>/03-stories.md`。
-- **阶段 4：契约冻结与断点 1 审批** ➔ 编写 `specs/features/<feature>/04-contract.md` 顶部固化 TypeScript 签名；生成 `00-INDEX.md` 全景大盘；人类执行 `loopx-flow approve contract <feature>` 锁定契约指纹并放行。
-- **阶段 5：TDD 循环实现与反熵增** ➔ 认领排他租约 `loopx task-lease acquire` ➔ 红绿重构（单测先写先红）➔ 依 `anti-entropy-governance` 清理退役旧逻辑 ➔ 四大门禁全绿。
+- **阶段 4：规格包与断点 1 审批** ➔ 在 `04-contract.md` 固化 TypeScript 签名 + AC 矩阵/Scope/Verification Plan/依赖顺序；`00-INDEX.md` 作为规格包视图；可按 `REQ-PR-LIFECYCLE-1` 创建 Draft PR 展示；人类执行 `loopx-flow approve contract <feature>`：校验规格完整性、TTY/第二账号、锁 SHA 并写 `user_gate` 授权记录后放行。
+- **阶段 5：TDD 循环实现与反熵增** ➔ `loopx-flow todo claim` 认领排他租约 ➔ 红绿重构（单测先写先红）➔ 依 `anti-entropy-governance` 清理退役旧逻辑 ➔ 四大门禁全绿。
 - **阶段 6：代码审查与质量收据融合** ➔ 执行 `loopx-flow check`，运行语义审查（选配 OCR）并通过适配器写入 LoopX `change-quality` 严格 Receipt，回写 `specs/features/<feature>/05-evidence.md`。
-- **阶段 7：预集成与交付审查 (L2)** ➔ `loopx integration-branch` 本地预集成 ➔ `gh pr create` 发起 PR ➔ `loopx-flow review <pr_id>` 顶置 LoopX 原生五段式审查报告（复用 `pr-review` 的 `review_template`）至 GitHub PR 页面。
-- **阶段 8：断点 2 审批、原子合入与归档** ➔ 人类在 GitHub PR 页面核验 8 项事实后点击 Approve ➔ 运行 `loopx-flow merge <pr_id>` ➔ 严格通过 `loopx pr-review --check-merge-readiness` 物理防偷跑核验 ➔ Squash 合入主干 ➔ 资产包整包原子移动至 `specs/archive/<feature>/` ➔ 自动闭环核销 Goal。
+- **阶段 7：预集成与交付审查 (L2)** ➔ `loopx-flow integrate` 本地预集成 ➔ `loopx-flow pr ready <pr>` 将阶段 4 的 Draft PR 转为 Ready（不代表合并授权）➔ `loopx-flow review <pr_id>` 发布 formal review（Agent 发 COMMENT，不发 author-owned 批准标题）。
+- **阶段 8：断点 2 审批、原子合入与归档** ➔ **Mode A**：人类非作者在 GitHub 页面点击 Approve；**Mode B**：Owner 执行 `loopx-flow release-approve <pr>`（TTY 确认、principal=`gh api user` login、写结构化评论）→ 运行 `loopx-flow merge <pr_id>`：按模式校验审批/readiness（Mode B 用 `blocking_reasons` 三档判定）与二次 HEAD → Squash 合入 → 资产包原子移入 `specs/archive/<feature>/` → Goal 收尾。
 
 ---
 
@@ -72,8 +73,7 @@
   1. 定位并补充单测验证。
   2. 外科手术式最小修复（不碰邻近无关代码）。
   3. 四大门禁全绿 + `loopx-flow check` 质量收据通过。
-  4. 执行自适应提交：`./scripts/fast-fix-push.sh <ISSUE_ID> "fix(<scope>): <summary>"`
-     （若主干未设保护则直推合入；若遇分支保护拦截，脚本自动降级为创建 PR 并自动合并）。
+  4. 创建修复分支与 PR，走与 Feature 相同的 Gate2（Fast-Path 不得绕过）；`scripts/fast-fix-push.sh` 不得直推 `main`，只允许分支+PR 或显式受控操作。
 
 ### 路径 B：Standard PR-Path（标准 PR 流程）
 - **准入标准**：涉及业务逻辑、状态变更、算法调整、高危并发或任何不符合 Fast-Path 的缺陷。
@@ -83,7 +83,7 @@
   3. **Failing Repro 先行**：在 `tests/unit/issues/issue-<id>.test.ts` 下新增针对根本所有者的复现用例，**验证必须先 FAIL**。
   4. 实施外科手术修复与代码退役（`delete-first`），验证用例变绿。
   5. 运行 `loopx-flow check` 固化质量收据。
-  6. 创建 GitHub PR 并在页面呈现修复对比证据，人类 Approve 后由 `loopx-flow merge <pr_id>` 合并核销。
+  6. 创建 GitHub PR 并在页面呈现修复对比证据；按 `authorization_mode` 走 Gate2（Mode A 非作者 Approve / Mode B `release-approve`）后由 `loopx-flow merge <pr_id>` 合并核销。
 
 ---
 

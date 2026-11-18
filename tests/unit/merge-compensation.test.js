@@ -4,6 +4,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { withoutRepoConfig } = require('./helpers/repo-isolation');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
@@ -77,6 +78,10 @@ test('1. already MERGED: skip merge/readiness, compensate stop/retire/sync/archi
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     const calls = fs.readFileSync(CALLS, 'utf8');
     assert.doesNotMatch(calls, /pr merge/);
+    const snap = path.join(PROJECT_ROOT, 'specs/archive', feature, 'ACTIVE_STATE.snapshot.md');
+    assert.strictEqual(fs.existsSync(snap), true, 'archive must emit ACTIVE_STATE.snapshot.md');
+    assert.match(fs.readFileSync(snap, 'utf8'), /historical_snapshot.*true/);
+    assert.strictEqual(fs.existsSync(path.join(PROJECT_ROOT, 'specs/archive', feature, 'ACTIVE_STATE.md')), false, 'runtime ACTIVE_STATE.md must not remain in archive');
     assert.doesNotMatch(calls, /check-merge-readiness/);
     assert.match(calls, /goal-lifecycle/);
     assert.match(calls, /retire-global-goal/);
@@ -91,7 +96,7 @@ test('2. OPEN + APPROVED: normal merge then archive', () => {
   const feature = 'merge-comp-test-b';
   cleanup(feature); setupMocks(); makeFeature(feature);
   try {
-    const r = runMerge(502, feature, { PR_STATE: 'OPEN', PR_DECISION: 'APPROVED' });
+    const r = withoutRepoConfig(() => runMerge(502, feature, { PR_STATE: 'OPEN', PR_DECISION: 'APPROVED' }));
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     const calls = fs.readFileSync(CALLS, 'utf8');
     assert.match(calls, /pr merge/);
@@ -150,7 +155,7 @@ test('7. OPEN without APPROVED: fail before merge', () => {
   const feature = 'merge-comp-test-g';
   cleanup(feature); setupMocks(); makeFeature(feature);
   try {
-    const r = runMerge(507, feature, { PR_STATE: 'OPEN', PR_DECISION: 'CHANGES_REQUESTED' });
+    const r = withoutRepoConfig(() => runMerge(507, feature, { PR_STATE: 'OPEN', PR_DECISION: 'CHANGES_REQUESTED' }));
     assert.strictEqual(r.status, 1, r.stdout + r.stderr);
     assert.match(r.stderr + r.stdout, /尚未在 GitHub 获得人类 APPROVED/);
     const calls = fs.readFileSync(CALLS, 'utf8');

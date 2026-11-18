@@ -64,9 +64,10 @@ test('1. ADR-003: gate verify pr is retired and must be rejected', () => {
 });
 
 test('2. ADR-002: Double-anchored Contract Gate: passes on matching SHA256', () => {
-  const res = spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'fail-closed-hardening'], {
+  const { withoutRepoConfig } = require('./helpers/repo-isolation');
+  const res = withoutRepoConfig(() => spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'fail-closed-hardening'], {
     encoding: 'utf8'
-  });
+  }));
   assert.strictEqual(res.status, 0, 'Matching contract SHA256 and approved marker must pass');
   assert.match(res.stdout, /阶段 4 契约冻结签名通过|契约双重锚定核验通过/, 'Must confirm contract gate pass');
 });

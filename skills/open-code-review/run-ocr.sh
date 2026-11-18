@@ -10,6 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 BASE_REF="${1:-origin/main}"
 FEATURE="${2:-}"
+GATE_RESULTS_FILE="${3:-}"
 OUTPUT_JSON="/tmp/ocr-audit-report.json"
 
 echo "==> [OCR 选配闭环] [1/3] 执行环境自检 (Self-Check)..."
@@ -38,6 +39,7 @@ echo "==> [OCR 选配闭环] [3/3] 将 OCR 审查结果送入 LoopX 代码质量
 node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" \
   --ocr-json "$OUTPUT_JSON" \
   --base-ref "$BASE_REF" \
+  ${GATE_RESULTS_FILE:+--gate-results "$GATE_RESULTS_FILE"} \
   ${FEATURE:+--feature "$FEATURE"}
 
 echo "[✓] OCR 选配审查与质量融合完成！"
