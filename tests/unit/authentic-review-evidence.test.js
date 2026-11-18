@@ -452,6 +452,17 @@ test('formatDiffForPrompt preserves tail test files and file inventory when diff
   assert.match(formatted, /tests\/unit\/tail-invariant\.test\.js/);
   assert.match(formatted, /tail invariant preserved/);
   assert.match(formatted, /FILE_DIFF_COMPACTED/);
+  assert.ok(formatted.length <= 240000);
+
+  const manySmall = Array.from({ length: 50 }, (_, i) => [
+    `diff --git a/src/mod-${i}.js b/src/mod-${i}.js`,
+    `--- a/src/mod-${i}.js`,
+    `+++ b/src/mod-${i}.js`,
+    '@@ -1,1 +1,10 @@',
+    `+const x${i} = "${'a'.repeat(1800)}";`,
+  ].join('\n')).join('\n');
+  const bounded = formatDiffForPrompt(manySmall, 72000);
+  assert.ok(bounded.length <= 72000, `expected <= 72000, got ${bounded.length}`);
 });
 
 test('buildValidationMatrix maps remoteChecks into repository_required_checks and diagnostic rows (P0-A2)', () => {
@@ -482,7 +493,7 @@ test('buildNativePrompt includes nested evidence specs, remote checks, and capVe
     branch: 'fix/issue-24',
     motivation: 'fix prompt alignment',
     reviewTemplate: { sections: [], output_hint: '' },
-    reviewPlan: { required_evidence_ids: ['problem_context', 'change_proportionality', 'observable_semantics', 'validation_matrix'] },
+    reviewPlan: { required_evidence_ids: ['problem_context', 'change_proportionality', 'observable_semantics', 'semantic_alignment', 'validation_matrix'] },
     evidenceCommands: [],
     evidenceText: '',
     diff: 'diff --git a/a.js b/a.js\n+const x = 1;',
@@ -508,15 +519,24 @@ test('buildNativePrompt includes nested evidence specs, remote checks, and capVe
           fields: ['scope_coverage', 'decision_text_assessment', 'verdict'],
           verdict_values: ['equivalent'],
           scope_coverage: { fields: ['decision', 'reason'], decision_values: ['not_applicable'], applicable_fields: ['cases'], case_ids: ['covered_subject'], case_fields: ['case_id'], case_statuses: ['passed'] },
-          decision_text_assessment: { fields: ['verdict', 'checked_scope', 'reason'], verdict_values: ['not_applicable'], applicable_fields: ['clause_comparisons'], clause_fields: ['baseline_clause'], counterfactual_fields: ['status'] },
+          decision_text_assessment: { fields: ['verdict', 'checked_scope', 'reason'], verdict_values: ['not_applicable', 'intentional_change_validated'], fields_by_verdict: { intentional_change_validated: ['authorization_basis'] }, applicable_fields: ['clause_comparisons'], clause_fields: ['baseline_clause'], counterfactual_fields: ['status'] },
+        },
+        {
+          evidence_id: 'semantic_alignment',
+          fields: ['checked_scope', 'impact_reason', 'verdict'],
+          verdict_values: ['aligned', 'not_applicable'],
+          candidate_decisions: ['reuse_existing', 'local_only'],
         },
       ],
     },
   });
   assert.match(prompt, /outcome_impact\.user_experience\.visual_review/);
   assert.match(prompt, /spec_basis \(object\)/);
+  assert.match(prompt, /symbol_or_path, validation_ref/);
   assert.match(prompt, /architecture_assessment \(object\)/);
   assert.match(prompt, /scope_coverage \(object\)/);
+  assert.match(prompt, /intentional_change_validated=\[authorization_basis\]/);
+  assert.match(prompt, /candidate_decisions: reuse_existing\|local_only/);
   assert.match(prompt, /Four Gates.*bucket=pass/);
 
   const approvedBody = finalizeReviewBody([

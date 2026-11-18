@@ -655,17 +655,22 @@ function formatDiffForPrompt(diff, maxChars = 240000) {
     let budget = tierBudgets[t];
     const small = [];
     const large = [];
-    const fair = Math.max(2000, Math.floor(budget / group.length));
+    const perFileShare = Math.floor(budget / group.length);
+    const fair = perFileShare >= 2000 ? perFileShare : Math.max(128, perFileShare);
     for (const e of group) {
       if (e.chars <= fair) small.push(e);
       else large.push(e);
     }
     for (const e of small) {
-      allocated.set(e.path, e.diff);
-      budget -= e.chars;
+      if (e.chars <= budget) {
+        allocated.set(e.path, e.diff);
+        budget -= e.chars;
+      } else {
+        large.push(e);
+      }
     }
     if (large.length) {
-      const perLarge = Math.max(512, Math.floor(budget / large.length));
+      const perLarge = Math.max(128, Math.floor(Math.max(0, budget) / large.length));
       for (const e of large) {
         allocated.set(e.path, compactFileDiff(e.diff, perLarge));
       }
@@ -673,7 +678,10 @@ function formatDiffForPrompt(diff, maxChars = 240000) {
   }
 
   const body = entries.map(e => allocated.get(e.path) || compactFileDiff(e.diff, 512)).join('\n');
-  return `${inventory}${body}`;
+  const combined = `${inventory}${body}`;
+  if (combined.length <= maxChars) return combined;
+  const suffix = '\n[DIFF_BUDGET_CLAMPED]\n';
+  return combined.slice(0, Math.max(0, maxChars - suffix.length)) + suffix;
 }
 
 module.exports = {

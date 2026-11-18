@@ -428,12 +428,24 @@ function prDiff(repo, prId) {
 
 function fetchPrChecks(repo, prId) {
   const r = sh('gh', ['pr', 'checks', String(prId), '--repo', repo, '--json', 'name,state,bucket,link']);
-  if (r.status !== 0 || !r.stdout) return [];
+  if (r.status !== 0) {
+    const detail = (r.stderr || r.stdout || `exit ${r.status}`).trim().slice(0, 200);
+    console.warn(`[WARN] gh pr checks failed for ${repo}#${prId}: ${detail}`);
+    return { checks: [], error: detail };
+  }
+  if (!r.stdout || !r.stdout.trim()) return { checks: [], error: null };
   try {
     const parsed = JSON.parse(r.stdout);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_) {
-    return [];
+    if (!Array.isArray(parsed)) {
+      const detail = 'gh pr checks returned non-array JSON';
+      console.warn(`[WARN] ${detail} for ${repo}#${prId}`);
+      return { checks: [], error: detail };
+    }
+    return { checks: parsed, error: null };
+  } catch (e) {
+    const detail = `gh pr checks JSON parse error: ${e.message}`;
+    console.warn(`[WARN] ${detail} for ${repo}#${prId}`);
+    return { checks: [], error: detail };
   }
 }
 
@@ -699,6 +711,9 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
       const pairs = Object.entries(r.fields_by_verdict).map(([k, v]) => `${k}=[${(v || []).join(', ')}]`).join('; ');
       if (pairs) lines.push(`  - fields_by_verdict: ${pairs}`);
     }
+    if (Array.isArray(r.candidate_decisions) && r.candidate_decisions.length) {
+      lines.push(`  - candidate_decisions: ${r.candidate_decisions.join('|')}`);
+    }
     if (r.positive_field && Array.isArray(r.positive_fields)) {
       lines.push(`  - ${r.positive_field} (object): ${r.positive_fields.join(', ')}`);
     }
@@ -714,7 +729,7 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
           lines.push(`  - outcome_impact.user_experience.visual_review (object): {${(vr.fields || ['decision', 'reason']).join(', ')}}; decision_values=${(vr.decision_values || []).join('|')} (CLI/internal-only changes use "not_applicable"); if decision!="not_applicable" also require [${(vr.applicable_fields || []).join(', ')}] and publish reason + unverified_scope in 我的整体评价`);
         }
       }
-      lines.push('  - spec_basis (object): {decision: mapped|no_spec|not_yet_proven, spec_source: accepted_rfc|accepted_contract_doc|linked_issue_or_task|review_thread|none, reason}; if decision=="no_spec" use spec_source="none"; if decision=="mapped" also require spec_ref, spec_revision (full 40-char commit SHA for RFC/contract docs), criteria=[{criterion_id, requirement, disposition: implemented|deferred|out_of_scope|not_met, ...}] and publish spec_ref, spec_revision, criterion_id in review_body');
+      lines.push('  - spec_basis (object): {decision: mapped|no_spec|not_yet_proven, spec_source: accepted_rfc|accepted_contract_doc|linked_issue_or_task|review_thread|none, reason}; if decision=="no_spec" use spec_source="none"; if decision=="mapped" also require spec_ref, spec_revision (full 40-char commit SHA for RFC/contract docs), criteria=[{criterion_id, requirement, disposition: implemented|deferred|out_of_scope|not_met}] where disposition=="implemented" MUST include [symbol_or_path, validation_ref], "deferred" MUST include [reason, successor_or_gap], "out_of_scope" MUST include [reason], "not_met" MUST include [observed_gap, minimum_repair], and publish spec_ref, spec_revision, criterion_id in review_body');
     }
     if (r.compatibility_assessment) {
       const ca = r.compatibility_assessment;
@@ -730,7 +745,10 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
     }
     if (r.decision_text_assessment) {
       const dt = r.decision_text_assessment;
-      lines.push(`  - decision_text_assessment (object): {${(dt.fields || []).join(', ')}}; verdict_values=${(dt.verdict_values || []).join('|')}; when verdict!="not_applicable" also require [${(dt.applicable_fields || []).join(', ')}] (clause_fields=[${(dt.clause_fields || []).join(', ')}], counterfactual_fields=[${(dt.counterfactual_fields || []).join(', ')}])`);
+      const dtByVerdict = dt.fields_by_verdict && typeof dt.fields_by_verdict === 'object'
+        ? Object.entries(dt.fields_by_verdict).map(([k, v]) => `${k}=[${(v || []).join(', ')}]`).join('; ')
+        : '';
+      lines.push(`  - decision_text_assessment (object): {${(dt.fields || []).join(', ')}}; verdict_values=${(dt.verdict_values || []).join('|')}${dtByVerdict ? `; fields_by_verdict: ${dtByVerdict}` : ''}; when verdict!="not_applicable" also require [${(dt.applicable_fields || []).join(', ')}] (clause_fields=[${(dt.clause_fields || []).join(', ')}], counterfactual_fields=[${(dt.counterfactual_fields || []).join(', ')}])`);
     }
     if (r.state_model_assessment) {
       lines.push(`  - state_model_assessment (object): classification_values=${(r.state_model_assessment.classification_values || []).join('|')}; item_fields=[${(r.state_model_assessment.item_fields || []).join(', ')}] (or {classification, reason} when no new state)`);
@@ -747,7 +765,7 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
 
 // 用原生 review_template（agent_instruction + 字数下限）+ evidence_commands + motivation 构建提示词。
 // 注意：这是"透传原生提示词约束"，不是手写版式。模型被要求严格按五段式产出。
-function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract, remoteChecks }) {
+function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract, remoteChecks, remoteChecksError }) {
   const prior = (priorFindings || []).map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
   const sectionsMd = (reviewTemplate.sections || []).map(s =>
     `### ${s.label}（最少 ${s.minimum_prose_characters} 正文字符）\n约束提示词：${s.agent_instruction || ''}`,
@@ -758,7 +776,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   const evidenceRequirements = formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan);
   const remoteChecksText = Array.isArray(remoteChecks) && remoteChecks.length
     ? remoteChecks.map(c => `- \`${c.name || 'check'}\`: state=${c.state || 'unknown'}, bucket=${c.bucket || 'unknown'}${c.link ? ` (${c.link})` : ''}`).join('\n')
-    : '(无远端 CI 检查记录或 gh pr checks 不可用)';
+    : (remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)');
   const formattedDiff = formatDiffForPrompt(diff, 240000);
   const head10 = headOid.slice(0, 10);
 
@@ -1266,7 +1284,9 @@ function main() {
 
   // --- 2. 执行原生 evidence_commands，收集证据（nativeMode 下驱动模型）---
   const evidenceText = runEvidenceCommands(pkt.evidenceCommands);
-  const remoteChecks = fetchPrChecks(o.repo, o.pr);
+  const remoteChecksRes = fetchPrChecks(o.repo, o.pr);
+  const remoteChecks = remoteChecksRes.checks;
+  const remoteChecksError = remoteChecksRes.error;
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
     try { validation = buildValidationMatrix(gates(), { headOid, remoteChecks }); } catch (e) { validation = []; }
@@ -1285,6 +1305,7 @@ function main() {
     evidenceCommands: pkt.evidenceCommands, evidenceText, diff, priorFindings,
     evidenceContract: pkt.evidenceContract || {},
     remoteChecks,
+    remoteChecksError,
   });
 
   // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
