@@ -1,12 +1,18 @@
-const test = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync, execSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const MOCK_BIN_DIR = path.join(PROJECT_ROOT, '.tmp-mock-bin-review-lock');
+
+// issue #8：测试临时工件必须隔离在 os.tmpdir()+mkdtemp，禁止共享 /tmp 固定文件名。
+const TEST_TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-review-lock-'));
+const MOCK_COMMENT_LOG = path.join(TEST_TMP_DIR, 'last-mock-pr-comment.txt');
+after(() => fs.rmSync(TEST_TMP_DIR, { recursive: true, force: true }));
 
 function setupMockGh(options = {}) {
   if (!fs.existsSync(MOCK_BIN_DIR)) {
@@ -41,10 +47,10 @@ JSONEOF
 fi
 
 if [[ "$cmd" == "pr" && "$subcmd" == "comment" ]]; then
-  echo "$*" > /tmp/last-mock-pr-comment.txt
+  echo "$*" > ${JSON.stringify(MOCK_COMMENT_LOG)}
   prev=""
   for a in "$@"; do
-    if [[ "$prev" == "--body-file" ]]; then cat "$a" >> /tmp/last-mock-pr-comment.txt; fi
+    if [[ "$prev" == "--body-file" ]]; then cat "$a" >> ${JSON.stringify(MOCK_COMMENT_LOG)}; fi
     prev="$a"
   done
   echo "[Mock GH] Comment posted"
@@ -105,8 +111,8 @@ function cleanupMock() {
   if (fs.existsSync(MOCK_BIN_DIR)) {
     fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true });
   }
-  if (fs.existsSync('/tmp/last-mock-pr-comment.txt')) {
-    fs.unlinkSync('/tmp/last-mock-pr-comment.txt');
+  if (fs.existsSync(MOCK_COMMENT_LOG)) {
+    fs.unlinkSync(MOCK_COMMENT_LOG);
   }
 }
 
@@ -127,8 +133,8 @@ test('1. Native Five-Section Review: loopx-flow review must render loopx pr-revi
     });
 
     assert.strictEqual(res.status, 0, `review command must exit 0: ${res.stderr}`);
-    assert.strictEqual(fs.existsSync('/tmp/last-mock-pr-comment.txt'), true, 'Must post comment via gh');
-    const comment = fs.readFileSync('/tmp/last-mock-pr-comment.txt', 'utf8');
+    assert.strictEqual(fs.existsSync(MOCK_COMMENT_LOG), true, 'Must post comment via gh');
+    const comment = fs.readFileSync(MOCK_COMMENT_LOG, 'utf8');
 
     // 原生五段式章节齐备，且必须携带动态元数据/声明/关键代码讲解
     for (const label of ['动机', '改动思路', '具体改动', '对主干的风险', '我的整体评价']) {
