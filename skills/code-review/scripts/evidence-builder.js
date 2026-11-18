@@ -259,15 +259,40 @@ function buildValidationMatrix(gates, opts = {}) {
     opts,
   ));
   const allFourPassed = names.every(n => rows.find(r => r.case_id === n)?.status === 'passed');
+  const remoteChecks = Array.isArray(opts.remoteChecks) ? opts.remoteChecks.filter(isPlainObject) : [];
+  const remoteSummary = remoteChecks.length
+    ? remoteChecks.map(c => `${c.name || 'check'}=${c.bucket || c.state || 'unknown'}`).join(', ')
+    : '';
   rows.push({
     case_id: 'repository_required_checks',
     invariant_or_case: 'repository-required checks',
-    command_or_check: 'npm run typecheck && npm run lint && npm run build && npm run test',
+    command_or_check: remoteChecks.length
+      ? 'npm run typecheck && npm run lint && npm run build && npm run test ; gh pr checks'
+      : 'npm run typecheck && npm run lint && npm run build && npm run test',
     status: allFourPassed ? 'passed' : 'unverified',
-    result: allFourPassed ? 'all repository gates executed' : 'not all repository gates passed',
+    result: allFourPassed
+      ? (remoteSummary ? `all repository gates executed; remote checks: ${remoteSummary}` : 'all repository gates executed')
+      : (remoteSummary ? `not all repository gates passed; remote checks: ${remoteSummary}` : 'not all repository gates passed'),
     required: true,
     skip_or_failure_reason: allFourPassed ? 'not applicable: all gates passed' : 'unverified: not all repository gates exited 0',
   });
+  for (const rc of remoteChecks) {
+    const bucket = String(rc.bucket || '').toLowerCase();
+    if (bucket === 'pass') continue;
+    const slug = String(rc.name || 'check').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'check';
+    const status = bucket === 'fail'
+      ? 'failed'
+      : (bucket === 'pending' ? 'pending' : ((bucket === 'skipping' || bucket === 'cancel') ? 'skipped' : 'unverified'));
+    rows.push({
+      case_id: `remote_check_${slug}`,
+      invariant_or_case: `remote CI check: ${rc.name || slug}`,
+      command_or_check: `gh pr checks (${rc.name || slug})`,
+      status,
+      result: `${rc.name || slug}: ${rc.state || rc.bucket || 'unknown'}`,
+      required: false,
+      skip_or_failure_reason: `diagnostic remote CI observation (${rc.state || rc.bucket || 'unknown'})`,
+    });
+  }
   return rows;
 }
 
@@ -419,6 +444,11 @@ function isValidJudgmentRow(id, modelRow, req, plan) {
   if (Array.isArray(req.verdict_values) && req.verdict_values.length) {
     if (!req.verdict_values.includes(modelRow.verdict)) return false;
   }
+  if (isPlainObject(req.fields_by_verdict) && typeof modelRow.verdict === 'string') {
+    for (const field of req.fields_by_verdict[modelRow.verdict] || []) {
+      if (isMissingValue(modelRow[field])) return false;
+    }
+  }
   if (typeof req.positive_field === 'string') {
     const pos = modelRow[req.positive_field];
     if (!isPlainObject(pos)) return false;
@@ -439,6 +469,8 @@ function isValidJudgmentRow(id, modelRow, req, plan) {
     if (!isPlainObject(oi) || !isPlainObject(oi.long_horizon) || !isPlainObject(oi.user_experience)) return false;
     if (isMissingValue(oi.long_horizon.decision) || isMissingValue(oi.long_horizon.reason)) return false;
     if (isMissingValue(oi.user_experience.decision) || isMissingValue(oi.user_experience.reason)) return false;
+    const vr = oi.user_experience.visual_review;
+    if (!isPlainObject(vr) || isMissingValue(vr.decision) || isMissingValue(vr.reason)) return false;
     const sb = modelRow.spec_basis;
     if (!isPlainObject(sb) || isMissingValue(sb.decision) || isMissingValue(sb.spec_source) || isMissingValue(sb.reason)) return false;
     if (sb.decision === 'mapped') {
@@ -544,6 +576,106 @@ function scanDiff(diff) {
   return findings;
 }
 
+function classifyDiffFile(filePath) {
+  const p = String(filePath || '');
+  if (/^(?:tests?|__tests__|spec)\/|\.test\.[^/]+$|\.spec\.[^/]+$/i.test(p)) return 'tests';
+  if (/^(?:docs|specs)\//i.test(p) || /\.md$/i.test(p)) return 'docs';
+  return 'prod';
+}
+
+function compactFileDiff(fileDiff, maxChars) {
+  const text = String(fileDiff || '');
+  if (text.length <= maxChars) return text;
+  const marker = `\n[FILE_DIFF_COMPACTED: omitted ${text.length - Math.max(0, maxChars - 96)} of ${text.length} chars]\n`;
+  const keep = Math.max(0, maxChars - marker.length);
+  if (keep === 0) return text.slice(0, maxChars);
+  let cut = text.lastIndexOf('\n', keep);
+  if (cut < Math.floor(keep * 0.5)) cut = keep;
+  return text.slice(0, cut) + marker;
+}
+
+function formatDiffForPrompt(diff, maxChars = 240000) {
+  const text = String(diff || '');
+  if (text.length <= maxChars) return text;
+  const fileMap = splitFileDiffs(text);
+  const entries = [...fileMap.entries()].map(([filePath, fileDiff]) => {
+    const st = diffStats(fileDiff);
+    return {
+      path: filePath,
+      diff: fileDiff,
+      tier: classifyDiffFile(filePath),
+      chars: fileDiff.length,
+      additions: st.additions,
+      deletions: st.deletions,
+    };
+  });
+  if (!entries.length) return `${text.slice(0, maxChars)}\n\n[TRUNCATED]`;
+
+  const inventoryLines = [
+    `## Diff File Inventory (${entries.length} files, total ${text.length} chars > ${maxChars} limit; per-file prioritized budget)`,
+    ...entries.map(e => `- [${e.tier}] \`${e.path}\` (+${e.additions}/-${e.deletions}, ${e.chars} chars)`),
+    '',
+  ];
+  const inventory = inventoryLines.join('\n');
+  const remainingTotal = Math.max(1000, maxChars - inventory.length - 128);
+
+  const byTier = {
+    prod: entries.filter(e => e.tier === 'prod'),
+    tests: entries.filter(e => e.tier === 'tests'),
+    docs: entries.filter(e => e.tier === 'docs'),
+  };
+  const weights = { prod: 0.55, tests: 0.30, docs: 0.15 };
+  const activeTiers = Object.keys(byTier).filter(t => byTier[t].length > 0);
+  const totalWeight = activeTiers.reduce((acc, t) => acc + weights[t], 0) || 1;
+
+  const tierBudgets = {};
+  let leftover = 0;
+  for (const t of activeTiers) {
+    const rawBudget = Math.floor(remainingTotal * (weights[t] / totalWeight));
+    const needed = byTier[t].reduce((acc, e) => acc + e.chars + 2, 0);
+    if (needed <= rawBudget) {
+      tierBudgets[t] = needed;
+      leftover += (rawBudget - needed);
+    } else {
+      tierBudgets[t] = rawBudget;
+    }
+  }
+  for (const t of ['tests', 'prod', 'docs']) {
+    if (!leftover || !byTier[t].length) continue;
+    const needed = byTier[t].reduce((acc, e) => acc + e.chars + 2, 0);
+    const gap = Math.max(0, needed - tierBudgets[t]);
+    const add = Math.min(leftover, gap);
+    tierBudgets[t] += add;
+    leftover -= add;
+  }
+
+  const allocated = new Map();
+  for (const t of activeTiers) {
+    const group = byTier[t];
+    let budget = tierBudgets[t];
+    const small = [];
+    const large = [];
+    const fair = Math.max(2000, Math.floor(budget / group.length));
+    for (const e of group) {
+      if (e.chars <= fair) small.push(e);
+      else large.push(e);
+    }
+    for (const e of small) {
+      allocated.set(e.path, e.diff);
+      budget -= e.chars;
+    }
+    if (large.length) {
+      const perLarge = Math.max(512, Math.floor(budget / large.length));
+      for (const e of large) {
+        allocated.set(e.path, compactFileDiff(e.diff, perLarge));
+      }
+    }
+  }
+
+  const body = entries.map(e => allocated.get(e.path) || compactFileDiff(e.diff, 512)).join('\n');
+  return `${inventory}${body}`;
+}
+
 module.exports = {
   listFiles,
   splitFileDiffs,
@@ -552,4 +684,5 @@ module.exports = {
   buildEvidenceGraph,
   describeFileFromDiff,
   scanDiff,
+  formatDiffForPrompt,
 };
