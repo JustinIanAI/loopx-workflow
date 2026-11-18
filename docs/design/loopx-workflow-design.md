@@ -51,8 +51,8 @@ flowchart LR
 
 | 命令 | 实现函数 | 满足的需求 | 失败即停的要点 |
 |---|---|---|---|
-| `doctor` | `cmd_doctor`、`cmd_doctor_control_plane` | 环境哨兵、`REQ-ENV-1`、`REQ-ENV-2`、`REQ-CAPABILITY-1` | preflight 失败、`loopx doctor` 失败、或本机没有 `loopx` 均非 0。诊断卡含原因/影响/修复命令。控制面路由/registry 一致性、`~/.loopx` 半迁移残留、运行时工件被跟踪、GitHub API 50% 预算基线为 WARN 级检查（见 ADR-0007） |
-| `init` | `cmd_init` | `REQ-MAIN-1`、`REQ-AUTH-MODE-1` | 安装 pre-commit；确认 `authorization_mode` 与风险接受；有 `loopx` 时 `bootstrap` 失败则退出 |
+| `doctor` | `cmd_doctor`、`cmd_doctor_control_plane` | 环境哨兵、`REQ-ENV-1`、`REQ-ENV-2`、`REQ-CAPABILITY-1`、`REQ-SKILL-READY-1` | preflight 失败（含本机已有 `loopx` 时 required skills/routes/新鲜度未通过）、`loopx doctor` 失败、或本机没有 `loopx` 均非 0。诊断卡含原因/影响/修复命令。控制面路由/registry 一致性、`~/.loopx` 半迁移残留、运行时工件被跟踪、GitHub API 50% 预算基线为 WARN 级检查（见 ADR-0007） |
+| `init` | `cmd_init` | `REQ-MAIN-1`、`REQ-AUTH-MODE-1`、`REQ-SKILL-READY-1` | 安装 pre-commit；确认 `authorization_mode` 与风险接受；preflight 在已有 `loopx` 时阻断缺失或过期的 required skills；有 `loopx` 时 `bootstrap` 失败则退出 |
 | `feature <name>` | `cmd_feature` | `REQ-FAILCLOSED-2`、`REQ-CAPSULE-1` | 分支创建或切换失败则退出，不写胶囊 |
 | `approve contract <feature>` | `cmd_approve` | `REQ-CHECKPOINT-1`、`REQ-GATE1-AUTH-1`、`REQ-AUTH-MODE-1` | 缺配置/规格不完整/未授权/`configure-goal`/`user_gate` 写入失败均非 0；先锁最终内容 SHA256，成功后才原子写入批准标记 |
 | `gate verify decisions\|contract` | `cmd_gate` | `REQ-GATE-DECISIONS-1`、`REQ-CONTRACT-LOCK-1`、`REQ-GATE1-AUTH-1` | 见第 5 节：SHA + user_gate 授权记录 + evidence 串；没有 `pr` 这个 stage |
@@ -275,6 +275,10 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | 租约已过期或已释放 | `todo claim` | 使用纳入 `lease_epoch` 与 `version` 的下一把幂等键 |
 | `task-lease acquire` 被 LoopX 拒绝 | `todo claim` | 非 0，保留 LoopX 的拒绝结果；`idempotency_key_reuse` 原样输出，不用“其他 Agent 持有”概括 |
 | 无 `loopx` | `doctor` | 非 0，输出诊断卡 |
+| 本机有 `loopx`，required skills 缺失、路由过期或冲突，新鲜度为 `stale` / `repair_recommended` / `missing`，或 `skill_delivery` 为 `repair_recommended` | `preflight` / `init` / `doctor` | 非 0，打印修复指令。`loopx doctor` 退出码 0 也不放行 |
+| 本机有 `loopx`，但 `loopx doctor` 非 0 或 stdout 不是 JSON | `preflight` / `init` / `doctor` | 非 0，不把环境标为就绪 |
+| 技能检查 `applicable: false` | `preflight` / `init` | 不因宿主自管技能阻断 |
+| 本机没有 `loopx` | `preflight` / `init` | 只告警；退出码仍由其余阻断项决定（ADR-0003） |
 | Mode A `reviewDecision != APPROVED` 或 review `commit_id != headRefOid` | `merge` | 非 0，不调用 `gh pr merge` |
 | 合入锁失败或 HEAD 在锁后变化 | `merge` | 非 0 |
 | 无 `loopx` | `approve` | 非 0，且不写批准标记 |
@@ -320,6 +324,7 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | `REQ-REVIEW-1` `REQ-PR-BODY-1` `REQ-RESPOND-1` | `authentic-review-pipeline`、`loopx-ecosystem-alignment` | `authentic-review.js`、`respond-report.js`、`cmd_pr`、`cmd_respond` |
 | `REQ-NATIVE-1` | `native-dispatch-deep-integration` | `cmd_todo`、`cmd_issue`、`cmd_integrate` |
 | `REQ-LEASE-1` | 本次修复 GitHub #12，无新胶囊 | `resolve_claim_owner`、`claim_idempotency_key`、`cmd_todo_lease` 的 claim |
+| `REQ-SKILL-READY-1` | 本次修复 GitHub #11，无新胶囊 | `scripts/preflight-check.sh`、`scripts/loopx-skill-readiness.js`、`scripts/workflow-init.sh` |
 | `REQ-GOAL-1` | `loopx-ecosystem-alignment`、`fail-closed-hardening` | `cmd_merge` 的 goal stop/retire/sync/archive 补偿 |
 | `REQ-CHECK-IDENTITY-1` | `fail-closed-hardening` | `cmd_check`、`ingest-to-loopx-quality.js` |
 | `REQ-QUALITY-2` | `change-quality-failclosed` | `ingest-to-loopx-quality.js`、`authentic-review.js` 的 PR body |
