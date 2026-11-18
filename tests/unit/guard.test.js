@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const HOOK_SCRIPT = path.join(PROJECT_ROOT, 'scripts/git-hooks/pre-commit');
+const { withoutRepoConfig } = require('./helpers/repo-isolation');
 
 test('1. Stage Signature Gate: decisions check in specs/features/<feat>/01-decisions.md', () => {
   // Test non-existent feature
@@ -50,10 +51,10 @@ test('2. Stage Signature Gate: contract check in specs/features/<feat>/04-contra
   fs.writeFileSync(regPath, JSON.stringify(reg, null, 2));
 
   // Test feature with FROZEN & APPROVED marker in 04-contract.md
-  const resApproved = spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'hard-guard'], {
+  const resApproved = withoutRepoConfig(() => spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'hard-guard'], {
     encoding: 'utf8',
     env: { ...process.env, LOOPX_REGISTRY: regPath },
-  });
+  }));
   assert.strictEqual(resApproved.status, 0, 'Approved contract file must pass gate check');
 });
 

@@ -34,12 +34,17 @@ test('3. Registry Boundary: .loopx/registry.json is untracked by Git and ignored
   assert.strictEqual(lsFiles, '', '.loopx/registry.json must not be tracked in git index');
 });
 
-test('4. Goal State Capsule Binding: cmd_feature binds state-file into specs/features/<feat>/ACTIVE_STATE.md', () => {
+test('4. Goal State Runtime Binding: cmd_feature binds state-file into .loopx/goals/<goal_id>/ACTIVE_GOAL_STATE.md (ADR-0008)', () => {
   const flowCode = fs.readFileSync(LOOPX_FLOW, 'utf8');
   assert.match(
     flowCode,
-    /--state-file\s+.*specs\/features\/\$feature\/ACTIVE_STATE\.md/,
-    'cmd_feature must pass capsule-bound --state-file to loopx bootstrap'
+    /state_file="\.loopx\/goals\/\$\{?goal_id\}?\/ACTIVE_GOAL_STATE\.md"/,
+    'cmd_feature must bind runtime state_file into .loopx/goals/<goal_id>/ACTIVE_GOAL_STATE.md'
+  );
+  assert.match(
+    flowCode,
+    /--state-file\s+"\$state_file"/,
+    'cmd_feature must pass --state-file "$state_file" to loopx bootstrap'
   );
 });
 

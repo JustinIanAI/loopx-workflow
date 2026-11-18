@@ -24,7 +24,7 @@ if [[ "$args" == *"agent-directory"* ]]; then
 fi
 
 if [[ "$args" == *"task-lease inspect"* ]]; then
-  echo '{"ok":true,"action":"inspect","active":false,"lease":null}'
+  echo '{"ok":true,"action":"inspect","active":false,"lease":null,"version":1,"owner":"loopx-flow-agent"}'
   exit 0
 fi
 
@@ -47,7 +47,7 @@ if [[ "$args" == *"issue-fix feasibility"* ]]; then
     echo "[Mock LoopX] feasibility engine error" >&2
     exit 1
   fi
-  echo '{"route": "fix_pr", "rationale": "bounded scope with confirmed reproduction"}'
+  echo '{"decision": {"route": "fix_pr", "rationale": "bounded scope with confirmed reproduction"}}'
   exit 0
 fi
 
@@ -147,6 +147,7 @@ test('2. Todo lease done: must complete todo then release the lease', () => {
     assert.ok(releaseCall, `must call task-lease release, got: ${calls.join(' | ')}`);
     assert.strictEqual(completeCall.includes('--todo-id todo_ab12cd34ef56'), true, 'complete must target the todo');
     assert.strictEqual(releaseCall.includes('--todo-id todo_ab12cd34ef56'), true, 'release must target the todo');
+    assert.strictEqual(releaseCall.includes('--expected-version 1'), true, 'release must use inspect version CAS');
   } finally {
     cleanupMocks();
   }
