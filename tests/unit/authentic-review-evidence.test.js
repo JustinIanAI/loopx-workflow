@@ -32,7 +32,7 @@ const DIFF = [
 ].join('\n');
 
 const CONTRACT = {
-  policy_revision: 22,
+  policy_revision: 26,
   evidence_requirements: [
     { evidence_id: 'problem_context', fields: ['goal_basis','author_claim','old_behavior','affected_caller_or_operator','compounding_cost','before_after_scenario','smaller_fix_analysis','observable_outcome','outcome_impact','spec_basis','non_goals'], verdict_values: ['goal_achieved'] },
     { evidence_id: 'architecture_flow', fields: ['entry_point','authoritative_input_or_state','decision_owner','side_effect_or_transition','receipt_or_consumer','failure_or_retry_owner'] },
@@ -58,7 +58,7 @@ const PLAN = {
     'symbol_map',
     'change_proportionality',
   ],
-  result_template: { review_policy_revision: 22, evidence: {} },
+  result_template: { review_policy_revision: 26, evidence: {} },
 };
 
 function build(extra = {}) {

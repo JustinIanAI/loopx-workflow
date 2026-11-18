@@ -46,7 +46,6 @@ const {
 } = require('./evidence-builder');
 
 const TIMEOUT_MS = 600000;
-const LOOPX_POLICY_REVISION = 22; // loopx review_contract.REVIEW_POLICY_REVISION
 // 评审结果私有落盘目录（不入 Git；供 loopx-flow respond 复用原生格式核销）
 const REVIEW_RESULT_DIR = path.join('.loopx', 'reviews');
 
@@ -213,8 +212,205 @@ function parseArgs(argv) {
   return o;
 }
 
-function sh(bin, args, timeoutMs) {
-  return spawnSync(bin, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs || 120000 });
+function sh(bin, args, timeoutMs, env) {
+  return spawnSync(bin, args, {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: timeoutMs || 120000,
+    ...(env ? { env } : {}),
+  });
+}
+
+// policy_revision 属于本机已安装 loopx 的运行时契约。禁止写死旧修订号，
+// 也无法从评审包或该可执行文件解析出正整数时直接 fail-closed。
+function parsePolicyRevision(value) {
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value;
+  if (typeof value === 'string' && /^[1-9]\d*$/.test(value.trim())) return Number(value.trim());
+  return null;
+}
+
+function isExecutableFile(filePath) {
+  try {
+    const st = fs.statSync(filePath);
+    if (!st.isFile()) return false;
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function findOnPath(name, pathEnv) {
+  for (const dir of String(pathEnv || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return null;
+}
+
+function activeRuntimeCandidates(env) {
+  const roots = [
+    ['CONDA_PREFIX', env.CONDA_PREFIX],
+    ['VIRTUAL_ENV', env.VIRTUAL_ENV],
+    ['MAMBA_ROOT_PREFIX', env.MAMBA_ROOT_PREFIX],
+  ];
+  const out = [];
+  for (const [source, root] of roots) {
+    if (!root) continue;
+    out.push({ source, file: path.join(root, 'bin', 'loopx') });
+  }
+  if (env.CONDA_EXE) {
+    out.push({ source: 'CONDA_EXE', file: path.join(path.dirname(env.CONDA_EXE), 'loopx') });
+  }
+  return out;
+}
+
+function resolveLoopxExecutable(env = process.env) {
+  const explicit = typeof env.LOOPX_BIN === 'string' ? env.LOOPX_BIN.trim() : '';
+  if (explicit) {
+    let candidate = null;
+    if (explicit.includes('/') || explicit.includes('\\')) {
+      const abs = path.isAbsolute(explicit) ? explicit : path.resolve(explicit);
+      if (isExecutableFile(abs)) candidate = abs;
+    } else {
+      candidate = findOnPath(explicit, env.PATH);
+    }
+    if (candidate) return { ok: true, bin: candidate, source: 'LOOPX_BIN' };
+    return {
+      ok: false,
+      error: `LOOPX_BIN is set to "${explicit}" but it is not an executable file. Refusing to fall back to PATH (fail-closed).`,
+    };
+  }
+  const fromPath = findOnPath('loopx', env.PATH);
+  if (fromPath) return { ok: true, bin: fromPath, source: 'PATH' };
+  for (const item of activeRuntimeCandidates(env)) {
+    if (isExecutableFile(item.file)) return { ok: true, bin: item.file, source: item.source };
+  }
+  return {
+    ok: false,
+    error: 'No executable loopx found via LOOPX_BIN, PATH, or the active runtime (CONDA_PREFIX, CONDA_EXE, VIRTUAL_ENV, MAMBA_ROOT_PREFIX). Set LOOPX_BIN to an executable path (fail-closed).',
+  };
+}
+
+function readShebangProgram(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(256);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    const line = buf.slice(0, n).toString('utf8').split('\n', 1)[0];
+    if (!line.startsWith('#!')) return '';
+    return line.slice(2).trim();
+  } catch (_) {
+    return '';
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) { /* ignore */ }
+    }
+  }
+}
+
+function resolveShebangProgram(shebang, env, loopxBin) {
+  const parts = String(shebang || '').split(/\s+/).filter(Boolean);
+  if (!parts.length) return null;
+  if (path.basename(parts[0]) === 'env') {
+    const prog = parts.slice(1).find(arg => !arg.startsWith('-'));
+    if (!prog) return null;
+    if (loopxBin) {
+      const sibling = path.join(path.dirname(loopxBin), prog);
+      if (isExecutableFile(sibling)) return sibling;
+    }
+    return findOnPath(prog, env.PATH);
+  }
+  return isExecutableFile(parts[0]) ? parts[0] : null;
+}
+
+function lastNonEmptyLine(text) {
+  const lines = String(text || '').split('\n').map(s => s.trim()).filter(Boolean);
+  return lines.length ? lines[lines.length - 1] : '';
+}
+
+function clipDiag(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+}
+
+function probeLoopxPolicyRevision(loopxBin, env) {
+  const attempts = [];
+  const interp = resolveShebangProgram(readShebangProgram(loopxBin), env || {}, loopxBin);
+  if (interp && /python/i.test(path.basename(interp))) {
+    const r = sh(interp, ['-c', [
+      'from loopx.capabilities.pr_review_queue.review_contract import REVIEW_POLICY_REVISION',
+      'print(REVIEW_POLICY_REVISION)',
+    ].join('\n')], 30000);
+    const revision = r && r.status === 0 ? parsePolicyRevision(lastNonEmptyLine(r.stdout)) : null;
+    if (revision) {
+      return { ok: true, revision, source: 'loopx.review_contract.REVIEW_POLICY_REVISION' };
+    }
+    attempts.push(`python import exited ${r && r.status}: ${clipDiag(r && (r.stderr || r.stdout))}`);
+  }
+  const probed = sh(loopxBin, ['pr-review', '--print-policy-revision'], 30000);
+  const revision = probed && probed.status === 0 ? parsePolicyRevision(lastNonEmptyLine(probed.stdout)) : null;
+  if (revision) {
+    return { ok: true, revision, source: 'loopx pr-review --print-policy-revision' };
+  }
+  attempts.push(`--print-policy-revision exited ${probed && probed.status}: ${clipDiag(probed && (probed.stderr || probed.stdout))}`);
+  return { ok: false, error: attempts.filter(Boolean).join('; ') || 'runtime probe produced no policy_revision' };
+}
+
+function matchPacketPullRequest(packet, pr, headOid) {
+  const prs = packet && Array.isArray(packet.pull_requests) ? packet.pull_requests : [];
+  const head = String(headOid || '').toLowerCase();
+  return prs.find(p => `${p.number}@${String(p.head_oid || '').toLowerCase()}` === `${pr}@${head}`) || prs[0] || null;
+}
+
+function matchExactPacketPullRequest(packet, pr, headOid) {
+  const prs = packet && Array.isArray(packet.pull_requests) ? packet.pull_requests : [];
+  if (pr && headOid) {
+    const head = String(headOid).toLowerCase();
+    return prs.find(p => `${p.number}@${String(p.head_oid || '').toLowerCase()}` === `${pr}@${head}`) || null;
+  }
+  return prs.length === 1 ? prs[0] : null;
+}
+
+function policyRevisionFromPacket(packet, pr, headOid) {
+  if (!packet || typeof packet !== 'object') return null;
+  const contract = packet.agent_response_contract && packet.agent_response_contract.review_execution_contract;
+  const fromContract = parsePolicyRevision(contract && contract.policy_revision);
+  if (fromContract) {
+    return {
+      revision: fromContract,
+      source: 'agent_response_contract.review_execution_contract.policy_revision',
+    };
+  }
+  const match = matchExactPacketPullRequest(packet, pr, headOid);
+  if (!match) return null;
+  const fromResult = parsePolicyRevision(match.result_template && match.result_template.review_policy_revision);
+  if (fromResult) {
+    return { revision: fromResult, source: 'pull_requests.result_template.review_policy_revision' };
+  }
+  const planTemplate = match.review_plan && match.review_plan.result_template;
+  const fromPlan = parsePolicyRevision(planTemplate && planTemplate.review_policy_revision);
+  if (fromPlan) {
+    return { revision: fromPlan, source: 'pull_requests.review_plan.result_template.review_policy_revision' };
+  }
+  return null;
+}
+
+function resolveReviewPolicyRevision({ packet, pr, headOid, loopxBin, env, probe } = {}) {
+  const fromPacket = policyRevisionFromPacket(packet, pr, headOid);
+  if (fromPacket) return { ok: true, revision: fromPacket.revision, source: fromPacket.source };
+  const probed = typeof probe === 'function'
+    ? probe(loopxBin)
+    : probeLoopxPolicyRevision(loopxBin, env || process.env);
+  if (probed && probed.ok && parsePolicyRevision(probed.revision)) {
+    return { ok: true, revision: probed.revision, source: probed.source || 'loopx-runtime-probe' };
+  }
+  const detail = probed && probed.error ? ` Runtime probe failed: ${probed.error}` : '';
+  return {
+    ok: false,
+    error: 'Unable to resolve a positive integer policy_revision from the loopx packet (agent_response_contract.review_execution_contract.policy_revision or result_template.review_policy_revision) or from the local loopx runtime.' + detail + ' Refusing to fall back to a hardcoded revision (fail-closed).',
+  };
 }
 
 function prView(repo, prId) {
@@ -325,16 +521,27 @@ function buildBody(feature, diff) {
 }
 
 let GATES_CACHE = null;
-function gates() {
-  if (GATES_CACHE) return GATES_CACHE;
+function isolatedGateEnv(baseEnv = process.env) {
+  const clean = { ...baseEnv };
+  delete clean.REVIEW_SHORTCIRCUIT;
+  delete clean.REVIEW_DEBOUNCE_SECONDS;
+  delete clean.REVIEW_UPSERT_PUBLISH;
+  delete clean.REVIEW_BACKOFF_BASE_MS;
+  delete clean.REVIEW_MAX_RETRIES;
+  return clean;
+}
+
+function gates(opts = {}) {
+  if (!opts.noCache && GATES_CACHE) return GATES_CACHE;
   const bin = process.env.AUTHENTIC_REVIEW_GATES_BIN || 'npm';
   const names = ['typecheck', 'lint', 'build', 'test'];
   const out = {};
+  const gateEnv = isolatedGateEnv(opts.env || process.env);
   for (const g of names) {
-    const r = sh(bin, ['run', g], 300000);
+    const r = sh(bin, ['run', g], 300000, gateEnv);
     out[g] = r.status === 0 ? 'PASSED' : `FAILED (exit ${r.status})`;
   }
-  GATES_CACHE = out;
+  if (!opts.noCache) GATES_CACHE = out;
   return out;
 }
 
@@ -345,17 +552,21 @@ function gates() {
 // 取原生评审包：review_template / review_plan / evidence_commands / motivation
 // 注意：若 loopx 命令本身失败 -> 抛错（无法获取原生能力，fail-closed）；
 // 若命令成功但本 PR 不在 pull_requests（如测试/无该 PR 的环境）-> 返回包，由 main 判定降级。
-function fetchPacket(repo, pr, headOid, packetFile) {
+function fetchPacket(repo, pr, headOid, packetFile, loopxBin) {
   if (packetFile && fs.existsSync(packetFile)) {
     return JSON.parse(fs.readFileSync(packetFile, 'utf8'));
   }
+  if (!loopxBin) {
+    throw new Error('loopx executable is not resolved; refusing to invoke an implicit loopx (fail-closed).');
+  }
   const r = sh(
-    process.env.LOOPX_BIN || 'loopx',
+    loopxBin,
     ['pr-review', '--repo', repo, '--target-exact-head', `${pr}@${headOid}`, '--format', 'json'],
     300000,
   );
   if (r.status !== 0) {
-    throw new Error(`loopx pr-review packet scan failed: ${(r.stderr || r.stdout || '').slice(0, 240).replace(/\n/g, ' ')}`);
+    const detail = (r.stderr || r.stdout || (r.error && r.error.message) || '').slice(0, 240).replace(/\n/g, ' ');
+    throw new Error(`loopx pr-review packet scan failed (bin=${loopxBin}): ${detail}`);
   }
   return JSON.parse(r.stdout);
 }
@@ -363,10 +574,7 @@ function fetchPacket(repo, pr, headOid, packetFile) {
 // 从原生包提取本 PR 的评审模板与证据指令。
 // hasNativeTemplate: 该 PR 是否在包中且带原生 review_template（决定走原生主路径还是降级）。
 function extractPacketReview(packet, pr, headOid) {
-  const prs = Array.isArray(packet.pull_requests) ? packet.pull_requests : [];
-  const match = prs.find(
-    p => `${p.number}@${(p.head_oid || '').toLowerCase()}` === `${pr}@${headOid.toLowerCase()}`,
-  ) || prs[0];
+  const match = matchPacketPullRequest(packet, pr, headOid);
   const hasNativeTemplate = !!match && !!match.review_template && Array.isArray(match.review_template.sections) && match.review_template.sections.length > 0;
   const rt = match && match.review_template ? match.review_template : {};
   const plan = match && match.review_plan ? match.review_plan : {};
@@ -663,8 +871,8 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, prob
 }
 
 // 跑原生 check-result，返回解析后的校验报告
-function runNativeCheckResult(resultPath, packetPath) {
-  const r = sh(process.env.LOOPX_BIN || 'loopx', ['pr-review', '--check-result', resultPath, '--packet', packetPath], 300000);
+function runNativeCheckResult(resultPath, packetPath, loopxBin) {
+  const r = sh(loopxBin, ['pr-review', '--check-result', resultPath, '--packet', packetPath], 300000);
   let parsed = null;
   try { parsed = JSON.parse(r.stdout); } catch (_) { /* non-json */ }
   return { status: r.status, raw: r.stdout, parsed };
@@ -876,6 +1084,13 @@ function main() {
     }
   }
 
+  const loopxResolved = resolveLoopxExecutable(process.env);
+  if (!loopxResolved.ok) {
+    console.error(`[BLOCKED] ${loopxResolved.error}`);
+    process.exit(1);
+  }
+  console.log(`[i] loopx executable: ${loopxResolved.bin} (${loopxResolved.source})`);
+
   let diff;
   try {
     diff = prDiff(o.repo, o.pr);
@@ -887,7 +1102,7 @@ function main() {
   // --- 1. 取原生评审包（格式与提示词的唯一权威；不可用即 fail-closed）---
   let packet = null;
   try {
-    packet = fetchPacket(o.repo, o.pr, headOid, o.packetFile);
+    packet = fetchPacket(o.repo, o.pr, headOid, o.packetFile, loopxResolved.bin);
   } catch (e) {
     console.error(`[NATIVE_UNAVAILABLE] ${e.message}`);
     console.error('[NOT_VERIFIED] 无法获取 LoopX 原生评审包（review_template 是唯一格式权威），禁止发布自造降级报告。');
@@ -898,7 +1113,19 @@ function main() {
     console.error('[NOT_VERIFIED] 原生评审包未提供 review_template，禁止发布自造版式报告。');
     process.exit(1);
   }
-  console.log('[i] 评审模式: LoopX 原生 review_template 驱动');
+  const policy = resolveReviewPolicyRevision({
+    packet,
+    pr: o.pr,
+    headOid,
+    loopxBin: loopxResolved.bin,
+    env: process.env,
+  });
+  if (!policy.ok) {
+    console.error(`[NOT_VERIFIED] ${policy.error}`);
+    process.exit(1);
+  }
+  console.log(`[i] 评审模式: LoopX 原生 review_template 驱动`);
+  console.log(`[i] review_policy_revision: ${policy.revision} (${policy.source})`);
 
   const contractFile = path.join('specs', 'features', feature, '04-contract.md');
   const contractSha = fs.existsSync(contractFile)
@@ -1044,7 +1271,7 @@ function main() {
     const resultPath = path.join(os.tmpdir(), `authentic-review-result-${o.pr}.json`);
     const buildResultFile = () => ({
       schema_version: 'pull_request_review_result_v1',
-      review_policy_revision: (pkt.evidenceContract && pkt.evidenceContract.policy_revision) || LOOPX_POLICY_REVISION,
+      review_policy_revision: policy.revision,
       target_exact_head: `${o.pr}@${headOid.toLowerCase()}`,
       evidence, findings, verdict, review_body: reviewBody,
       reviewer: {
@@ -1064,7 +1291,7 @@ function main() {
     let fmt = null;
     const runCheck = () => {
       fs.writeFileSync(resultPath, JSON.stringify(buildResultFile(), null, 2));
-      check = runNativeCheckResult(resultPath, packetPath);
+      check = runNativeCheckResult(resultPath, packetPath, loopxResolved.bin);
       fmt = bodyFormatPasses(check);
     };
     runCheck();
@@ -1127,4 +1354,12 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { finalizeReviewBody, buildNativePrompt };
+module.exports = {
+  finalizeReviewBody,
+  buildNativePrompt,
+  parsePolicyRevision,
+  resolveLoopxExecutable,
+  resolveReviewPolicyRevision,
+  isolatedGateEnv,
+  gates,
+};
