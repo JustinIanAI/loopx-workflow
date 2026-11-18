@@ -108,10 +108,18 @@ case "$0" in
     if [[ "$args" == *"edit"* ]]; then exit 0; fi
     exit 0 ;;
   *codex)
+    if [[ ! -t 0 ]]; then
+      cat >> ${JSON.stringify(logs)}/calls.log
+      printf '\n' >> ${JSON.stringify(logs)}/calls.log
+    fi
     if [[ "${codexExit}" != "0" ]]; then exit ${codexExit}; fi
     cat "${codexStdoutFile}"
     exit 0 ;;
   *claude)
+    if [[ ! -t 0 ]]; then
+      cat >> ${JSON.stringify(logs)}/calls.log
+      printf '\n' >> ${JSON.stringify(logs)}/calls.log
+    fi
     if [[ -n "${claudeStdoutFile}" ]]; then cat "${claudeStdoutFile}"; else
       echo '{"schemaVersion":"authentic_review_result_v1","verdict":"approve","findings":[],"declaration":{"reviewer":"claude","model":"claude-default","declaration":"self_reported"}}'
     fi
@@ -191,7 +199,9 @@ exit 0
   fs.chmodSync(path.join(bin, 'loopx'), 0o755);
   fs.chmodSync(path.join(bin, 'npm'), 0o755);
   fs.chmodSync(path.join(bin, 'claude'), 0o755);
-  return { dir, bin, logs: path.join(logs, 'calls.log') };
+  const tmpDir = path.join(dir, 'tmp');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  return { dir, bin, logs: path.join(logs, 'calls.log'), tmpDir };
 }
 
 function run(sbx, args, envExtra) {
@@ -200,6 +210,7 @@ function run(sbx, args, envExtra) {
     PATH: `${sbx.bin}:${process.env.PATH}`,
     AUTHENTIC_REVIEW_HEAD_OID: HEAD,
     REVIEW_MODEL: 'codex',
+    LOOPX_TMP_DIR: sbx.tmpDir,
   };
   if (envExtra) Object.assign(env, envExtra);
   try {
@@ -219,6 +230,7 @@ describe('S1 invocation: codex exec with default model', () => {
     assert.strictEqual(r.code, 0, r.out);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
     assert.match(calls, /codex exec/);
+    assert.match(calls, /codex exec -o .* -$/m);
     assert.doesNotMatch(calls, /codex exec .*-m |codex exec .*--model /);
   });
 });
@@ -530,7 +542,7 @@ describe('R3 carryover adjudication', () => {
     fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/a.js', severity: 'P1', summary: 'still here' }] }));
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
     assert.strictEqual(r.code, 0, r.out);
-    const result = JSON.parse(fs.readFileSync(path.join(os.tmpdir(), 'authentic-review-result-7.json'), 'utf8'));
+    const result = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
     assert.ok(result.review_body.includes('上轮 findings 裁决'));
     assert.ok(result.review_body.indexOf('上轮 findings 裁决') < result.review_body.indexOf('English verdict'));
   });
@@ -652,5 +664,40 @@ describe('P0-A1 gates env isolation', () => {
       else process.env.AUTHENTIC_REVIEW_GATES_BIN = prevBin;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('ADR-0013 stdin streaming, sandbox prompt artifact, two-stage alignment & PATCH arg fix', () => {
+  test('two-stage alignment resolves missing evidence on APPROVE and stores prompt in LOOPX_TMP_DIR', () => {
+    const sbx = makeSandbox({ verdict: 'approve' });
+    const stage1File = path.join(sbx.dir, 'stage1.json');
+    const stage2File = path.join(sbx.dir, 'stage2.json');
+    fs.writeFileSync(stage1File, nativeModelOut({ verdict: 'approve', findings: [] }));
+    fs.writeFileSync(stage2File, '```json\n{"evidence":{"e1":{"status":"verified","summary":"aligned in stage 2"}}}\n```');
+    // Override mock codex to emit stage1 on first call and stage2 on second call
+    const counterFile = path.join(sbx.dir, 'codex-count');
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/usr/bin/env bash
+echo "$0 $*" >> ${JSON.stringify(sbx.logs)}
+if [[ ! -t 0 ]]; then cat >> ${JSON.stringify(sbx.logs)}; printf '\\n' >> ${JSON.stringify(sbx.logs)}; fi
+n=0
+if [[ -f ${JSON.stringify(counterFile)} ]]; then n=$(cat ${JSON.stringify(counterFile)}); fi
+n=$((n+1))
+echo "$n" > ${JSON.stringify(counterFile)}
+if [[ "$n" == "1" ]]; then cat ${JSON.stringify(stage1File)}; else cat ${JSON.stringify(stage2File)}; fi
+exit 0
+`, { mode: 0o755 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { REVIEW_KEEP_PROMPT: '1' });
+    assert.strictEqual(r.code, 0, r.out);
+    assert.match(r.out, /阶段 2 证据对齐/);
+    assert.strictEqual(fs.existsSync(path.join(sbx.tmpDir, `review-prompt-7-${HEAD.slice(0, 10)}.md`)), true);
+    assert.strictEqual(fs.existsSync(path.join(sbx.tmpDir, `review-prompt-7-${HEAD.slice(0, 10)}-stage2.md`)), true);
+    const resultJson = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
+    assert.strictEqual(resultJson.evidence.e1.status, 'verified');
+  });
+
+  test('ghApiWithBackoff PATCH passes separate -X and PATCH tokens (no leading space method)', () => {
+    const src = fs.readFileSync(SCRIPT, 'utf8');
+    assert.strictEqual(src.includes("'-X', 'PATCH'"), true, 'must pass -X and PATCH as separate args');
+    assert.strictEqual(src.includes('`-X PATCH`'), false, 'must not embed space in -X PATCH single arg');
   });
 });

@@ -40,11 +40,28 @@ const { spawnSync } = require('node:child_process');
 const {
   buildEvidenceGraph,
   buildValidationMatrix,
+  listFiles,
   splitFileDiffs,
+  diffStats,
   describeFileFromDiff,
   scanDiff,
-  formatDiffForPrompt,
 } = require('./evidence-builder');
+const { resolveTmpDir } = require('./ingest-to-loopx-quality');
+
+function ensureSandboxTmpDir() {
+  const dir = resolveTmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function writePromptArtifact(pr, headOid, prompt, stage = 'stage1') {
+  const tmpDir = ensureSandboxTmpDir();
+  const head10 = String(headOid || 'unknown').slice(0, 10);
+  const suffix = stage === 'stage1' ? '' : `-${stage}`;
+  const file = path.join(tmpDir, `review-prompt-${pr}-${head10}${suffix}.md`);
+  fs.writeFileSync(file, String(prompt || ''), 'utf8');
+  return file;
+}
 
 const TIMEOUT_MS = 600000;
 // 评审结果私有落盘目录（不入 Git；供 loopx-flow respond 复用原生格式核销）
@@ -141,7 +158,7 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
   const trimmed = String(body).replace(/\s+$/g, '');
   const postedBody = trimmed.includes(marker) ? trimmed : `${trimmed}\n\n${marker}`;
   if (!useUpsert) {
-    const postedFile = path.join(os.tmpdir(), `authentic-review-report-${pr}.md`);
+    const postedFile = path.join(ensureSandboxTmpDir(), `authentic-review-report-${pr}.md`);
     fs.writeFileSync(postedFile, trimmed);
     const cm = sh('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', postedFile]);
     if (cm.status !== 0) {
@@ -153,7 +170,7 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
     console.log(`[✓] 原生五段式第三方评审报告已发布至 PR #${pr}（head ${String(headOid).slice(0, 10)}）。`);
     return { mode: 'created', commentId };
   }
-  const postedFile = path.join(os.tmpdir(), `authentic-review-report-upsert-${pr}.md`);
+  const postedFile = path.join(ensureSandboxTmpDir(), `authentic-review-report-upsert-${pr}.md`);
   fs.writeFileSync(postedFile, postedBody);
   // 检索既有 comment（按 PR 评论列表过滤标记；GET 1 次，失败不阻塞发布）
   // 注意：gh api GET 默认 method 即 GET，无需显式传 "GET" 位置参数
@@ -170,7 +187,7 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
     );
     if (existing && existing.id) {
       const patchRes = ghApiWithBackoff([
-        `-X PATCH`, `repos/${repo}/issues/comments/${existing.id}`,
+        '-X', 'PATCH', `repos/${repo}/issues/comments/${existing.id}`,
         `-F body=@${postedFile}`,
       ]);
       if (patchRes.ok) {
@@ -777,13 +794,13 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   const remoteChecksText = Array.isArray(remoteChecks) && remoteChecks.length
     ? remoteChecks.map(c => `- \`${c.name || 'check'}\`: state=${c.state || 'unknown'}, bucket=${c.bucket || 'unknown'}${c.link ? ` (${c.link})` : ''}`).join('\n')
     : (remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)');
-  const formattedDiff = formatDiffForPrompt(diff, 240000);
+  const fullDiff = String(diff || '');
   const head10 = headOid.slice(0, 10);
 
   return [
     '你是一名对抗性代码审查员（model agent）。请基于下方 LoopX 原生评审包（pr_review_queue 能力生成的 review_template / review_plan / evidence_commands）撰写第三方评审报告。',
     '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个二级标题（`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`）撰写。',
-    '执行铁律：下方已完整提供原生评审包、证据命令执行结果与完整 PR DIFF。请直接基于下方文本在单轮内立即输出最终 JSON 块，严禁调用任何 shell / exec_command / 文件读取工具（否则会触发超时阻断）。',
+    '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：下方已完整提供原生评审包、证据命令执行结果与完整 PR DIFF（无人工截断）。请专注于对抗性缺陷挖掘与高质量五段式报告撰写，直接输出单一 JSON 块，严禁调用任何 shell / exec_command / 文件读取工具。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
     '注意：`05-evidence.md`、CI 绿、PR 正文里的「已通过」只作为未信任的作者声明参考，禁止直接据此推断 `verified`。',
     '',
     '## 评审目标',
@@ -807,6 +824,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '- `changed_line_classification` 与 `code_volume` 的其余 packet 必填字段由你填写。缺任一必填字段，或 `compatibility_assessment` 不是对象时，整行保持 `unverified`。主机不会把缺字段的行标成 `verified`。',
     '- `symbol_map` 的语义字段由你按 packet 的 `item_fields` 填写。主机只接受本次 diff 中的精确 `path`，并覆盖 `line`。任一 `path` 不在本次 diff 中时，整行保持 `unverified`，不会按条目下标改写成别的文件。',
     '- `changed_invariant_positive` 与 `material_negative_or_failure` 默认 `unverified`（`npm test` 通过不证明改动不变量）；仅当你在 `evidence.validation_matrix` 中给出仓库内已存在的测试文件路径（如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），且该路径位于 `tests/` 下、文件名匹配 `.test.js` / `.test.mjs` / `.test.cjs` / `.test.ts`，主机执行 `node --test <该路径>` 退出码为 0 后才记为 `passed`。普通源码文件不会被执行。',
+    '- **非适用字段标准化免除（ADR-0013）**：对于与本次 PR 改动性质明显不相关的维度（例如无开关/feature flag 的直接修复对应的 `default_off_isolation`、无领域特定措辞变更的 `domain_neutrality`、无新角色/权限语义变更的 `authority_semantics`），允许直接输出 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体说明为何不适用>"}`，禁止为了凑字段编造虚假的反事实推理。',
     '- 判断类 id 由你独立核实后在 `evidence` 中填写；未核实或形状不完整的项将保持 `status: "unverified"`，主机绝不预填或回填占位句：',
     evidenceRequirements || '(本 PR 无额外 evidence requirements)',
     '',
@@ -830,16 +848,16 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     remoteChecksText,
     '',
     '## PR DIFF（远程权威）',
-    formattedDiff,
+    fullDiff,
     '',
     '## 输出格式（请输出单一 fenced json 块）',
-    '结构如下：你必须按上方「评审范围 evidence」逐项填写全部 required_evidence_ids（已独立核实且无缺口的项写 `"status": "verified"` 并填全全部必填字段与嵌套对象；确实存在未核实项时写 `"status": "unverified"` 且 verdict 只能为 `REQUEST_CHANGES`）。若代码确无阻塞缺陷且所有必填证据均已核实并完整填写（包括 `validation_matrix.changed_invariant_positive` 与 `material_negative_or_failure` 的真实 `tests/*.test.js` 路径，以及 `symbol_map` 的 2-5 个精确 diff 符号），请输出 `verdict: "APPROVE"`。其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals`、`outcome_impact`（含 `user_experience.visual_review`）和 `spec_basis` 并写入「动机」段；`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap` 并写入同一段：',
+    '结构如下：优先确保 `review_body`、`verdict`、`findings`、`reviewer`（以及如有上轮 findings 时的 `carryover`）完整准确；`evidence` 中建议先给出 `validation_matrix` 的测试文件路径、`problem_context` 核心字段、适用的 `not_applicable` 声明以及 `symbol_map` 关键符号（剩余嵌套判断字段若本轮未写全，主机将在阶段 2 基于你的报告做轻量结构化对齐）。若代码确无阻塞缺陷，请输出 `verdict: "APPROVE"`；存在阻塞缺陷或核心不变量未验证时输出 `REQUEST_CHANGES`。其中 `evidence.problem_context` 的 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals` 须与「动机」段保持一致：',
     '```json',
     JSON.stringify({
       review_body: 'Markdown 字符串：首行必须是 `Reviewer: model_agent · model=<model> · provider=<provider> · declaration=<declaration_source> · head=<headOid>`（declaration_source 默认 self_reported）；随后依次出现五个二级标题（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价），各章达到字数下限；「具体改动」下必须含 `### 关键代码讲解`；正文内须含精确 head oid；结尾须有一行 `English verdict: APPROVE` 或 `English verdict: REQUEST_CHANGES`。',
       verdict: 'APPROVE 或 REQUEST_CHANGES（大写，须与 review_body 中的 English verdict 完全一致）',
       findings: [{ file: '路径', line: '整数或 null', severity: 'P0|P1|P2|P3|blocker|major|minor|advisory', summary: '...', repro: '可选复现步骤' }],
-      reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-high', declared_provider: '如 openai' },
+      reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-tiered', declared_provider: '如 google' },
       evidence: {
         validation_matrix: {
           changed_invariant_positive: { test_path: 'tests/unit/相关测试.test.js（如存在）' },
@@ -872,20 +890,58 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ].join('\n');
 }
 
+function buildStage2Prompt({ pr, headOid, branch, reviewBody, diff, missingIds, evidenceContract, reviewPlan }) {
+  const files = listFiles(diff || '');
+  const st = diffStats(diff || '');
+  const filteredPlan = {
+    ...(reviewPlan || {}),
+    required_evidence_ids: Array.isArray(missingIds) ? missingIds : [],
+  };
+  const reqText = formatEvidenceRequirementsForPrompt(evidenceContract, filteredPlan);
+  const head10 = String(headOid || '').slice(0, 10);
+
+  return [
+    '你是一名证据结构化对齐助手（ADR-0013 阶段 2）。请仅根据下方已经完成的阶段 1 五段式评审报告、文件改动清单和证据契约，补齐缺失的结构化判断类 `evidence` JSON。',
+    '约束：严禁编造未在评审报告或文件清单中核实的事实；若某项不适用（如无特性开关的 `default_off_isolation`、无领域措辞变更的 `domain_neutrality`、无权限模型变更的 `authority_semantics`），请严格输出 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若报告中缺乏足够依据，则保留 `"status": "unverified"`。',
+    '执行铁律：直接输出单一 fenced json 块 `{"evidence": { ... }}`，严禁调用任何 shell / 文件读取工具。',
+    '',
+    `- PR: #${pr} · 分支 \`${branch}\` · 精确 head \`${head10}\` (\`${headOid}\`)`,
+    `- 改动文件列表（共 ${files.length} 个文件，+${st.additions}/-${st.deletions}）：${files.join(', ') || '(无)'}`,
+    '',
+    '## 待补齐的证据项契约',
+    reqText || '(无)',
+    '',
+    '## 阶段 1 已产出的评审报告正文',
+    String(reviewBody || ''),
+    '',
+    '## 输出格式',
+    '```json',
+    JSON.stringify({ evidence: {} }, null, 2),
+    '```',
+  ].join('\n');
+}
+
 function runReviewAgent(agentBin, prompt, timeoutMs) {
   const which = sh('which', [agentBin]);
   if (which.status !== 0) return { unavailable: true };
-  const args = agentBin.includes('claude') ? ['-p', prompt] : ['exec', prompt];
+  // ADR-0013 / REQ-REVIEW-2: 通过 stdin 流式传输提示词，禁止用 CLI argv 传巨型字符串触碰 ARG_MAX。
+  const args = agentBin.includes('claude') ? ['-p'] : ['exec', '-'];
   let tmpMsg = null;
   if (!agentBin.includes('claude')) {
-    tmpMsg = path.join(os.tmpdir(), `codex-review-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+    tmpMsg = path.join(ensureSandboxTmpDir(), `codex-review-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
     args.splice(1, 0, '-o', tmpMsg);
   }
-  const r = spawnSync(agentBin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs || TIMEOUT_MS });
+  const r = spawnSync(agentBin, args, {
+    input: String(prompt || ''),
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: timeoutMs || TIMEOUT_MS,
+  });
   if (r.status !== 0) return { error: `exit ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}` };
   if (tmpMsg && fs.existsSync(tmpMsg)) {
     const out = fs.readFileSync(tmpMsg, 'utf8');
-    try { fs.unlinkSync(tmpMsg); } catch (_) {}
+    try { fs.rmSync(tmpMsg, { force: true }); } catch (_) {}
     return { stdout: out };
   }
   return { stdout: r.stdout };
@@ -1310,7 +1366,12 @@ function main() {
 
   // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
   const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || 'codex';
+  const stage1PromptFile = writePromptArtifact(o.pr, headOid, prompt, 'stage1');
+  console.log(`[i] 阶段 1 评审提示词已写入沙箱文件: ${stage1PromptFile} (通过 stdin 流式传入 ${primaryAgent})`);
   const agentRun = runReviewAgent(primaryAgent, prompt);
+  if (process.env.REVIEW_KEEP_PROMPT !== '1') {
+    try { fs.rmSync(stage1PromptFile, { force: true }); } catch (_) {}
+  }
   if (agentRun.unavailable) {
     console.error(`[NOT_VERIFIED] ${primaryAgent} CLI unavailable; refusing to publish an unreviewed report.`);
     process.exit(1);
@@ -1354,12 +1415,61 @@ function main() {
     console.error('[NOT_VERIFIED] 原生模型输出缺少 review_body；禁止自造降级正文发布。');
     process.exit(1);
   }
-  const autoEvidence = buildEvidenceGraph({
+  let mergedModelEvidence = modelOut.evidence && typeof modelOut.evidence === 'object'
+    ? { ...modelOut.evidence }
+    : null;
+  let autoEvidence = buildEvidenceGraph({
     contract: pkt.evidenceContract || {},
     plan: pkt.reviewPlan || {},
     diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
-    modelEvidence: modelOut.evidence && typeof modelOut.evidence === 'object' ? modelOut.evidence : null,
+    modelEvidence: mergedModelEvidence,
   });
+
+  // ADR-0013 阶段 2（两阶段解耦）：当模型阶段 1 主观 verdict=APPROVE 但仍有未对齐的判断类证据行时，
+  // 基于阶段 1 评审报告 + 文件清单做轻量定向结构化抽取（不传全量 diff），再由主机重跑 buildEvidenceGraph。
+  const unverifiedForStage2 = Object.entries(autoEvidence)
+    .filter(([k, v]) => k !== 'validation_matrix' && v && v.status === 'unverified')
+    .map(([k]) => k);
+  if (verdict === 'APPROVE' && unverifiedForStage2.length > 0 && process.env.REVIEW_TWO_STAGE_ALIGNMENT !== '0') {
+    const stage2Prompt = buildStage2Prompt({
+      pr: o.pr,
+      headOid,
+      branch: head.headRefName,
+      reviewBody: modelOut.review_body,
+      diff,
+      missingIds: unverifiedForStage2,
+      evidenceContract: pkt.evidenceContract || {},
+      reviewPlan: pkt.reviewPlan || {},
+    });
+    const stage2PromptFile = writePromptArtifact(o.pr, headOid, stage2Prompt, 'stage2');
+    console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length} 项): ${stage2PromptFile}`);
+    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt);
+    if (process.env.REVIEW_KEEP_PROMPT !== '1') {
+      try { fs.rmSync(stage2PromptFile, { force: true }); } catch (_) {}
+    }
+    if (!stage2Run.unavailable && !stage2Run.error) {
+      const parsedStage2 = extractJson(stage2Run.stdout || '');
+      const stage2Evidence = parsedStage2 && parsedStage2.evidence && typeof parsedStage2.evidence === 'object'
+        ? parsedStage2.evidence
+        : null;
+      if (stage2Evidence) {
+        const nextInput = mergedModelEvidence ? { ...mergedModelEvidence } : {};
+        for (const id of unverifiedForStage2) {
+          if (stage2Evidence[id] && typeof stage2Evidence[id] === 'object') {
+            nextInput[id] = stage2Evidence[id];
+          }
+        }
+        mergedModelEvidence = nextInput;
+        autoEvidence = buildEvidenceGraph({
+          contract: pkt.evidenceContract || {},
+          plan: pkt.reviewPlan || {},
+          diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
+          modelEvidence: mergedModelEvidence,
+        });
+      }
+    }
+  }
+
   const problemContext = autoEvidence.problem_context || null;
   const carryoverSection = buildCarryoverSection(carryover, priorFindings);
   let reviewBody = finalizeReviewBody(modelOut.review_body, {
@@ -1417,13 +1527,14 @@ function main() {
 
   // --- 7. 原生 check-result 硬门禁（ok=true 才允许发布）---
   {
+    const sandboxTmp = ensureSandboxTmpDir();
     const packetPath = o.packetFile && fs.existsSync(o.packetFile)
       ? o.packetFile
-      : path.join(os.tmpdir(), `loopx-pr-review-packet-${o.pr}.json`);
+      : path.join(sandboxTmp, `loopx-pr-review-packet-${o.pr}.json`);
     if (!o.packetFile) fs.writeFileSync(packetPath, JSON.stringify(packet, null, 2));
 
     const evidence = Object.keys(autoEvidence).length ? autoEvidence : { problem_context: { status: 'unverified' } };
-    const resultPath = path.join(os.tmpdir(), `authentic-review-result-${o.pr}.json`);
+    const resultPath = path.join(sandboxTmp, `authentic-review-result-${o.pr}.json`);
     const buildResultFile = () => ({
       schema_version: 'pull_request_review_result_v1',
       review_policy_revision: policy.revision,
@@ -1461,7 +1572,7 @@ function main() {
       runCheck();
     }
 
-    const reportOut = path.join(os.tmpdir(), `authentic-review-check-${o.pr}.json`);
+    const reportOut = path.join(sandboxTmp, `authentic-review-check-${o.pr}.json`);
     fs.writeFileSync(reportOut, check.raw || JSON.stringify(check, null, 2));
     if (check.parsed) {
       console.log(`[✓] loopx pr-review --check-result: ok=${check.parsed.ok} approval_consistent=${check.parsed.approval_consistent}`);
@@ -1489,7 +1600,7 @@ function main() {
   // --- 9. 可选：用胶囊重建 PR body ---
   if (o.rebuildBody) {
     const body = buildBody(feature, diff);
-    const bodyFile = path.join(os.tmpdir(), `authentic-body-${o.pr}.md`);
+    const bodyFile = path.join(ensureSandboxTmpDir(), `authentic-body-${o.pr}.md`);
     fs.writeFileSync(bodyFile, body);
     console.log(body);
     const ed = sh('gh', ['pr', 'edit', String(o.pr), '--repo', o.repo, '--body-file', bodyFile]);
@@ -1509,8 +1620,10 @@ if (require.main === module) main();
 module.exports = {
   finalizeReviewBody,
   buildNativePrompt,
+  buildStage2Prompt,
   formatEvidenceRequirementsForPrompt,
   capVerdictInBody,
+  runReviewAgent,
   parsePolicyRevision,
   resolveLoopxExecutable,
   resolveReviewPolicyRevision,

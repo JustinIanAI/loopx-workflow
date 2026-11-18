@@ -9,10 +9,10 @@ const {
   buildValidationMatrix,
   describeFileFromDiff,
   scanDiff,
-  formatDiffForPrompt,
 } = require('../../skills/code-review/scripts/evidence-builder.js');
 const {
   buildNativePrompt,
+  buildStage2Prompt,
   finalizeReviewBody,
   capVerdictInBody,
 } = require('../../skills/code-review/scripts/authentic-review.js');
@@ -428,7 +428,7 @@ test('scanDiff finds high-signal additions only', () => {
   assert.strictEqual(findings.filter(f => f.rule === 'tracked-todo').length, 1);
 });
 
-test('formatDiffForPrompt preserves tail test files and file inventory when diff exceeds maxChars (P0-A2)', () => {
+test('ADR-0013：buildNativePrompt 完整透传超 240KB Diff（无人工截断）并支持 not_applicable 与两阶段提示词', () => {
   const hugeProd = [
     'diff --git a/bin/huge-prod.js b/bin/huge-prod.js',
     '--- a/bin/huge-prod.js',
@@ -446,23 +446,60 @@ test('formatDiffForPrompt preserves tail test files and file inventory when diff
   ].join('\n');
   const full = `${hugeProd}\n${tailTest}`;
   assert.ok(full.length > 240000);
-  const formatted = formatDiffForPrompt(full, 240000);
-  assert.match(formatted, /Diff File Inventory/);
-  assert.match(formatted, /bin\/huge-prod\.js/);
-  assert.match(formatted, /tests\/unit\/tail-invariant\.test\.js/);
-  assert.match(formatted, /tail invariant preserved/);
-  assert.match(formatted, /FILE_DIFF_COMPACTED/);
-  assert.ok(formatted.length <= 240000);
+  const prompt = buildNativePrompt({
+    pr: 28,
+    headOid: 'a'.repeat(40),
+    branch: 'refactor/adr-0013',
+    motivation: 'ADR-0013',
+    reviewTemplate: { sections: [], output_hint: '' },
+    reviewPlan: { required_evidence_ids: ['problem_context'] },
+    evidenceCommands: [],
+    evidenceText: '',
+    diff: full,
+    priorFindings: [],
+    evidenceContract: CONTRACT,
+  });
+  assert.ok(prompt.includes('tail invariant preserved'), 'full diff including tail tests must not be truncated');
+  assert.doesNotMatch(prompt, /\[TRUNCATED\]|FILE_DIFF_COMPACTED/);
 
-  const manySmall = Array.from({ length: 50 }, (_, i) => [
-    `diff --git a/src/mod-${i}.js b/src/mod-${i}.js`,
-    `--- a/src/mod-${i}.js`,
-    `+++ b/src/mod-${i}.js`,
-    '@@ -1,1 +1,10 @@',
-    `+const x${i} = "${'a'.repeat(1800)}";`,
-  ].join('\n')).join('\n');
-  const bounded = formatDiffForPrompt(manySmall, 72000);
-  assert.ok(bounded.length <= 72000, `expected <= 72000, got ${bounded.length}`);
+  // not_applicable normalization for non-applicable dimensions
+  const naContract = {
+    evidence_requirements: [
+      { evidence_id: 'default_off_isolation', fields: ['opt_in_or_default_off_claim', 'verdict'], verdict_values: ['isolated', 'not_applicable'] },
+      { evidence_id: 'domain_neutrality', fields: ['obligation_or_error_text'] },
+    ],
+  };
+  const naGraph = buildEvidenceGraph({
+    contract: naContract,
+    plan: { required_evidence_ids: ['default_off_isolation', 'domain_neutrality'] },
+    diff: DIFF,
+    headOid: 'a'.repeat(40),
+    pr: 28,
+    motivation: 'm',
+    validation: [],
+    modelEvidence: {
+      default_off_isolation: { status: 'not_applicable', reason: 'No feature toggle changed.' },
+      domain_neutrality: { status: 'not_applicable', reason: 'No control-plane domain text touched.' },
+    },
+  });
+  assert.strictEqual(naGraph.default_off_isolation.status, 'not_applicable');
+  assert.strictEqual(naGraph.default_off_isolation.verdict, 'not_applicable');
+  assert.strictEqual(naGraph.domain_neutrality.status, 'not_applicable');
+
+  // Stage 2 prompt stays compact (omits raw diff hunks) and passes Stage 1 reviewBody + missingIds
+  const stage2 = buildStage2Prompt({
+    pr: 28,
+    headOid: 'a'.repeat(40),
+    branch: 'refactor/adr-0013',
+    reviewBody: '## 动机\n阶段 1 报告正文',
+    diff: full,
+    missingIds: ['semantic_alignment'],
+    evidenceContract: CONTRACT,
+    reviewPlan: PLAN,
+  });
+  assert.match(stage2, /阶段 1 报告正文/);
+  assert.match(stage2, /semantic_alignment/);
+  assert.doesNotMatch(stage2, /padding_payload_/);
 });
 
 test('buildValidationMatrix maps remoteChecks into repository_required_checks and diagnostic rows (P0-A2)', () => {

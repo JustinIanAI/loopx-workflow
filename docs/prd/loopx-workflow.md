@@ -46,7 +46,7 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 可核对结果：
 
 1. 任意一条必须能力都能在本文找到 `REQ-*`。胶囊、ADR、设计文档只引用这些编号，不另起一条平行需求。
-2. 承重命令在本文写明的失败条件下以非 0 退出。条件写在 `REQ-FAILCLOSED-*`、`REQ-CHECKPOINT-*`、`REQ-CONTRACT-LOCK-1`、`REQ-REVIEW-1`。
+2. 承重命令在本文写明的失败条件下以非 0 退出。条件写在 `REQ-FAILCLOSED-*`、`REQ-CHECKPOINT-*`、`REQ-CONTRACT-LOCK-1`、`REQ-REVIEW-1`、`REQ-REVIEW-2`。
 3. 改变产品行为的变更，在冻结契约之前已经有一份 ADR，并且 PRD（行为变化时还有详细设计）已经改完。
 
 ## 5. 用户分段
@@ -189,6 +189,10 @@ LoopX 提供 `change-quality`、`pr-review`、`task-lease`、`integration-branch
 #### 审查与 PR 正文
 
 - **REQ-REVIEW-1** `review` 的报告结构只使用 LoopX `pr-review` 给出的 `review_template` 五段：动机、改动思路、具体改动、对主干的风险、我的整体评价。代码变更的「具体改动」包含 `### 关键代码讲解`。实现是 `skills/code-review/scripts/authentic-review.js`。原生模板不可用、审查者 CLI 不可用、输出不可解析、或 `check-result` 未通过时，输出 `NOT_VERIFIED` 且进程非 0，不发布自造报告。
+- **REQ-REVIEW-2** (ADR-0013) 审查执行契约对齐 LoopX 原生文件/流协议与两阶段解耦：
+  1. 禁止通过 CLI argv 参数直接传递全量内存 Prompt 字符串，全面迁移为文件路径（写入项目沙箱 `.loopx/tmp/review-prompt-<pr>-<head>.md`）或 stdin 管道传递；彻底废除任何人工字符截断限制（如 240,000 字符硬截断）。
+  2. 审查流程实施两阶段解耦：阶段 1 由模型产出主观对抗性评审（缺陷与五段式报告）；阶段 2 由主机自动装配静态事实证据（测试退出码、代码行分类、符号位置等）。
+  3. 对非适用判定字段（如无开关改动的 `default_off_isolation`）提供标准化的 `not_applicable` 免除通道，给出合理解释即合法放行，杜绝伪造数据与封顶死锁。
 - **REQ-RESPOND-1** `respond` 复用同一五段结构，实现是 `skills/code-review/scripts/respond-report.js`。发布前依次跑 typecheck、lint、build、test，任一失败则不发评论。**只接受与当前 PR `headRefOid` 精确对应的既有审查产物；精确 head 缺失时 fail-closed，不得回退旧 artifact。** 本机有 `loopx` 时 `loopx status` 失败也不发评论；没有 `loopx` 时该步记为跳过，不因此退出。
 - **REQ-PR-BODY-1** `loopx-flow pr` 调用 `authentic-review.js --generate-pr-body`。正文固定四段：动机、改动思路、具体改动、对主干的风险，外加验证矩阵与**六问**（依据哪个 Goal/REQ/ADR、关闭哪个缺口、AC 哪些满足、真实入口 vs Mock、当前 Head、哪些未验证/后续）；验证矩阵增 `Real-vs-Mock` 列。动机、思路、风险来自胶囊；文件列表来自真实 diff；逐文件说明必须来自真实 diff hunk/符号或模型输出，无法生成时写 `NOT_PROVIDED`，禁止固定映射或静态“已通过”。矩阵优先取 `05-evidence.md` 里已有的「验证矩阵」，否则现场执行四条 `npm run` 并写入退出结果。胶囊缺段时写 `NOT_PROVIDED`。这四段不是 `REQ-REVIEW-1` 的审查报告，审查报告另有第五段「我的整体评价」。
 

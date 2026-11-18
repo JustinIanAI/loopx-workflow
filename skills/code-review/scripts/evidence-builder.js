@@ -515,7 +515,12 @@ function buildJudgmentRow(id, req, plan, modelRow) {
     }
     return { status: 'unverified' };
   }
-  return { ...modelRow };
+  const out = { ...modelRow };
+  if (out.status === 'not_applicable' && out.verdict === undefined
+      && Array.isArray(req.verdict_values) && req.verdict_values.includes('not_applicable')) {
+    out.verdict = 'not_applicable';
+  }
+  return out;
 }
 
 function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, validation, modelEvidence, repoRoot, runNodeTest }) {
@@ -576,114 +581,6 @@ function scanDiff(diff) {
   return findings;
 }
 
-function classifyDiffFile(filePath) {
-  const p = String(filePath || '');
-  if (/^(?:tests?|__tests__|spec)\/|\.test\.[^/]+$|\.spec\.[^/]+$/i.test(p)) return 'tests';
-  if (/^(?:docs|specs)\//i.test(p) || /\.md$/i.test(p)) return 'docs';
-  return 'prod';
-}
-
-function compactFileDiff(fileDiff, maxChars) {
-  const text = String(fileDiff || '');
-  if (text.length <= maxChars) return text;
-  const marker = `\n[FILE_DIFF_COMPACTED: omitted ${text.length - Math.max(0, maxChars - 96)} of ${text.length} chars]\n`;
-  const keep = Math.max(0, maxChars - marker.length);
-  if (keep === 0) return text.slice(0, maxChars);
-  let cut = text.lastIndexOf('\n', keep);
-  if (cut < Math.floor(keep * 0.5)) cut = keep;
-  return text.slice(0, cut) + marker;
-}
-
-function formatDiffForPrompt(diff, maxChars = 240000) {
-  const text = String(diff || '');
-  if (text.length <= maxChars) return text;
-  const fileMap = splitFileDiffs(text);
-  const entries = [...fileMap.entries()].map(([filePath, fileDiff]) => {
-    const st = diffStats(fileDiff);
-    return {
-      path: filePath,
-      diff: fileDiff,
-      tier: classifyDiffFile(filePath),
-      chars: fileDiff.length,
-      additions: st.additions,
-      deletions: st.deletions,
-    };
-  });
-  if (!entries.length) return `${text.slice(0, maxChars)}\n\n[TRUNCATED]`;
-
-  const inventoryLines = [
-    `## Diff File Inventory (${entries.length} files, total ${text.length} chars > ${maxChars} limit; per-file prioritized budget)`,
-    ...entries.map(e => `- [${e.tier}] \`${e.path}\` (+${e.additions}/-${e.deletions}, ${e.chars} chars)`),
-    '',
-  ];
-  const inventory = inventoryLines.join('\n');
-  const remainingTotal = Math.max(1000, maxChars - inventory.length - 128);
-
-  const byTier = {
-    prod: entries.filter(e => e.tier === 'prod'),
-    tests: entries.filter(e => e.tier === 'tests'),
-    docs: entries.filter(e => e.tier === 'docs'),
-  };
-  const weights = { prod: 0.55, tests: 0.30, docs: 0.15 };
-  const activeTiers = Object.keys(byTier).filter(t => byTier[t].length > 0);
-  const totalWeight = activeTiers.reduce((acc, t) => acc + weights[t], 0) || 1;
-
-  const tierBudgets = {};
-  let leftover = 0;
-  for (const t of activeTiers) {
-    const rawBudget = Math.floor(remainingTotal * (weights[t] / totalWeight));
-    const needed = byTier[t].reduce((acc, e) => acc + e.chars + 2, 0);
-    if (needed <= rawBudget) {
-      tierBudgets[t] = needed;
-      leftover += (rawBudget - needed);
-    } else {
-      tierBudgets[t] = rawBudget;
-    }
-  }
-  for (const t of ['tests', 'prod', 'docs']) {
-    if (!leftover || !byTier[t].length) continue;
-    const needed = byTier[t].reduce((acc, e) => acc + e.chars + 2, 0);
-    const gap = Math.max(0, needed - tierBudgets[t]);
-    const add = Math.min(leftover, gap);
-    tierBudgets[t] += add;
-    leftover -= add;
-  }
-
-  const allocated = new Map();
-  for (const t of activeTiers) {
-    const group = byTier[t];
-    let budget = tierBudgets[t];
-    const small = [];
-    const large = [];
-    const perFileShare = Math.floor(budget / group.length);
-    const fair = perFileShare >= 2000 ? perFileShare : Math.max(128, perFileShare);
-    for (const e of group) {
-      if (e.chars <= fair) small.push(e);
-      else large.push(e);
-    }
-    for (const e of small) {
-      if (e.chars <= budget) {
-        allocated.set(e.path, e.diff);
-        budget -= e.chars;
-      } else {
-        large.push(e);
-      }
-    }
-    if (large.length) {
-      const perLarge = Math.max(128, Math.floor(Math.max(0, budget) / large.length));
-      for (const e of large) {
-        allocated.set(e.path, compactFileDiff(e.diff, perLarge));
-      }
-    }
-  }
-
-  const body = entries.map(e => allocated.get(e.path) || compactFileDiff(e.diff, 512)).join('\n');
-  const combined = `${inventory}${body}`;
-  if (combined.length <= maxChars) return combined;
-  const suffix = '\n[DIFF_BUDGET_CLAMPED]\n';
-  return combined.slice(0, Math.max(0, maxChars - suffix.length)) + suffix;
-}
-
 module.exports = {
   listFiles,
   splitFileDiffs,
@@ -692,5 +589,4 @@ module.exports = {
   buildEvidenceGraph,
   describeFileFromDiff,
   scanDiff,
-  formatDiffForPrompt,
 };
