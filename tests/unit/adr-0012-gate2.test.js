@@ -281,6 +281,7 @@ test('Mode B 支持非 feature/* 分支（fix/issue-* / fast-fix/*）走 Gate2 m
     const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     assert.match(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), /merged/);
+    assert.doesNotMatch(fs.readFileSync(path.join(dir, 'loopx-calls.log'), 'utf8'), /--goal-id\s+-goal/);
   } finally { h.cleanup(dir); }
 });
 

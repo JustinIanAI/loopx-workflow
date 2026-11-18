@@ -895,8 +895,10 @@ process.stdout.write(JSON.stringify(d));
 
 # Mode A readiness：以 JSON ready 字段为准（ADR-0012 决策 2③）
 mode_a_readiness_ok() {
-    local pr_id="$1" head_oid="$2" goal_id="$3" out parsed
-    out="$(loopx $REGISTRY_FLAG pr-review --goal-id "$goal_id" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
+    local pr_id="$1" head_oid="$2" goal_id="${3:-}" out parsed
+    local -a goal_flag=()
+    [[ -n "$goal_id" ]] && goal_flag=(--goal-id "$goal_id")
+    out="$(loopx $REGISTRY_FLAG pr-review "${goal_flag[@]}" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
     parsed="$(readiness_json_field "$out")" || return 1
     node -e '
 let d = {};
@@ -907,8 +909,10 @@ process.exit(d.ready === true ? 0 : 1);
 
 # Mode B readiness：blocking_reasons 三档判定（ADR-0012 决策 2③ 允许/忽略列表）
 mode_b_readiness_ok() {
-    local pr_id="$1" head_oid="$2" goal_id="$3" out parsed
-    out="$(loopx $REGISTRY_FLAG pr-review --goal-id "$goal_id" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
+    local pr_id="$1" head_oid="$2" goal_id="${3:-}" out parsed
+    local -a goal_flag=()
+    [[ -n "$goal_id" ]] && goal_flag=(--goal-id "$goal_id")
+    out="$(loopx $REGISTRY_FLAG pr-review "${goal_flag[@]}" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
     parsed="$(readiness_json_field "$out")" || return 1
     node -e '
 const allow = new Set(["pull_request_not_open","draft_pull_request","remote_head_mismatch","status_checks_missing","status_checks_failed","status_checks_pending","status_checks_incomplete","review_threads_incomplete","unresolved_review_threads","merge_state_requires_update","merge_state_unverified","repository_merge_state_blocked"]);
@@ -1200,7 +1204,7 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
             exit 1
         fi
         echo -e "    检测到启用阿里 OCR 选配项，调用技能内自闭环脚本..."
-        "$PROJECT_ROOT/skills/open-code-review/run-ocr.sh" "$cq_base_ref" "$feature"
+        "$PROJECT_ROOT/skills/open-code-review/run-ocr.sh" "$cq_base_ref" "$feature" "$gate_results_file"
     else
         echo -e "    调用默认语义契约审查并送入 LoopX Quality 适配器..."
         node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" ${feature:+--feature "$feature"} --goal-id "$resolved_goal" --base-ref "$cq_base_ref" --gate-results "$gate_results_file"
@@ -1809,18 +1813,20 @@ cmd_merge() {
             fi
             echo -e "    ${GREEN}[✓] 分支保护满足 ${auth_mode_val}（必须走 PR + Four Gates）${NC}"
         fi
-        local goal_flag=()
+        local merge_goal_id=""
+        local -a goal_flag=()
         if [[ -n "$feature" ]]; then
-            goal_flag=(--goal-id "${feature}-goal")
+            merge_goal_id="${feature}-goal"
+            goal_flag=(--goal-id "$merge_goal_id")
         fi
         if [[ "$auth_mode_val" == "single_owner" ]]; then
-            if ! mode_b_readiness_ok "$pr_id" "$head_oid" "${feature}-goal"; then
+            if ! mode_b_readiness_ok "$pr_id" "$head_oid" "$merge_goal_id"; then
                 echo -e "${RED}[-] [FAIL-CLOSED] Mode B readiness 三档判定失败（blocking_reasons 命中允许列表/未知项/缺失）${NC}" >&2
                 exit 1
             fi
             echo -e "    ${GREEN}[✓] Mode B readiness 通过${NC}"
         elif [[ "$auth_mode_val" == "independent" ]]; then
-            if ! mode_a_readiness_ok "$pr_id" "$head_oid" "${feature}-goal"; then
+            if ! mode_a_readiness_ok "$pr_id" "$head_oid" "$merge_goal_id"; then
                 echo -e "${RED}[-] [FAIL-CLOSED] Mode A readiness 未 ready=true: PR #$pr_id @ $head_oid${NC}" >&2
                 exit 1
             fi
