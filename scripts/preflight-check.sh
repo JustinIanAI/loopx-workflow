@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# preflight-check.sh: LoopX AI-Native 流水线前置环境与工程骨架体检哨兵 (v2.0)
-# 验证核心 CLI、四大硬门禁、specs/features 资产包架构与核心技能完整性
+# preflight-check.sh: LoopX AI-Native 流水线前置环境与工程骨架体检哨兵 (v2.1)
+# 验证核心 CLI、四大硬门禁、specs/features 资产包架构、仓库技能，
+# 以及（本机已有 loopx 时）required skills / routes / 安装新鲜度。
 # ==============================================================================
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 AUTO_FIX=false
 if [[ "${1:-}" == "--fix" ]]; then
@@ -18,6 +21,37 @@ NC='\033[0m' # No Color
 
 ERRORS=0
 WARNINGS=0
+
+# LoopX doctor 把技能检查标成 required:false，退出码 0 不能当成技能就绪。
+# 本机没有 loopx 时不调用这里（ADR-0003：缺 CLI 只告警）。
+verify_loopx_skill_readiness() {
+    local doctor_out doctor_err doctor_status
+    doctor_out="$(mktemp)"
+    doctor_err="$(mktemp)"
+    set +e
+    loopx doctor --format json >"$doctor_out" 2>"$doctor_err"
+    doctor_status=$?
+    set -e
+    if [[ "$doctor_status" -ne 0 ]]; then
+        echo -e "      - LoopX skills/routes/新鲜度: ${RED}FAIL${NC} (loopx doctor 退出码 ${doctor_status})"
+        echo -e "        ${RED}[FAIL-CLOSED] loopx doctor 验证未通过，不得把环境标记为就绪。${NC}"
+        if [[ -s "$doctor_err" ]]; then
+            sed 's/^/        /' "$doctor_err"
+        fi
+        echo -e "        修复指令: loopx doctor --format json"
+        echo -e "        若提示 skills 缺失或过期，再执行: loopx workflow-skills --install && loopx slash-commands --install && loopx doctor --format json"
+        rm -f "$doctor_out" "$doctor_err"
+        return 1
+    fi
+    if ! node "$SCRIPT_DIR/loopx-skill-readiness.js" <"$doctor_out"; then
+        echo -e "      - LoopX skills/routes/新鲜度: ${RED}FAIL${NC}"
+        rm -f "$doctor_out" "$doctor_err"
+        return 1
+    fi
+    echo -e "      - LoopX skills/routes/新鲜度: ${GREEN}PASS${NC}"
+    rm -f "$doctor_out" "$doctor_err"
+    return 0
+}
 
 echo -e "${BLUE}======================================================================${NC}"
 echo -e "${BLUE}        LoopX AI-Native 研发流水线前置环境自检 (Pre-flight Sentinel)   ${NC}"
@@ -74,6 +108,11 @@ done
 for tool in "${RECOMMENDED_TOOLS[@]}"; do
     if command -v "$tool" >/dev/null 2>&1; then
         echo -e "      - 推荐工具 $tool: ${GREEN}INSTALLED${NC} ($(which "$tool"))"
+        if [[ "$tool" == "loopx" ]]; then
+            if ! verify_loopx_skill_readiness; then
+                ERRORS=$((ERRORS + 1))
+            fi
+        fi
     else
         echo -e "      - 推荐工具 $tool: ${YELLOW}NOT FOUND (部分控制面特性受限)${NC}"
         WARNINGS=$((WARNINGS + 1))

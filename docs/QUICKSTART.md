@@ -35,6 +35,7 @@ cd /path/to/your-existing-repo
 - 校验 `package.json` 中的四大硬门禁（Typecheck, Lint, Build, Test）。
 - 挂载 Git pre-commit 主干防直推物理钩子。
 - 在本地初始化 LoopX 状态仓库（`.loopx/registry.json`）。
+- 本机已有 `loopx` 时，核验 required skills、routes 与安装新鲜度；缺失或过期则初始化失败并打印修复指令。
 
 ---
 

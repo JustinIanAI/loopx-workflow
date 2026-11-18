@@ -45,4 +45,5 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 echo "==> [✓] LoopX AI-Native 研发流水线初始化就绪！"
+echo "    - 本机已有 loopx 时，required skills、routes 与安装新鲜度已在 preflight 中核验。"
 echo "    - 建议后续在编码前运行: ./scripts/preflight-check.sh"
