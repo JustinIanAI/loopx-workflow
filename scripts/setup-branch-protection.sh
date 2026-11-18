@@ -19,7 +19,7 @@
 # 模式规则 (ADR-0012 决策 1/5/7):
 #   independent : PR review (required_approving_review_count >= 1 + dismiss_stale_reviews
 #                 + require_last_push_approval) + status check (context = "Four Gates", strict)
-#   single_owner: 只要求 PR + status check (context = "Four Gates", strict); 不得要求 approving review
+#   single_owner: 必须走 PR (required_approving_review_count = 0) + status check (context = "Four Gates", strict); 不得要求 >=1 approving review
 #   两者共同: enforce_admins=true, allow_force_pushes=false, allow_deletions=false
 # ==============================================================================
 set -euo pipefail
@@ -174,11 +174,20 @@ NODE_COMPARE='
 const fs = require("fs");
 const mode = process.argv[1];
 const branch = process.argv[2];
+const rulesRaw = process.argv[3] || "[]";
 const reasons = [];
 let protection = null;
 let parseFailed = false;
 try { protection = JSON.parse(fs.readFileSync(0, "utf8")); }
 catch (_) { parseFailed = true; }
+
+let rules = [];
+try {
+  const parsedRules = JSON.parse(rulesRaw);
+  if (Array.isArray(parsedRules)) rules = parsedRules;
+} catch (_) {
+  rules = [];
+}
 
 const enabled = (value) => {
   if (typeof value === "boolean") return value;
@@ -186,26 +195,52 @@ const enabled = (value) => {
   return null;
 };
 
-if (parseFailed || !protection || typeof protection !== "object" || Array.isArray(protection)) {
+const hasRuleset = rules.length > 0;
+if ((parseFailed || !protection || typeof protection !== "object" || Array.isArray(protection)) && !hasRuleset) {
   reasons.push("malformed_protection_json");
 } else {
-  const requiredStatusChecks = protection.required_status_checks;
+  const p = (protection && typeof protection === "object" && !Array.isArray(protection)) ? protection : {};
+  const requiredStatusChecks = p.required_status_checks;
+  const rulesetChecksRule = rules.find((r) => r && r.type === "required_status_checks");
+  const rulesetChecks = rulesetChecksRule && rulesetChecksRule.parameters && Array.isArray(rulesetChecksRule.parameters.required_status_checks)
+    ? rulesetChecksRule.parameters.required_status_checks.map((item) => (item && item.context) || "")
+    : [];
+  const rulesetStrict = Boolean(rulesetChecksRule && rulesetChecksRule.parameters && rulesetChecksRule.parameters.strict_required_status_checks_policy === true);
+
+  let statusOk = false;
+  if (rulesetChecks.includes("Four Gates") && rulesetStrict) {
+    statusOk = true;
+  }
   if (!requiredStatusChecks || typeof requiredStatusChecks !== "object") {
-    reasons.push("required_status_checks_missing");
+    if (!statusOk) reasons.push("required_status_checks_missing");
   } else {
     const contexts = Array.isArray(requiredStatusChecks.contexts) ? requiredStatusChecks.contexts : [];
     const checks = Array.isArray(requiredStatusChecks.checks)
       ? requiredStatusChecks.checks.map((item) => (item && item.context) || "")
       : [];
-    if (!contexts.includes("Four Gates") && !checks.includes("Four Gates")) {
+    if (!contexts.includes("Four Gates") && !checks.includes("Four Gates") && !rulesetChecks.includes("Four Gates")) {
       reasons.push("status_check_four_gates_missing");
     }
-    if (requiredStatusChecks.strict !== true) reasons.push("status_check_not_strict");
+    if (requiredStatusChecks.strict !== true && !rulesetStrict) reasons.push("status_check_not_strict");
   }
 
-  const requiredReviews = protection.required_pull_request_reviews;
+  const requiredReviews = p.required_pull_request_reviews;
+  const rulesetPrRule = rules.find((r) => r && r.type === "pull_request");
+  const rulesetPrParams = (rulesetPrRule && rulesetPrRule.parameters && typeof rulesetPrRule.parameters === "object")
+    ? rulesetPrRule.parameters
+    : null;
+
   if (mode === "independent") {
-    if (!requiredReviews || typeof requiredReviews !== "object") {
+    const rulesetIndependentOk = Boolean(
+      rulesetPrParams
+      && typeof rulesetPrParams.required_approving_review_count === "number"
+      && rulesetPrParams.required_approving_review_count >= 1
+      && rulesetPrParams.dismiss_stale_reviews_on_push === true
+      && rulesetPrParams.require_last_push_approval === true
+    );
+    if (rulesetIndependentOk) {
+      // satisfied via GitHub Ruleset
+    } else if (!requiredReviews || typeof requiredReviews !== "object") {
       reasons.push("required_pull_request_reviews_missing");
     } else {
       const count = requiredReviews.required_approving_review_count;
@@ -214,14 +249,38 @@ if (parseFailed || !protection || typeof protection !== "object" || Array.isArra
       if (requiredReviews.require_last_push_approval !== true) reasons.push("require_last_push_approval_disabled");
     }
   } else if (mode === "single_owner") {
-    if (requiredReviews && typeof requiredReviews === "object") {
+    const classicCount = (requiredReviews && typeof requiredReviews === "object")
+      ? requiredReviews.required_approving_review_count
+      : null;
+    const classicCodeOwner = Boolean(requiredReviews && requiredReviews.require_code_owner_reviews === true);
+    const classicZeroPr = Boolean(requiredReviews && typeof requiredReviews === "object" && classicCount === 0 && !classicCodeOwner);
+    const classicDisallowed = Boolean(
+      requiredReviews && typeof requiredReviews === "object"
+      && (typeof classicCount !== "number" || classicCount >= 1 || classicCodeOwner)
+    );
+    const rulesetPrCount = rulesetPrParams ? rulesetPrParams.required_approving_review_count : null;
+    const rulesetZeroPr = Boolean(
+      rulesetPrParams
+      && typeof rulesetPrCount === "number"
+      && rulesetPrCount === 0
+      && rulesetPrParams.require_code_owner_review !== true
+    );
+    const rulesetDisallowed = Boolean(
+      rulesetPrParams
+      && (typeof rulesetPrCount !== "number" || rulesetPrCount >= 1 || rulesetPrParams.require_code_owner_review === true)
+    );
+    if (classicDisallowed || rulesetDisallowed) {
       reasons.push("unexpected_required_pull_request_reviews");
+    } else if (!classicZeroPr && !rulesetZeroPr) {
+      reasons.push("pull_request_not_required");
     }
   }
 
-  if (enabled(protection.enforce_admins) !== true) reasons.push("enforce_admins_disabled");
-  if (enabled(protection.allow_force_pushes) !== false) reasons.push("force_pushes_allowed");
-  if (enabled(protection.allow_deletions) !== false) reasons.push("deletions_allowed");
+  const rulesetNoForcePush = rules.some((r) => r && r.type === "non_fast_forward");
+  const rulesetNoDeletion = rules.some((r) => r && r.type === "deletion");
+  if (enabled(p.enforce_admins) !== true && !(hasRuleset && !protection)) reasons.push("enforce_admins_disabled");
+  if (enabled(p.allow_force_pushes) !== false && !rulesetNoForcePush) reasons.push("force_pushes_allowed");
+  if (enabled(p.allow_deletions) !== false && !rulesetNoDeletion) reasons.push("deletions_allowed");
 }
 
 const result = {
@@ -236,8 +295,8 @@ process.exit(reasons.length === 0 ? 0 : 1);
 '
 
 run_compare() {
-    local raw="$1" out status
-    if out="$(printf '%s' "$raw" | node -e "$NODE_COMPARE" "$MODE" "$BRANCH")"; then
+    local raw="$1" rules_raw="${2:-[]}" out status
+    if out="$(printf '%s' "$raw" | node -e "$NODE_COMPARE" "$MODE" "$BRANCH" "$rules_raw")"; then
         printf '%s\n' "$out"
         return 0
     else
@@ -264,9 +323,23 @@ run_check() {
         return 1
     fi
 
-    local out
+    local out="" rules_out="[]" rules_ok=0 prot_ok=0
     if out="$(gh api "repos/${REPO}/branches/${BRANCH}/protection" 2>&1)"; then
-        run_compare "$out"
+        prot_ok=1
+    fi
+    if rules_out="$(gh api "repos/${REPO}/rules/branches/${BRANCH}" 2>/dev/null)"; then
+        if node -e 'const d = JSON.parse(process.argv[1]); process.exit(Array.isArray(d) && d.length > 0 ? 0 : 1);' "$rules_out" 2>/dev/null; then
+            rules_ok=1
+        fi
+    else
+        rules_out="[]"
+    fi
+
+    if [[ "$prot_ok" -eq 1 ]]; then
+        run_compare "$out" "$rules_out"
+        return $?
+    elif [[ "$rules_ok" -eq 1 ]]; then
+        run_compare "null" "$rules_out"
         return $?
     else
         emit_check_json false "$(classify_api_failure "$out")"
@@ -293,22 +366,6 @@ run_apply() {
 
     log "apply mode=${MODE} branch=${BRANCH} repo=${REPO}"
 
-    if [[ "$MODE" == "single_owner" ]]; then
-        log "single_owner: 清除 required_pull_request_reviews (若存在)"
-        local out
-        if out="$(gh api --method DELETE "repos/${REPO}/branches/${BRANCH}/protection/required_pull_request_reviews" 2>&1)"; then
-            log "  -> 已删除 required_pull_request_reviews"
-        else
-            case "$out" in
-                *"HTTP 404"*|*"Not Found"*|*"Required reviews not enabled"*)
-                    log "  -> 未启用 required_pull_request_reviews，跳过" ;;
-                *)
-                    echo "[-] [setup-branch-protection] 删除 required_pull_request_reviews 失败: $out" >&2
-                    return 1 ;;
-            esac
-        fi
-    fi
-
     local payload
     if ! payload="$(node -e '
 const mode = process.argv[1];
@@ -317,7 +374,12 @@ const payload = {
   enforce_admins: true,
   allow_force_pushes: false,
   allow_deletions: false,
-  required_pull_request_reviews: null,
+  required_pull_request_reviews: {
+    dismiss_stale_reviews: false,
+    require_code_owner_reviews: false,
+    required_approving_review_count: 0,
+    require_last_push_approval: false
+  },
   restrictions: null
 };
 if (mode === "independent") {

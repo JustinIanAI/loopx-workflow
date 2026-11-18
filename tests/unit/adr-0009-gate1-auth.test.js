@@ -239,3 +239,43 @@ test('T0 gate verify：single_owner 配置 + 匹配 evidence 通过', () => {
     assert.match(r.stdout, /GATE PASS/);
   } finally { h.cleanup(dir); }
 });
+
+test('P1-1：缺 loopx-workflow.config.json 时 gate verify contract 必须 fail-closed', () => {
+  const { dir } = gateVerifySandbox({});
+  try {
+    fs.rmSync(path.join(dir, 'loopx-workflow.config.json'), { force: true });
+    const r = h.run(dir, ['gate', 'verify', 'contract', FEATURE]);
+    assert.notStrictEqual(r.status, 0, 'missing config must fail closed on gate verify');
+    assert.match(r.stderr + r.stdout, /授权配置/);
+  } finally { h.cleanup(dir); }
+});
+
+test('P1-1 & P2-1：gate1_spec_complete 拒绝仅含 Contract 字样而无 AC 的契约，且 approve 更新加粗 00-INDEX.md', () => {
+  const dir = sandboxWithConfig('independent');
+  try {
+    h.writeCapsule(dir, FEATURE, {
+      contract: [
+        '# Feature Contract',
+        '- **Scope**: only this feature',
+        '- **Verification Plan**: npm run test',
+        '- **依赖顺序**: Story-1',
+        '- **引用**: REQ-CHECKPOINT-1',
+      ].join('\n'),
+    });
+    approveLoopxMock(dir);
+    approveGhMock(dir, path.join(dir, 'comments.json'));
+    const bad = h.run(dir, ['approve', 'contract', FEATURE]);
+    assert.strictEqual(bad.status, 1, 'Contract word alone must not satisfy AC check');
+    assert.match(bad.stderr + bad.stdout, /规格不完整/);
+
+    // Valid contract updates bold **Contract Status**: and **Current Status**: in 00-INDEX.md
+    const capsule = h.writeCapsule(dir, FEATURE);
+    const lockedSha = h.lockedShaFile(capsule.contractPath);
+    approveGhMock(dir, gateComments(dir, lockedSha));
+    const ok = h.run(dir, ['approve', 'contract', FEATURE]);
+    assert.strictEqual(ok.status, 0, ok.stdout + ok.stderr);
+    const idx = fs.readFileSync(path.join(dir, 'specs/features', FEATURE, '00-INDEX.md'), 'utf8');
+    assert.match(idx, /\*\*Contract Status\*\*:\s*FROZEN & APPROVED/);
+    assert.match(idx, /\*\*Current Status\*\*:\s*APPROVED/);
+  } finally { h.cleanup(dir); }
+});

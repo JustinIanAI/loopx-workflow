@@ -207,3 +207,49 @@ test('5. PATH 中缺少 gh → --check fail closed (ok=false)', () => {
     }
   });
 });
+
+test('6. single_owner + Ruleset pull_request(count=0) 或 classic count=0 → --check 通过; 缺 PR 约束则阻断 (P1-2)', () => {
+  withConfig('single_owner', () => {
+    const dir = makeTempDir('loopx-ruleset-');
+    const protectionFile = path.join(dir, 'protection.json');
+    const rulesFile = path.join(dir, 'rules.json');
+    fs.writeFileSync(protectionFile, JSON.stringify({
+      required_status_checks: { strict: true, contexts: ['Four Gates'] },
+      required_pull_request_reviews: null,
+      enforce_admins: { enabled: true },
+      allow_force_pushes: { enabled: false },
+      allow_deletions: { enabled: false }
+    }));
+    fs.writeFileSync(rulesFile, JSON.stringify([
+      { type: 'pull_request', parameters: { required_approving_review_count: 0, require_code_owner_review: false } }
+    ]));
+    const mockGh = path.join(dir, 'gh');
+    fs.writeFileSync(mockGh, `#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  auth) exit 0 ;;
+  repo) echo "mock-owner/mock-repo" ;;
+  api)
+    if [[ "\${2:-}" == *"/rules/branches/"* ]]; then cat "${rulesFile}"; exit 0; fi
+    cat "${protectionFile}"
+    ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o755 });
+    try {
+      const okRes = runCheck({ mockDir: dir });
+      assert.strictEqual(okRes.status, 0, 'Ruleset pull_request(count=0) must satisfy single_owner: ' + okRes.stderr + okRes.stdout);
+      assert.strictEqual(stdoutJsonLines(okRes)[0].ok, true);
+
+      // When neither classic PR reviews nor ruleset pull_request rule exists -> fail closed with pull_request_not_required
+      fs.writeFileSync(rulesFile, '[]');
+      const missingRes = runCheck({ mockDir: dir });
+      assert.notStrictEqual(missingRes.status, 0, 'single_owner without PR requirement must fail closed');
+      const parsed = stdoutJsonLines(missingRes)[0];
+      assert.strictEqual(parsed.ok, false);
+      assert.ok(parsed.reasons.includes('pull_request_not_required'), 'expected pull_request_not_required, got ' + JSON.stringify(parsed.reasons));
+    } finally {
+      cleanupDir(dir);
+    }
+  });
+});

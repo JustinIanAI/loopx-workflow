@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
@@ -8,6 +9,7 @@ const crypto = require('node:crypto');
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const REG_PATH = path.join(PROJECT_ROOT, '.loopx/registry.json');
+const CONFIG_PATH = path.join(PROJECT_ROOT, 'loopx-workflow.config.json');
 
 let hadOriginalReg = false;
 let originalRegContent = null;
@@ -64,12 +66,37 @@ test('1. ADR-003: gate verify pr is retired and must be rejected', () => {
 });
 
 test('2. ADR-002: Double-anchored Contract Gate: passes on matching SHA256', () => {
-  const { withoutRepoConfig } = require('./helpers/repo-isolation');
-  const res = withoutRepoConfig(() => spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'fail-closed-hardening'], {
-    encoding: 'utf8'
+  const contractFile = fs.existsSync(path.join(PROJECT_ROOT, 'specs/features/fail-closed-hardening/04-contract.md'))
+    ? path.join(PROJECT_ROOT, 'specs/features/fail-closed-hardening/04-contract.md')
+    : path.join(PROJECT_ROOT, 'specs/archive/fail-closed-hardening/04-contract.md');
+  const contractSha = crypto.createHash('sha256').update(fs.readFileSync(contractFile)).digest('hex');
+  const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  const acc = cfg.single_owner_risk_acceptance || { accepted_by: 'JustinIanAI', accepted_at: '2026-11-12T09:43:44Z' };
+  const evidence = cfg.authorization_mode === 'single_owner'
+    ? `authorization_mode=single_owner;contract_sha=${contractSha};spec_commit=${'b'.repeat(40)};feature=fail-closed-hardening;principal=${acc.accepted_by};risk_acceptance=${acc.accepted_by}@${acc.accepted_at}`
+    : `authorization_mode=${cfg.authorization_mode};contract_sha=${contractSha};spec_commit=${'b'.repeat(40)};feature=fail-closed-hardening;principal=reviewer`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-hardening-mock-'));
+  const todosFile = path.join(tmpDir, 'todos.json');
+  fs.writeFileSync(todosFile, JSON.stringify({
+    todos: [{
+      task_class: 'user_gate',
+      decision_outcome: 'approve',
+      decision_scope: { scope_key: contractSha },
+      superseded_by: null,
+      evidence
+    }]
   }));
-  assert.strictEqual(res.status, 0, 'Matching contract SHA256 and approved marker must pass');
-  assert.match(res.stdout, /阶段 4 契约冻结签名通过|契约双重锚定核验通过/, 'Must confirm contract gate pass');
+  fs.writeFileSync(path.join(tmpDir, 'loopx'), `#!/usr/bin/env bash\nif [[ "$*" == *"todo list"* ]]; then cat "${todosFile}"; exit 0; fi\nexit 0\n`, { mode: 0o755 });
+  try {
+    const res = spawnSync(LOOPX_FLOW, ['gate', 'verify', 'contract', 'fail-closed-hardening'], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${tmpDir}:${process.env.PATH}` },
+    });
+    assert.strictEqual(res.status, 0, `Matching contract SHA256 and approved marker must pass: ${res.stderr}`);
+    assert.match(res.stdout, /阶段 4 契约冻结签名通过|契约双重锚定核验通过/, 'Must confirm contract gate pass');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test('3. ADR-002: Double-anchored Contract Gate: fails closed on tampered contract SHA256', () => {
