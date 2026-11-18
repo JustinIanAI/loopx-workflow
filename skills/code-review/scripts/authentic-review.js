@@ -43,6 +43,7 @@ const {
   splitFileDiffs,
   describeFileFromDiff,
   scanDiff,
+  formatDiffForPrompt,
 } = require('./evidence-builder');
 
 const TIMEOUT_MS = 600000;
@@ -425,6 +426,29 @@ function prDiff(repo, prId) {
   return r.stdout || '';
 }
 
+function fetchPrChecks(repo, prId) {
+  const r = sh('gh', ['pr', 'checks', String(prId), '--repo', repo, '--json', 'name,state,bucket,link']);
+  if (r.status !== 0) {
+    const detail = (r.stderr || r.stdout || `exit ${r.status}`).trim().slice(0, 200);
+    console.warn(`[WARN] gh pr checks failed for ${repo}#${prId}: ${detail}`);
+    return { checks: [], error: detail };
+  }
+  if (!r.stdout || !r.stdout.trim()) return { checks: [], error: null };
+  try {
+    const parsed = JSON.parse(r.stdout);
+    if (!Array.isArray(parsed)) {
+      const detail = 'gh pr checks returned non-array JSON';
+      console.warn(`[WARN] ${detail} for ${repo}#${prId}`);
+      return { checks: [], error: detail };
+    }
+    return { checks: parsed, error: null };
+  } catch (e) {
+    const detail = `gh pr checks JSON parse error: ${e.message}`;
+    console.warn(`[WARN] ${detail} for ${repo}#${prId}`);
+    return { checks: [], error: detail };
+  }
+}
+
 function extractJson(text) {
   if (!text) return null;
   const fence = text.match(/```json\s*([\s\S]*?)```/);
@@ -665,21 +689,95 @@ function buildCarryoverSection(carryover, priorFindings) {
   return `### 上轮 findings 裁决 (Carryover)\n${rows.join('\n')}`;
 }
 
+function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
+  const hostFactIds = new Set(['validation_matrix']);
+  const requiredIds = Array.isArray(reviewPlan && reviewPlan.required_evidence_ids)
+    ? reviewPlan.required_evidence_ids
+    : [];
+  const reqs = Array.isArray(evidenceContract && evidenceContract.evidence_requirements)
+    ? evidenceContract.evidence_requirements
+    : [];
+  const negRequired = !reviewPlan || !reviewPlan.applicability || reviewPlan.applicability.negative_walkthrough_required !== false;
+  const lines = [];
+  for (const r of reqs) {
+    if (!requiredIds.includes(r.evidence_id) || hostFactIds.has(r.evidence_id)) continue;
+    lines.push(
+      `- \`${r.evidence_id}\`: fields=${(r.fields || []).join(', ') || '(none)'}${r.items_field ? `; items_field=${r.items_field}; item_fields=${(r.item_fields || []).join(', ')}` : ''}${r.verdict_values ? `; verdict_values=${r.verdict_values.join('|')}` : ''}`,
+    );
+    if (r.item_count && (r.item_count.minimum != null || r.item_count.maximum != null)) {
+      lines.push(`  - item_count: min=${r.item_count.minimum ?? 0}, max=${r.item_count.maximum ?? 'unbounded'}`);
+    }
+    if (r.fields_by_verdict && typeof r.fields_by_verdict === 'object') {
+      const pairs = Object.entries(r.fields_by_verdict).map(([k, v]) => `${k}=[${(v || []).join(', ')}]`).join('; ');
+      if (pairs) lines.push(`  - fields_by_verdict: ${pairs}`);
+    }
+    if (Array.isArray(r.candidate_decisions) && r.candidate_decisions.length) {
+      lines.push(`  - candidate_decisions: ${r.candidate_decisions.join('|')}`);
+    }
+    if (r.positive_field && Array.isArray(r.positive_fields)) {
+      lines.push(`  - ${r.positive_field} (object): ${r.positive_fields.join(', ')}`);
+    }
+    if (r.negative_field && negRequired && Array.isArray(r.negative_fields)) {
+      lines.push(`  - ${r.negative_field} (object, required): ${r.negative_fields.join(', ')}`);
+    }
+    if (r.evidence_id === 'problem_context') {
+      if (r.outcome_impact) {
+        const oi = r.outcome_impact;
+        lines.push(`  - outcome_impact (object): keys=[${(oi.dimensions || ['long_horizon', 'user_experience']).join(', ')}]; each={${(oi.fields || ['decision', 'reason', 'inspected_path']).join(', ')}}; decision_values=${(oi.decision_values || []).join('|')}; when decision!="not_applicable" also require [${(oi.applicable_fields || ['before_after', 'evidence_refs']).join(', ')}]`);
+        if (oi.visual_review) {
+          const vr = oi.visual_review;
+          lines.push(`  - outcome_impact.user_experience.visual_review (object): {${(vr.fields || ['decision', 'reason']).join(', ')}}; decision_values=${(vr.decision_values || []).join('|')} (CLI/internal-only changes use "not_applicable"); if decision!="not_applicable" also require [${(vr.applicable_fields || []).join(', ')}] and publish reason + unverified_scope in 我的整体评价`);
+        }
+      }
+      lines.push('  - spec_basis (object): {decision: mapped|no_spec|not_yet_proven, spec_source: accepted_rfc|accepted_contract_doc|linked_issue_or_task|review_thread|none, reason}; if decision=="no_spec" use spec_source="none"; if decision=="mapped" also require spec_ref, spec_revision (full 40-char commit SHA for RFC/contract docs), criteria=[{criterion_id, requirement, disposition: implemented|deferred|out_of_scope|not_met}] where disposition=="implemented" MUST include [symbol_or_path, validation_ref], "deferred" MUST include [reason, successor_or_gap], "out_of_scope" MUST include [reason], "not_met" MUST include [observed_gap, minimum_repair], and publish spec_ref, spec_revision, criterion_id in review_body');
+    }
+    if (r.compatibility_assessment) {
+      const ca = r.compatibility_assessment;
+      lines.push(`  - compatibility_assessment (object): {${(ca.fields || []).join(', ')}}; decision_values=${(ca.decision_values || []).join('|')}; when decision!="not_applicable" also require [${(ca.applicable_fields || []).join(', ')}] (deployment_boundary=${(ca.deployment_boundary_values || []).join('|')})`);
+    }
+    if (r.architecture_assessment) {
+      const aa = r.architecture_assessment;
+      lines.push(`  - architecture_assessment (object): {${(aa.fields || []).join(', ')}}; decision_values=${(aa.decision_values || []).join('|')}; when decision!="not_applicable" also require [${(aa.applicable_fields || []).join(', ')}] with mechanisms=[{${(aa.mechanism_fields || []).join(', ')}}] (responsibility=${(aa.responsibility_values || []).join('|')})`);
+    }
+    if (r.scope_coverage) {
+      const sc = r.scope_coverage;
+      lines.push(`  - scope_coverage (object): {${(sc.fields || []).join(', ')}}; decision_values=${(sc.decision_values || []).join('|')}; when decision!="not_applicable" also require [${(sc.applicable_fields || []).join(', ')}] with cases for [${(sc.case_ids || []).join(', ')}] (each={${(sc.case_fields || []).join(', ')}}; status=${(sc.case_statuses || []).join('|')})`);
+    }
+    if (r.decision_text_assessment) {
+      const dt = r.decision_text_assessment;
+      const dtByVerdict = dt.fields_by_verdict && typeof dt.fields_by_verdict === 'object'
+        ? Object.entries(dt.fields_by_verdict).map(([k, v]) => `${k}=[${(v || []).join(', ')}]`).join('; ')
+        : '';
+      lines.push(`  - decision_text_assessment (object): {${(dt.fields || []).join(', ')}}; verdict_values=${(dt.verdict_values || []).join('|')}${dtByVerdict ? `; fields_by_verdict: ${dtByVerdict}` : ''}; when verdict!="not_applicable" also require [${(dt.applicable_fields || []).join(', ')}] (clause_fields=[${(dt.clause_fields || []).join(', ')}], counterfactual_fields=[${(dt.counterfactual_fields || []).join(', ')}])`);
+    }
+    if (r.state_model_assessment) {
+      lines.push(`  - state_model_assessment (object): classification_values=${(r.state_model_assessment.classification_values || []).join('|')}; item_fields=[${(r.state_model_assessment.item_fields || []).join(', ')}] (or {classification, reason} when no new state)`);
+    }
+    if (r.rule_ownership && Array.isArray(r.rule_ownership.row_fields)) {
+      lines.push(`  - rule_ownership: row_fields=[${r.rule_ownership.row_fields.join(', ')}] (or {status/note} recording no parallel path when not applicable)`);
+    }
+    if (Array.isArray(r.row_fields)) {
+      lines.push(`  - comparison_rows item fields: [${r.row_fields.join(', ')}]; execution_receipt_fields=[${(r.execution_receipt_fields || []).join(', ')}]; regression_sensitivity_fields=[${(r.regression_sensitivity_fields || []).join(', ')}]`);
+    }
+  }
+  return lines.join('\n');
+}
+
 // 用原生 review_template（agent_instruction + 字数下限）+ evidence_commands + motivation 构建提示词。
 // 注意：这是"透传原生提示词约束"，不是手写版式。模型被要求严格按五段式产出。
-function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract }) {
+function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract, remoteChecks, remoteChecksError }) {
   const prior = (priorFindings || []).map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
   const sectionsMd = (reviewTemplate.sections || []).map(s =>
     `### ${s.label}（最少 ${s.minimum_prose_characters} 正文字符）\n约束提示词：${s.agent_instruction || ''}`,
   ).join('\n\n');
 
   const evdCmds = (evidenceCommands || []).map(c => `- \`${c}\``).join('\n');
-  const hostFactIds = new Set(['validation_matrix']);
   const requiredIds = (reviewPlan.required_evidence_ids || []).join(', ');
-  const evidenceRequirements = (evidenceContract && evidenceContract.evidence_requirements || [])
-    .filter(r => (reviewPlan.required_evidence_ids || []).includes(r.evidence_id) && !hostFactIds.has(r.evidence_id))
-    .map(r => `- \`${r.evidence_id}\`: fields=${(r.fields || []).join(', ') || '(none)'}${r.items_field ? `; items_field=${r.items_field}; item_fields=${(r.item_fields || []).join(', ')}` : ''}${r.verdict_values ? `; verdict_values=${r.verdict_values.join('|')}` : ''}`)
-    .join('\n');
+  const evidenceRequirements = formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan);
+  const remoteChecksText = Array.isArray(remoteChecks) && remoteChecks.length
+    ? remoteChecks.map(c => `- \`${c.name || 'check'}\`: state=${c.state || 'unknown'}, bucket=${c.bucket || 'unknown'}${c.link ? ` (${c.link})` : ''}`).join('\n')
+    : (remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)');
+  const formattedDiff = formatDiffForPrompt(diff, 240000);
   const head10 = headOid.slice(0, 10);
 
   return [
@@ -728,11 +826,14 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '## 证据命令执行结果',
     evidenceText || '(无)',
     '',
+    '## 远端 CI 检查状态（gh pr checks）',
+    remoteChecksText,
+    '',
     '## PR DIFF（远程权威）',
-    diff.length > 240000 ? `${diff.slice(0, 240000)}\n\n[TRUNCATED]` : diff,
+    formattedDiff,
     '',
     '## 输出格式（请输出单一 fenced json 块）',
-    '结构如下（仅填写你已独立核实的判断类 evidence，未核实项保持或省略为 unverified；其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals` 四个非空字符串并写入「动机」段。`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap`，并写入同一段）：',
+    '结构如下：你必须按上方「评审范围 evidence」逐项填写全部 required_evidence_ids（已独立核实且无缺口的项写 `"status": "verified"` 并填全全部必填字段与嵌套对象；确实存在未核实项时写 `"status": "unverified"` 且 verdict 只能为 `REQUEST_CHANGES`）。若代码确无阻塞缺陷且所有必填证据均已核实并完整填写（包括 `validation_matrix.changed_invariant_positive` 与 `material_negative_or_failure` 的真实 `tests/*.test.js` 路径，以及 `symbol_map` 的 2-5 个精确 diff 符号），请输出 `verdict: "APPROVE"`。其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals`、`outcome_impact`（含 `user_experience.visual_review`）和 `spec_basis` 并写入「动机」段；`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap` 并写入同一段：',
     '```json',
     JSON.stringify({
       review_body: 'Markdown 字符串：首行必须是 `Reviewer: model_agent · model=<model> · provider=<provider> · declaration=<declaration_source> · head=<headOid>`（declaration_source 默认 self_reported）；随后依次出现五个二级标题（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价），各章达到字数下限；「具体改动」下必须含 `### 关键代码讲解`；正文内须含精确 head oid；结尾须有一行 `English verdict: APPROVE` 或 `English verdict: REQUEST_CHANGES`。',
@@ -740,12 +841,28 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
       findings: [{ file: '路径', line: '整数或 null', severity: 'P0|P1|P2|P3|blocker|major|minor|advisory', summary: '...', repro: '可选复现步骤' }],
       reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-high', declared_provider: '如 openai' },
       evidence: {
+        validation_matrix: {
+          changed_invariant_positive: { test_path: 'tests/unit/相关测试.test.js（如存在）' },
+          material_negative_or_failure: { test_path: 'tests/unit/相关测试.test.js（如存在）' },
+        },
         problem_context: {
           status: 'unverified 或 verified（全字段核实后）',
           affected_caller_or_operator: '受影响的调用方或维护者说明（必填字符串）',
           before_after_scenario: '变更前后具体场景对比（必填字符串）',
           observable_outcome: '可观测结果说明（必填字符串）',
           non_goals: '本 PR 的非目标边界（必填字符串）',
+          outcome_impact: {
+            long_horizon: { decision: 'improved|preserved|accepted_tradeoff|not_applicable', reason: '...', inspected_path: '...', before_after: '...', evidence_refs: ['...'] },
+            user_experience: {
+              decision: 'improved|preserved|accepted_tradeoff|not_applicable',
+              reason: '...',
+              inspected_path: '...',
+              before_after: '...',
+              evidence_refs: ['...'],
+              visual_review: { decision: 'not_applicable|inspected', reason: '...' },
+            },
+          },
+          spec_basis: { decision: 'no_spec|mapped', spec_source: 'none|accepted_contract_doc|linked_issue_or_task', reason: '...' },
         },
       },
       carryover: [{ finding_index: '上轮 finding 序号（1 起）', status: 'fixed|reproducible|obsolete', evidence: '复验依据/命令' }],
@@ -856,6 +973,24 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, prob
       text = text.replace(/(^|\n)(#+\s*动机[\s\S]*?)(?=\n#+\s*改动思路)/,
         (m, p1, p2) => `${p1}${p2}\n\n> 动机要素（LoopX 原生契约）：\n${pcBlock}`);
     }
+    const vr = problemContext.outcome_impact
+      && problemContext.outcome_impact.user_experience
+      && problemContext.outcome_impact.user_experience.visual_review;
+    if (vr && vr.decision && vr.decision !== 'not_applicable') {
+      const vrMissing = [vr.reason, vr.unverified_scope].filter(s => typeof s === 'string' && s.trim() && !text.includes(s));
+      if (vrMissing.length > 0 && /##\s*我的整体评价/.test(text)) {
+        text = text.replace(/(##\s*我的整体评价[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 视觉复核：${vrMissing.join('；unverified_scope: ')}`);
+      }
+    }
+    const sb = problemContext.spec_basis;
+    if (sb && sb.decision === 'mapped') {
+      const refs = [sb.spec_ref, sb.spec_revision].concat(
+        Array.isArray(sb.criteria) ? sb.criteria.map(c => c && c.criterion_id) : [],
+      ).filter(s => typeof s === 'string' && s.trim() && !text.includes(s));
+      if (refs.length > 0 && /##\s*具体改动/.test(text)) {
+        text = text.replace(/(##\s*具体改动[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 规格映射引用：${refs.join(' · ')}`);
+      }
+    }
   }
 
   if (carryoverSection && String(carryoverSection).trim() && !text.includes('### 上轮 findings 裁决')) {
@@ -868,6 +1003,21 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, prob
 
   const verdictLine = `English verdict: ${verdict}`;
   return `${reviewerLine}\n\n${text}\n\n${verdictLine}\n`;
+}
+
+function capVerdictInBody(reviewBody, { authorOwned = false } = {}) {
+  let text = String(reviewBody || '');
+  if (authorOwned) {
+    if (text.includes(AUTHOR_OWNED_REVIEW_TITLES.APPROVE)) {
+      text = text.replace(AUTHOR_OWNED_REVIEW_TITLES.APPROVE, AUTHOR_OWNED_REVIEW_TITLES.REQUEST_CHANGES);
+    } else if (!text.includes(AUTHOR_OWNED_REVIEW_TITLES.REQUEST_CHANGES)) {
+      text = `${AUTHOR_OWNED_REVIEW_TITLES.REQUEST_CHANGES}\n\n${text}`;
+    }
+  }
+  return text.replace(
+    /^English verdict:\s*APPROVE\s*$/m,
+    '> [VERDICT CAPPED] 仍有 unverified 必填证据或 unresolved 验证失败（approval_contradicts_evidence），按 LoopX verdict policy 封顶为 REQUEST_CHANGES。\n\nEnglish verdict: REQUEST_CHANGES',
+  );
 }
 
 // 跑原生 check-result，返回解析后的校验报告
@@ -1134,9 +1284,12 @@ function main() {
 
   // --- 2. 执行原生 evidence_commands，收集证据（nativeMode 下驱动模型）---
   const evidenceText = runEvidenceCommands(pkt.evidenceCommands);
+  const remoteChecksRes = fetchPrChecks(o.repo, o.pr);
+  const remoteChecks = remoteChecksRes.checks;
+  const remoteChecksError = remoteChecksRes.error;
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
-    try { validation = buildValidationMatrix(gates(), { headOid }); } catch (e) { validation = []; }
+    try { validation = buildValidationMatrix(gates(), { headOid, remoteChecks }); } catch (e) { validation = []; }
   }
 
   // --- 3. 构建提示词：原生 review_template（透传，不重写）---
@@ -1151,6 +1304,8 @@ function main() {
     reviewTemplate: pkt.reviewTemplate, reviewPlan: pkt.reviewPlan,
     evidenceCommands: pkt.evidenceCommands, evidenceText, diff, priorFindings,
     evidenceContract: pkt.evidenceContract || {},
+    remoteChecks,
+    remoteChecksError,
   });
 
   // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
@@ -1302,10 +1457,7 @@ function main() {
     if (!fmt.pass && verdict === 'APPROVE' && nativeErrors.includes('approval_contradicts_evidence')) {
       console.log('[CAPPED] 仍有 unverified 必填证据或 unresolved 验证失败 -> APPROVE 与证据矛盾 (approval_contradicts_evidence)，封顶为 REQUEST_CHANGES 并重校验。');
       verdict = 'REQUEST_CHANGES';
-      reviewBody = reviewBody.replace(
-        /^English verdict:\s*APPROVE\s*$/m,
-        '> [VERDICT CAPPED] 仍有 unverified 必填证据或 unresolved 验证失败（approval_contradicts_evidence），按 LoopX verdict policy 封顶为 REQUEST_CHANGES。\n\nEnglish verdict: REQUEST_CHANGES',
-      );
+      reviewBody = capVerdictInBody(reviewBody, { authorOwned: pkt.authorOwned });
       runCheck();
     }
 
@@ -1357,6 +1509,8 @@ if (require.main === module) main();
 module.exports = {
   finalizeReviewBody,
   buildNativePrompt,
+  formatEvidenceRequirementsForPrompt,
+  capVerdictInBody,
   parsePolicyRevision,
   resolveLoopxExecutable,
   resolveReviewPolicyRevision,
