@@ -71,7 +71,15 @@ function makeSandbox(opts = {}) {
     reviewHeadOid = HEAD,
     claudeStdoutFile = '', loopxCheckResult = 'ok', gatesExit = 0,
     reviewTemplate = 1, codexMode = 'native',
+    policyMode = 'contract', policyRevision = 26,
   } = opts;
+  const contractFragment = policyMode === 'contract'
+    ? `,"agent_response_contract":{"review_execution_contract":{"policy_revision":${policyRevision}}}`
+    : '';
+  const templateFragment = policyMode === 'result_template'
+    ? `,"result_template":{"review_policy_revision":${policyRevision}}`
+    : '';
+  const probeValue = policyMode === 'probe' ? String(policyRevision) : '';
 
   // 默认模型输出：原生 schema（review_body + verdict + findings + reviewer）
   if (!codexStdoutFile) {
@@ -109,14 +117,22 @@ case "$0" in
     fi
     exit 0 ;;
   *loopx)
+    if [[ "$args" == *"--print-policy-revision"* ]]; then
+      if [[ -n "${probeValue}" ]]; then
+        echo "${probeValue}"
+        exit 0
+      fi
+      echo "policy_revision unavailable" >&2
+      exit 1
+    fi
     if [[ "$args" == *"pr-review"* && "$args" == *"--format json"* ]]; then
       if [[ "${reviewTemplate}" == "1" ]]; then
         cat <<JSON
-{"schema_version":"pull_request_review_packet_v0","repository":"o/r","request":{"source":"github_cli"},"reviewer_execution":{"status":"unavailable","reason":"session_not_bound"},"pull_requests":[{"number":7,"head_oid":"${mockHeadOid}","headRefOid":"${mockHeadOid}","headRefName":"feature/x","title":"t","review_action_kind":"review","review_template":{"schema":"pr_review_five_block_template_v0","sections":[{"label":"动机","minimum_prose_characters":40,"agent_instruction":"NATIVE_AGENT_INSTRUCTION_XYZ 动机约束"},{"label":"改动思路","minimum_prose_characters":80,"agent_instruction":"改动思路约束"},{"label":"具体改动","minimum_prose_characters":180,"agent_instruction":"具体改动约束；代码类变更必须包含 ### 关键代码讲解"},{"label":"对主干的风险","minimum_prose_characters":120,"agent_instruction":"风险约束"},{"label":"我的整体评价","minimum_prose_characters":60,"agent_instruction":"评价约束"}],"output_hint":"NATIVE_OUTPUT_HINT_XYZ"},"review_plan":{"required_evidence_ids":["e1"],"applicability":{"behavior_bearing_change":true}},"evidence_commands":["echo evidence-ok"],"motivation":"LoopX extracted motivation text."}]}
+{"schema_version":"pull_request_review_packet_v0","repository":"o/r","request":{"source":"github_cli"},"reviewer_execution":{"status":"unavailable","reason":"session_not_bound"}${contractFragment},"pull_requests":[{"number":7,"head_oid":"${mockHeadOid}","headRefOid":"${mockHeadOid}","headRefName":"feature/x","title":"t","review_action_kind":"review","review_template":{"schema":"pr_review_five_block_template_v0","sections":[{"label":"动机","minimum_prose_characters":40,"agent_instruction":"NATIVE_AGENT_INSTRUCTION_XYZ 动机约束"},{"label":"改动思路","minimum_prose_characters":80,"agent_instruction":"改动思路约束"},{"label":"具体改动","minimum_prose_characters":180,"agent_instruction":"具体改动约束；代码类变更必须包含 ### 关键代码讲解"},{"label":"对主干的风险","minimum_prose_characters":120,"agent_instruction":"风险约束"},{"label":"我的整体评价","minimum_prose_characters":60,"agent_instruction":"评价约束"}],"output_hint":"NATIVE_OUTPUT_HINT_XYZ"},"review_plan":{"required_evidence_ids":["e1"],"applicability":{"behavior_bearing_change":true}},"evidence_commands":["echo evidence-ok"],"motivation":"LoopX extracted motivation text."${templateFragment}}]}
 JSON
       else
         cat <<JSON
-{"schema_version":"pull_request_review_packet_v0","repository":"o/r","request":{"source":"github_cli"},"reviewer_execution":{"status":"unavailable","reason":"session_not_bound"},"pull_requests":[{"number":7,"head_oid":"${mockHeadOid}","headRefOid":"${mockHeadOid}","headRefName":"feature/x","title":"t","review_action_kind":"review"}]}
+{"schema_version":"pull_request_review_packet_v0","repository":"o/r","request":{"source":"github_cli"},"reviewer_execution":{"status":"unavailable","reason":"session_not_bound"}${contractFragment},"pull_requests":[{"number":7,"head_oid":"${mockHeadOid}","headRefOid":"${mockHeadOid}","headRefName":"feature/x","title":"t","review_action_kind":"review"${templateFragment}}]}
 JSON
       fi
       exit 0
@@ -141,6 +157,9 @@ JSON
       fi
       if [[ -n "$result_file" && -f "$result_file" ]] && grep -q "7@${mockHeadOid}" "$result_file"; then
         echo "TARGET_EXACT_HEAD_MATCHES" >> ${JSON.stringify(logs)}/calls.log
+      fi
+      if [[ -n "$result_file" && -f "$result_file" ]] && grep -Eq '"review_policy_revision": *${policyRevision}(,|})' "$result_file"; then
+        echo "RESULT_POLICY_REVISION_${policyRevision}" >> ${JSON.stringify(logs)}/calls.log
       fi
       if [[ -n "$result_file" && -f "$result_file" ]] && grep -q '"declaration_source": *"self_reported"' "$result_file"; then
         echo "RESULT_DECLARATION_SELF_REPORTED" >> ${JSON.stringify(logs)}/calls.log
@@ -369,6 +388,79 @@ describe('INV3 native check-result protocol alignment', () => {
     assert.match(calls, /PACKET_HAS_PULL_REQUESTS/);
     assert.match(calls, /RESULT_SCHEMA_V1/);
     assert.match(calls, /TARGET_EXACT_HEAD_MATCHES/);
+    assert.match(calls, /RESULT_POLICY_REVISION_26/);
+    assert.match(r.out, /review_policy_revision: 26/);
+    assert.match(r.out, /loopx executable:/);
+  });
+});
+
+describe('issue #19 dynamic loopx and policy_revision', () => {
+  test('a non-default packet revision is written through, not a hardcoded constant', () => {
+    const sbx = makeSandbox({ policyRevision: 31 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /RESULT_POLICY_REVISION_31/);
+    assert.doesNotMatch(calls, /RESULT_POLICY_REVISION_22/);
+  });
+
+  test('result_template.review_policy_revision is accepted when the execution contract omits it', () => {
+    const sbx = makeSandbox({ policyMode: 'result_template', policyRevision: 26 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /RESULT_POLICY_REVISION_26/);
+    assert.match(r.out, /result_template\.review_policy_revision/);
+  });
+
+  test('runtime probe supplies policy_revision when the packet does not', () => {
+    const sbx = makeSandbox({ policyMode: 'probe', policyRevision: 26 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /RESULT_POLICY_REVISION_26/);
+    assert.match(r.out, /print-policy-revision|REVIEW_POLICY_REVISION/);
+  });
+
+  test('missing policy_revision fails closed and does not publish', () => {
+    const sbx = makeSandbox({ policyMode: 'none' });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.notStrictEqual(r.code, 0);
+    assert.match(r.out, /policy_revision/);
+    assert.match(r.out, /fail-closed/);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.doesNotMatch(calls, /\/gh pr comment/);
+  });
+
+  test('LOOPX_BIN pointing at a missing file fails closed before pr-review', () => {
+    const sbx = makeSandbox();
+    const missing = path.join(sbx.dir, 'missing-loopx');
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { LOOPX_BIN: missing });
+    assert.notStrictEqual(r.code, 0);
+    assert.match(r.out, /LOOPX_BIN/);
+    assert.match(r.out, /fail-closed/);
+    const calls = fs.existsSync(sbx.logs) ? fs.readFileSync(sbx.logs, 'utf8') : '';
+    assert.doesNotMatch(calls, /pr-review/);
+  });
+
+  test('an active CONDA_PREFIX is used when PATH and LOOPX_BIN do not provide loopx', () => {
+    const sbx = makeSandbox();
+    const pathDir = path.join(sbx.dir, 'pathbin');
+    fs.mkdirSync(pathDir);
+    for (const name of ['gh', 'codex', 'claude', 'npm']) {
+      fs.symlinkSync(path.join(sbx.bin, name), path.join(pathDir, name));
+    }
+    fs.symlinkSync(process.execPath, path.join(pathDir, 'node'));
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {
+      LOOPX_BIN: '',
+      PATH: `${pathDir}:/usr/bin:/bin`,
+      CONDA_PREFIX: sbx.dir,
+      CONDA_EXE: '',
+      VIRTUAL_ENV: '',
+      MAMBA_ROOT_PREFIX: '',
+    });
+    assert.strictEqual(r.code, 0, r.out);
+    assert.match(r.out, /loopx executable:.*\(CONDA_PREFIX\)/);
   });
 });
 
@@ -511,5 +603,54 @@ describe('R3 carryover integrity', () => {
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
     assert.notStrictEqual(r.code, 0);
     assert.ok(r.out.includes('NOT_VERIFIED') || r.out.includes('carryover status'));
+  });
+});
+
+describe('P0-A1 gates env isolation', () => {
+  test('gates() strips cmd_review REVIEW_* throttle vars before spawning npm', () => {
+    const { isolatedGateEnv, gates } = require(SCRIPT);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'auth-gates-env-'));
+    const dumpFile = path.join(dir, 'env.log');
+    const mockNpm = path.join(dir, 'npm');
+    fs.writeFileSync(mockNpm, [
+      '#!/usr/bin/env bash',
+      'printf "%s:%s:%s:%s\\n" "${REVIEW_SHORTCIRCUIT:-UNSET}" "${REVIEW_DEBOUNCE_SECONDS:-UNSET}" "${REVIEW_UPSERT_PUBLISH:-UNSET}" "$*" >> ' + JSON.stringify(dumpFile),
+      'exit 0',
+    ].join('\n'), { mode: 0o755 });
+
+    const prevBin = process.env.AUTHENTIC_REVIEW_GATES_BIN;
+    process.env.AUTHENTIC_REVIEW_GATES_BIN = mockNpm;
+    try {
+      const clean = isolatedGateEnv({
+        PATH: process.env.PATH,
+        REVIEW_SHORTCIRCUIT: '1',
+        REVIEW_DEBOUNCE_SECONDS: '60',
+        REVIEW_UPSERT_PUBLISH: '1',
+        REVIEW_BACKOFF_BASE_MS: '1000',
+        REVIEW_MAX_RETRIES: '3',
+      });
+      assert.strictEqual(clean.REVIEW_SHORTCIRCUIT, undefined);
+      assert.strictEqual(clean.REVIEW_DEBOUNCE_SECONDS, undefined);
+      assert.strictEqual(clean.REVIEW_UPSERT_PUBLISH, undefined);
+      const res = gates({
+        noCache: true,
+        env: {
+          ...process.env,
+          REVIEW_SHORTCIRCUIT: '1',
+          REVIEW_DEBOUNCE_SECONDS: '60',
+          REVIEW_UPSERT_PUBLISH: '1',
+        },
+      });
+      assert.strictEqual(res.test, 'PASSED');
+      const lines = fs.readFileSync(dumpFile, 'utf8').trim().split('\n');
+      assert.strictEqual(lines.length, 4);
+      for (const line of lines) {
+        assert.match(line, /^UNSET:UNSET:UNSET:run (typecheck|lint|build|test)$/);
+      }
+    } finally {
+      if (prevBin === undefined) delete process.env.AUTHENTIC_REVIEW_GATES_BIN;
+      else process.env.AUTHENTIC_REVIEW_GATES_BIN = prevBin;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
