@@ -64,3 +64,9 @@
 
 - 不修改 LoopX 官方 Python 核心包（`loopx`）的代码与校验策略。
 - 不改变 PR 五段式评审报告的版式与字数硬性要求。
+
+## 2026-11-19 修订（运行目录隔离与留证策略）
+
+- 阶段 1/2 提示词、packet、`result.json` 与 `check-result.json` 统一落盘在 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 独立运行目录中，不再使用按 PR 号固定的裸文件名（消除多进程覆写）。
+- 遵循“成功即清理、失败即留证”原则：正常退出（exit 0）自动清理本次运行目录；失败退出或显式设置 `REVIEW_KEEP_PROMPT=1` / `LOOPX_KEEP_TMP=1` 时保留运行目录并打印目录路径。
+- PR 评论发布、comment upsert（`PATCH` 拆分为 `['-X', 'PATCH', endpoint, '-F', 'body=@-']`）与 `gh pr edit` 全链路改用 stdin 传递，不再产生临时正文文件。

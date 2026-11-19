@@ -1,0 +1,20 @@
+{
+  "schema_version": "loopx_lark_kanban_local_config_v0",
+  "board": {
+    "base_token": "**",
+    "table_id": "**",
+    "view_id": "**",
+    "base_url": "https://my.feishu.cn/base/**",
+    "base_name": "LoopX - <goal-id>",
+    "table_name": "LoopX Control Plane",
+    "cli_bin": "lark-cli",
+    "identity": "user",
+    "view_ids": {
+      "All Tasks": "**",
+      "Worker Queue": "**",
+      "User Gates": "**",
+      "Kanban": "**"
+    }
+  },
+  "todo_records": {}
+}

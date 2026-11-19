@@ -9,7 +9,8 @@ const { withoutRepoConfig } = require('./helpers/repo-isolation');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
-const MOCK_BIN = path.join(PROJECT_ROOT, '.tmp-mock-bin-merge-comp');
+const MOCK_BIN = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-mock-bin-merge-comp-'));
+process.on('exit', () => { try { fs.rmSync(MOCK_BIN, { recursive: true, force: true }); } catch (_) {} });
 const CALLS = path.join(MOCK_BIN, 'calls.log');
 
 function setupMocks() {
@@ -176,15 +177,21 @@ test('8. P0-B：真实 git-sync 归档先 pull main 再 git mv，远端拦截直
     execSync(`git clone -q "${remote}" "${seed}"`);
     execSync('git config user.email t@example.com && git config user.name test', { cwd: seed });
     fs.mkdirSync(path.join(seed, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(seed, 'lib'), { recursive: true });
     fs.mkdirSync(path.join(seed, 'scripts'), { recursive: true });
     fs.copyFileSync(LOOPX_FLOW, path.join(seed, 'bin/loopx-flow'));
     fs.chmodSync(path.join(seed, 'bin/loopx-flow'), 0o755);
+    fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.sh'), path.join(seed, 'lib/paths.sh'));
+    fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.js'), path.join(seed, 'lib/paths.js'));
+    fs.writeFileSync(path.join(seed, '.gitignore'), '.loopx/\n');
     fs.writeFileSync(path.join(seed, 'README.md'), '# seed\n');
     execSync('git add -A && git commit -qm init && git push -q -u origin main', { cwd: seed });
 
     execSync(`git clone -q "${remote}" "${work}"`);
     execSync('git config user.email t@example.com && git config user.name test', { cwd: work });
     execSync(`git checkout -qb "feature/${feature}"`, { cwd: work });
+    fs.mkdirSync(path.join(work, '.loopx'), { recursive: true });
+    fs.writeFileSync(path.join(work, '.loopx/registry.json'), JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
 
     // Simulate PR #14 merge having landed specs/features/<feature> onto origin/main
     fs.mkdirSync(path.join(seed, 'specs/features', feature), { recursive: true });

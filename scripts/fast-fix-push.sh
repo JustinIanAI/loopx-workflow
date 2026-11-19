@@ -82,7 +82,11 @@ git checkout -b "$BRANCH_NAME" || fail "创建分支失败: ${BRANCH_NAME}"
 # ---------------------------------------------------------------------------
 if [[ -n "$(git status --porcelain)" ]]; then
     echo "==> [Fast-Path] 提交本地改动..."
-    git add -A || fail "git add 失败"
+    git add -A -- . ':!.loopx' ':!.codex' ':!qa-acceptance' || fail "git add 失败"
+    if [[ -n "$(git diff --cached --name-only -- .loopx .codex qa-acceptance)" ]]; then
+        git reset -q -- .loopx .codex qa-acceptance || true
+        fail "检测到运行时/私有目录被暂存（.loopx/.codex/qa-acceptance），已拒绝提交"
+    fi
     git commit -m "$COMMIT_MSG" || fail "git commit 失败"
 else
     echo "[i] [Fast-Path] 工作区无改动，使用当前 HEAD"

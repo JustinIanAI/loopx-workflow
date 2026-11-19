@@ -7,10 +7,9 @@ const { spawnSync, execSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
-const MOCK_BIN_DIR = path.join(PROJECT_ROOT, '.tmp-mock-bin-dispatch');
-
 // issue #8：测试临时工件隔离在 os.tmpdir()+mkdtemp，禁止共享 /tmp 固定文件名。
 const TEST_TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-native-dispatch-'));
+const MOCK_BIN_DIR = path.join(TEST_TMP_DIR, 'mock-bin');
 const CALLS_LOG = path.join(TEST_TMP_DIR, 'native-dispatch-mock-calls.log');
 after(() => fs.rmSync(TEST_TMP_DIR, { recursive: true, force: true }));
 

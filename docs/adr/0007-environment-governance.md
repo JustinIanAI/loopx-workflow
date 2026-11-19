@@ -70,3 +70,13 @@
 - **成本**：`doctor` 增加 3 个检查段（约 120 行 bash），并在缺少 `gh`/`loopx` 时降级为 WARN；
   迁移仍是一次性人工确认操作，不由自动流程执行。
 - **不做**：不引入第二套 registry 兜底、不在 `doctor` 里自动删除或自动迁移用户 HOME 状态。
+
+## 2026-11-19 修订（统一路径锚定、Worktree Fail-Closed 与可丢弃缓存分层）
+
+为彻底消除临时工件泄露、CWD 偏移与宿主机路径污染，并严守“不触碰 LoopX 原生运行态”边界，对本 ADR 补充以下约束（详见 `docs/adr/0014-temp-artifact-path-remediation-and-history-sanitization.md`）：
+
+- **双根唯一真相模块（`lib/paths.sh` & `lib/paths.js`）**：严格区分 `WORKFLOW_ROOT`（脚本/技能静态资产）与 `REPO_ROOT`（`git rev-parse --show-toplevel` 解析的目标仓库根），所有运行态目录（`.loopx/tmp/`、`.loopx/cache/reviews/`）与默认 registry 统一锚定 `REPO_ROOT`。
+- **`.gitignore` 收敛为单行 `.loopx/`**：整目录隔离 LoopX 私有运行态与编排层临时/缓存目录；脱敏配置示例改放 `docs/examples/`。
+- **Worktree 缺 registry 强制 fail-closed（D1）**：需读写 LoopX 权威状态的命令（`approve`/`gate verify contract`/`check`/`merge`/`todo`/`issue`/`integrate`）在附属 worktree 缺 `.loopx/registry.json` 时报错退出，只提示主 checkout 候选路径，绝不自动回指；支持在子命令前显式传 `--registry <path>`（支持含空格路径）或导出 `LOOPX_REGISTRY`。
+- **评审缓存降级与并发安全回收（D2）**：`.loopx/reviews/` 迁移至 `$REPO_ROOT/.loopx/cache/reviews/` 并升级为 `loopx_flow_review_cache_v1`（含完整 `result_payload`）；缓存命中仅跳过模型调用，发布前仍须拉取最新 packet 并重跑 `loopx pr-review --check-result`；提供 `loopx-flow gc [--days N] [--force]` 回收过期缓存与失败保留运行目录（默认保护 1 小时内活跃项且禁止跟随符号链接）。
+- **宿主机全局技能挂载改为显式 opt-in**：`scripts/workflow-init.sh` 默认不再写入 `${CODEX_HOME:-$HOME/.codex}/skills`，仅传 `--link-global-skills` 时执行软链挂载。

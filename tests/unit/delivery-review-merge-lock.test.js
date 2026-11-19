@@ -7,10 +7,9 @@ const { spawnSync, execSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
-const MOCK_BIN_DIR = path.join(PROJECT_ROOT, '.tmp-mock-bin-review-lock');
-
 // issue #8：测试临时工件必须隔离在 os.tmpdir()+mkdtemp，禁止共享 /tmp 固定文件名。
 const TEST_TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-review-lock-'));
+const MOCK_BIN_DIR = path.join(TEST_TMP_DIR, 'mock-bin');
 const MOCK_COMMENT_LOG = path.join(TEST_TMP_DIR, 'last-mock-pr-comment.txt');
 after(() => fs.rmSync(TEST_TMP_DIR, { recursive: true, force: true }));
 

@@ -2,12 +2,14 @@ const test = require('node:test');
 const assert = require('node:assert');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
-const MOCK_BIN_DIR = path.join(PROJECT_ROOT, '.tmp-mock-bin-issue-12');
+const MOCK_BIN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-mock-bin-issue-12-'));
+process.on('exit', () => { try { fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true }); } catch (_) {} });
 const CALLS_LOG = path.join(MOCK_BIN_DIR, 'calls.log');
 
 function expectedKey(goalId, todoId, owner) {

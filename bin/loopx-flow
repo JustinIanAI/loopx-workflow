@@ -6,11 +6,54 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-REGISTRY_FLAG=""
-if [[ -f "$PROJECT_ROOT/.loopx/registry.json" ]]; then
-    REGISTRY_FLAG="--registry $PROJECT_ROOT/.loopx/registry.json"
-fi
+WORKFLOW_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+# shellcheck source=../lib/paths.sh
+source "$WORKFLOW_ROOT/lib/paths.sh"
+
+# 路由前解析全局选项：支持 `loopx-flow --registry <path> <command> ...`（D1 / R15）
+CLI_REGISTRY=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --registry)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                echo "[-] [FAIL-CLOSED] --registry 需要指定文件路径" >&2
+                exit 2
+            fi
+            CLI_REGISTRY="$2"
+            shift 2
+            ;;
+        --registry=*)
+            CLI_REGISTRY="${1#--registry=}"
+            if [[ -z "$CLI_REGISTRY" ]]; then
+                echo "[-] [FAIL-CLOSED] --registry= 需要指定文件路径" >&2
+                exit 2
+            fi
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+wf_init_paths "$CLI_REGISTRY"
+# 兼容别名：PROJECT_ROOT 统一指向目标仓库根（EFFECTIVE_ROOT），静态脚本/技能资产统一走 WORKFLOW_ROOT。
+PROJECT_ROOT="$EFFECTIVE_ROOT"
+REGISTRY_FLAG="$(wf_registry_display_flag)"
+export LOOPX_TMP_DIR
+
+# 安全数组调用 loopx，完整保留含空格的 registry 路径（R15）。
+run_loopx() {
+    if [[ "${#REGISTRY_ARGS[@]}" -gt 0 ]]; then
+        loopx "${REGISTRY_ARGS[@]}" "$@"
+    else
+        loopx "$@"
+    fi
+}
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -23,10 +66,7 @@ NC='\033[0m' # No Color
 # 单一事实源在 ingest-to-loopx-quality.js#discoverBaseRef；shell 侧只做委托与降级，避免两处逻辑漂移。
 resolve_change_quality_base_ref() {
     local ref
-    ref="$(node -e '
-const ingest = require(process.argv[1]);
-try { process.stdout.write(ingest.discoverBaseRef(".")); } catch (_) {}
-' "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" 2>/dev/null)" || true
+    ref="$(wf_discover_base_ref "$PROJECT_ROOT" || true)"
     [[ -n "$ref" ]] && { printf '%s' "$ref"; return 0; }
     return 1
 }
@@ -44,7 +84,7 @@ preflight_change_quality_qualification() {
     # 分离捕获退出码与 JSON 输出：严禁用 `|| echo '{}'` 拼接，否则 prepare 失败时双 JSON
     # 会让 JSON.parse 失败并回落空对象，UNKNOWN 被误判为 OK，跳过前置阻断空跑四大门禁。
     prepare_rc=0
-    payload="$(loopx $REGISTRY_FLAG change-quality prepare --goal-id "$goal_id" --base-ref "$base_ref" --format json 2>/dev/null)" || prepare_rc=$?
+    payload="$(run_loopx change-quality prepare --goal-id "$goal_id" --repo-path "$PROJECT_ROOT" --base-ref "$base_ref" --format json 2>/dev/null)" || prepare_rc=$?
     verdict="$(node -e '
 let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
 let p={};try{p=JSON.parse(d)}catch(_){}
@@ -83,7 +123,7 @@ usage() {
 ===============================================================================
 
 用法:
-  loopx-flow <command> [arguments...]
+  loopx-flow [--registry <path>] <command> [arguments...]
 
 核心场景指令:
   feature <name>          开启新特性管线，生成 specs/features/<name> 资产包与 Goal (阶段 0~4)
@@ -100,6 +140,7 @@ usage() {
   archive <feature>       原子归档已合入特性的资产包 (specs/features/ -> specs/archive/)
   gate verify <stage> <f> 阶段流转物理熔断守卫 (decisions | contract)
   doctor                  前置环境与 LoopX 就绪度全维评分 (preflight + loopx doctor)
+  gc [--days N] [--force] 并发安全清理 .loopx/cache/reviews/ 与 .loopx/tmp/ 过期工件（默认 14 天，1h 活跃保护）
   init                    初始化项目工作流骨架、依赖及本地 LoopX 连接
   status                  查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
   status --next [feature] 只读投影 + 下一步建议（不写 Goal/Todo/Lease/Gate，不是 resume）
@@ -123,14 +164,26 @@ cmd_doctor_control_plane() {
 
     # 1. runtime root 路由与项目 registry 声明是否一致
     local route_json runtime_root declared_root
-    route_json="$(loopx --format json status 2>/dev/null || echo '{}')"
+    route_json="$(run_loopx --format json status 2>/dev/null || echo '{}')"
     runtime_root="$(node -e '
 const firstJson=(s)=>{let depth=0,inStr=false,esc=false;for(let i=0;i<s.length;i++){const c=s[i];if(inStr){if(esc){esc=false}else if(c==="\\"){esc=true}else if(c==="\""){inStr=false}continue}if(c==="\""){inStr=true;continue}if(c==="{"){depth++}else if(c==="}"){depth--;if(depth===0)return s.slice(0,i+1)}}return null};
 let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let out="";try{out=JSON.parse(d).runtime_root||""}catch(_){const j=firstJson(d);if(j){try{out=JSON.parse(j).runtime_root||""}catch(__){}}}process.stdout.write(out)})' <<< "$route_json")"
     declared_root="$(node -e '
 const fs=require("fs");
-try{const r=JSON.parse(fs.readFileSync(".loopx/registry.json","utf8"));process.stdout.write(r.common_runtime_root||"")}catch(_){}
-' 2>/dev/null)"
+try{const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(r.common_runtime_root||"")}catch(_){}
+' "$LOOPX_REGISTRY_PATH" 2>/dev/null)"
+    if [[ ! -f "$LOOPX_REGISTRY_PATH" ]]; then
+        if [[ "$LOOPX_REGISTRY_EXPLICIT" -eq 0 ]] && wf_is_linked_worktree "$PROJECT_ROOT"; then
+            local hint=""
+            hint="$(wf_main_checkout_registry_hint "$PROJECT_ROOT" || true)"
+            echo -e "${YELLOW}[WARN] 当前附属 worktree 缺少 LoopX registry: $LOOPX_REGISTRY_PATH${NC}"
+            echo -e "       🛠️ 修复: loopx bootstrap --project \"$PROJECT_ROOT\" 或显式指定 --registry \"${hint:-<主 checkout>/.loopx/registry.json}\""
+            fail=1
+        else
+            echo -e "${YELLOW}[WARN] 本地 LoopX registry 缺失: $LOOPX_REGISTRY_PATH${NC}"
+            fail=1
+        fi
+    fi
     if [[ -n "$runtime_root" && -n "$declared_root" && "$runtime_root" != "$declared_root" ]]; then
         echo -e "${YELLOW}[WARN] runtime root 不一致: 生效=$runtime_root 项目声明=$declared_root${NC}"
         echo -e "       🛠️ 修复: loopx bootstrap --project . --goal-id <goal> 重新同步，或统一 registry 的 common_runtime_root"
@@ -154,11 +207,11 @@ try{const r=JSON.parse(fs.readFileSync(".loopx/registry.json","utf8"));process.s
     local bad_goals
     bad_goals="$(node -e '
 const fs=require("fs"),os=require("os"),path=require("path");
-const files=[".loopx/registry.json",path.join(os.homedir(),".loopx","registry.global.json"),path.join(os.homedir(),".codex","loopx","registry.global.json")];
+const files=[process.argv[1],path.join(os.homedir(),".loopx","registry.global.json"),path.join(process.argv[2],"loopx","registry.global.json")];
 const bad=[];
 for(const f of files){try{const d=JSON.parse(fs.readFileSync(f,"utf8"));for(const g of (d.goals||[])){if(g&&g.id&&!g.state_file)bad.push(f+"#"+g.id)}}catch(_){}}
 process.stdout.write([...new Set(bad)].join(" "))
-' 2>/dev/null)"
+' "$LOOPX_REGISTRY_PATH" "$(wf_codex_home)" 2>/dev/null)"
     if [[ -n "$bad_goals" ]]; then
         echo -e "${YELLOW}[WARN] registry 存在缺 state_file 的 goal（会阻塞迁移/审批）: $bad_goals${NC}"
         echo -e "       🛠️ 修复: 补 state_file 指向 <project>/.codex/goals/<goal>/ACTIVE_GOAL_STATE.md，或 retire 该 goal"
@@ -169,7 +222,7 @@ process.stdout.write([...new Set(bad)].join(" "))
 
     # 4. 运行时工件不得进入 Git 跟踪面（会污染 exact scope / 收据证据）
     local tracked_runtime
-    tracked_runtime="$(git ls-files 2>/dev/null | grep -E '(\.codex/|\.loopx/[^/]*\.lock$|\.loopx/.*\.lock$)' | head -5 || true)"
+    tracked_runtime="$(git -C "$PROJECT_ROOT" ls-files 2>/dev/null | grep -E '^(\.codex/|\.loopx/|qa-acceptance/)' | head -5 || true)"
     if [[ -n "$tracked_runtime" ]]; then
         echo -e "${YELLOW}[WARN] 运行时工件仍被 Git 跟踪（会进入 exact scope）:${NC}"
         echo "$tracked_runtime" | sed 's/^/         /'
@@ -239,7 +292,7 @@ cmd_doctor_change_quality() {
 
 doctor_branch_protection() {
     local mode="$1" script out
-    script="$PROJECT_ROOT/scripts/setup-branch-protection.sh"
+    script="$WORKFLOW_ROOT/scripts/setup-branch-protection.sh"
     if [[ ! -f "$script" ]]; then
         echo -e "${YELLOW}[WARN] 缺少分支保护检查脚本: $script${NC}"
         return 1
@@ -311,21 +364,21 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2) + "\n");
 
 cmd_doctor() {
     echo -e "${BLUE}==> [1/3] 运行流水线前置哨兵体检 (Preflight Sentinel)...${NC}"
-    "$PROJECT_ROOT/scripts/preflight-check.sh"
+    "$WORKFLOW_ROOT/scripts/preflight-check.sh"
 
     echo -e "\n${BLUE}==> [2/3] 运行 LoopX 原生健康自检 (LoopX Doctor)...${NC}"
     if command -v loopx >/dev/null 2>&1; then
         if ! loopx doctor; then
             echo -e "\n${RED}[-] [FAIL-CLOSED] LoopX 原生健康自检失败！${NC}" >&2
             echo -e "💡 为什么阻断？LoopX 控制面存在配置损坏或环境缺失，继续执行可能导致状态丢失。" >&2
-            echo -e "🛠️ 修复指令: 查看上方详细自检日志，或运行 python3 -m pip install --upgrade loopx 进行修复。" >&2
+            echo -e "🛠️ 修复指令: 查看上方详细自检日志，或运行 python3 -m pip install --upgrade loopx 进行修复。" >&2 # loopx-allow: install hint text
             exit 1
         fi
     else
         echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，流水线控制面不可用。${NC}" >&2
         echo -e "    原因: 本机 PATH 中没有 loopx，无法注册 Goal、锁定契约、核验收据或合入锁。" >&2
         echo -e "    影响: approve/check/merge/issue/integrate/todo 等承重命令将全部阻断。" >&2
-        echo -e "🛠️ 修复指令: python3 -m pip install --upgrade loopx && loopx doctor" >&2
+        echo -e "🛠️ 修复指令: python3 -m pip install --upgrade loopx && loopx doctor" >&2 # loopx-allow: install hint text
         exit 1
     fi
 
@@ -343,20 +396,37 @@ cmd_doctor() {
     doctor_authorization_config
 }
 
-# 项目本地临时沙箱（ADR-0007 / issue #8）：临时工件禁止硬编码系统 /tmp 固定文件名，
-# 否则多 Agent / 多进程会互相覆写，且重启或清理后证据丢失、平台（macOS /private/tmp、
-# Windows %TEMP%）不可移植。默认写入项目内已 gitignore 的 .loopx/tmp/，文件名必须唯一
-# （mktemp 或 PID/UUID）；CI 或隔离测试可用 LOOPX_TMP_DIR 覆盖该目录。
-LOOPX_TMP_DIR="${LOOPX_TMP_DIR:-$PROJECT_ROOT/.loopx/tmp}"
-
 ensure_loopx_tmp_dir() {
     mkdir -p "$LOOPX_TMP_DIR"
+}
+
+cmd_gc() {
+    local days="14" force="false" as_json="false"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days) days="${2:-}"; shift 2 ;;
+            --force) force="true"; shift ;;
+            --json) as_json="true"; shift ;;
+            -h|--help)
+                echo "用法: loopx-flow gc [--days N] [--force] [--json]"
+                return 0
+                ;;
+            *)
+                echo -e "${RED}[-] 未知参数: $1${NC}" >&2
+                exit 2
+                ;;
+        esac
+    done
+    local -a gc_args=(--gc --repo-root "$PROJECT_ROOT" --tmp-dir "$LOOPX_TMP_DIR" --days "$days")
+    [[ "$force" == "true" ]] && gc_args+=(--force)
+    [[ "$as_json" == "true" ]] && gc_args+=(--json)
+    node "$WORKFLOW_ROOT/lib/paths.js" "${gc_args[@]}"
 }
 
 cmd_init() {
     init_authorization_config
     echo -e "${BLUE}==> 正在初始化 LoopX 工作流环境...${NC}"
-    "$PROJECT_ROOT/scripts/workflow-init.sh"
+    "$WORKFLOW_ROOT/scripts/workflow-init.sh"
     mkdir -p "$PROJECT_ROOT/.loopx/tmp"
     echo -e "${GREEN}[✓] 项目本地临时沙箱已就绪: .loopx/tmp (已 gitignore，可用 LOOPX_TMP_DIR 覆盖)${NC}"
     if command -v loopx >/dev/null 2>&1; then
@@ -375,7 +445,7 @@ sync_global_required() {
     [[ -n "$goal_id" ]] && args+=(--goal-id "$goal_id")
     local attempt out status
     for attempt in 1 2 3; do
-        if out="$(loopx $REGISTRY_FLAG "${args[@]}" 2>&1)"; then
+        if out="$(run_loopx "${args[@]}" 2>&1)"; then
             return 0
         fi
         status=$?
@@ -512,12 +582,12 @@ EVIEEOF
     echo -e "    ${GREEN}[✓] 已生成自包含资产包: specs/features/$feature/${NC}"
 
     echo -e "${BLUE}==> [3/3] 注册 LoopX Goal 实体与持久化状态 (Capsule State Bound)...${NC}"
-    local state_file=".loopx/goals/${goal_id}/ACTIVE_GOAL_STATE.md"
+    local state_file=".loopx/goals/${goal_id}/ACTIVE_GOAL_STATE.md" # loopx-allow: repo-relative path passed to --project "$PROJECT_ROOT"
 
     if command -v loopx >/dev/null 2>&1; then
         # LoopX 2.0 只有在 --state-file 不存在时才会创建 canonical authority；
         # 因此这里严禁在 bootstrap 前预创建 state_file（issue #17 / ADR-0008 归 LoopX runtime）。
-        if ! loopx $REGISTRY_FLAG bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" --state-file "$state_file"; then
+        if ! run_loopx bootstrap --project "$PROJECT_ROOT" --goal-id "$goal_id" --display-name "Feature: $feature" --state-file "$state_file"; then
             echo -e "${RED}[-] [FAIL-CLOSED] 注册 LoopX Goal $goal_id 失败，流程已阻断！${NC}" >&2
             echo -e "💡 为什么阻断？目标实体注册失败将导致任务无法被正确追踪与审计。" >&2
             echo -e "🛠️ 修复指令: 运行 loopx doctor 排查本地注册表健康状态。" >&2
@@ -618,8 +688,8 @@ gate1_spec_complete() {
     local stories="$PROJECT_ROOT/specs/features/$feature/03-stories.md"
     [[ -f "$contract" ]] || return 1
     grep -Eqi '(^|[^A-Za-z])AC([^A-Za-z]|$)|AC[[:space:]]*矩阵|Acceptance Criteria' "$contract" || return 1
-    grep -Eqi '\bScope\b' "$contract" || return 1
-    grep -Eqi '\bVerification\b' "$contract" || return 1
+    grep -Eqi '(^|[^A-Za-z])Scope([^A-Za-z]|$)' "$contract" || return 1
+    grep -Eqi '(^|[^A-Za-z])Verification([^A-Za-z]|$)' "$contract" || return 1
     grep -Eqi '依赖|Dependency|Order' "$contract" || return 1
     grep -Eq 'REQ-|ADR-' "$contract" || return 1
     if [[ -f "$stories" ]] && grep -qi 'Story' "$stories"; then
@@ -701,7 +771,7 @@ process.exit(1);
 
 gate1_user_gate_evidence() {
     local feature="$1" sha="$2" goal="$1-goal" json
-    json="$(loopx --format json $REGISTRY_FLAG todo list --goal-id "$goal" --role user 2>/dev/null || true)"
+    json="$(run_loopx --format json todo list --goal-id "$goal" --role user 2>/dev/null || true)"
     [[ -n "$json" ]] || return 1
     node -e '
 const fs = require("fs");
@@ -917,7 +987,7 @@ mode_a_readiness_ok() {
     local pr_id="$1" head_oid="$2" goal_id="${3:-}" out parsed
     local -a goal_flag=()
     [[ -n "$goal_id" ]] && goal_flag=(--goal-id "$goal_id")
-    out="$(loopx $REGISTRY_FLAG pr-review "${goal_flag[@]}" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
+    out="$(run_loopx pr-review "${goal_flag[@]}" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
     parsed="$(readiness_json_field "$out")" || return 1
     node -e '
 let d = {};
@@ -931,7 +1001,7 @@ mode_b_readiness_ok() {
     local pr_id="$1" head_oid="$2" goal_id="${3:-}" out parsed
     local -a goal_flag=()
     [[ -n "$goal_id" ]] && goal_flag=(--goal-id "$goal_id")
-    out="$(loopx $REGISTRY_FLAG pr-review "${goal_flag[@]}" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
+    out="$(run_loopx pr-review "${goal_flag[@]}" --check-merge-readiness "$pr_id@$head_oid" --format json 2>&1 || true)"
     parsed="$(readiness_json_field "$out")" || return 1
     node -e '
 const allow = new Set(["pull_request_not_open","draft_pull_request","remote_head_mismatch","status_checks_missing","status_checks_failed","status_checks_pending","status_checks_incomplete","review_threads_incomplete","unresolved_review_threads","merge_state_requires_update","merge_state_unverified","repository_merge_state_blocked"]);
@@ -954,7 +1024,7 @@ process.exit(0);
 
 # CI/分支保护是 Gate2 前置；缺失时 merge fail-closed（ADR-0012 决策 5）
 branch_protection_ok() {
-    local mode="$1" branch="${2:-main}" script="$PROJECT_ROOT/scripts/setup-branch-protection.sh" out
+    local mode="$1" branch="${2:-main}" script="$WORKFLOW_ROOT/scripts/setup-branch-protection.sh" out
     if [[ ! -f "$script" ]]; then
         echo "[-] [FAIL-CLOSED] 缺少分支保护检查脚本: $script" >&2
         return 1
@@ -1009,9 +1079,7 @@ cmd_approve() {
 
     # 先落最终字节：批准标记行固定，不把审批人/时间写进参与哈希的正文。
     local temp_contract="$contract_file.tmp.$$"
-    APPROVE_TEMP_CONTRACT="$temp_contract"
-    cleanup_approve_temp_contract() { [[ -n "${APPROVE_TEMP_CONTRACT:-}" ]] && rm -f -- "$APPROVE_TEMP_CONTRACT"; }
-    trap cleanup_approve_temp_contract EXIT INT TERM
+    wf_register_temp_file "$temp_contract"
     node -e '
 const fs = require("fs");
 const src = process.argv[1], dst = process.argv[2];
@@ -1067,14 +1135,14 @@ fs.writeFileSync(dst, text);
     echo "    契约 SHA256 指纹: $contract_sha (mode=$mode, principal=$principal)"
     local goal_id="$feature-goal"
     local configure_out
-    if ! configure_out="$(loopx $REGISTRY_FLAG configure-goal --goal-id "$goal_id" --progress-review-contract-revision "$contract_sha" --execute 2>&1)"; then
+    if ! configure_out="$(run_loopx configure-goal --goal-id "$goal_id" --progress-review-contract-revision "$contract_sha" --execute 2>&1)"; then
         rm -f "$temp_contract"
         echo "[-] [FAIL-CLOSED] 契约 SHA256 物理锁定失败: $configure_out" >&2
         exit 1
     fi
 
     local agent="${LOOPX_AGENT_ID:-loopx-flow-agent}"
-    loopx $REGISTRY_FLAG register-agent --goal-id "$goal_id" --agent-id "$agent" --execute >/dev/null 2>&1 || true
+    run_loopx register-agent --goal-id "$goal_id" --agent-id "$agent" --execute >/dev/null 2>&1 || true
     local evidence
     if [[ "$mode" == "single_owner" ]]; then
         evidence="authorization_mode=single_owner;contract_sha=$contract_sha;spec_commit=$spec_commit;feature=$feature;principal=$principal;risk_acceptance=$(auth_accepted_by)@$(auth_accepted_at)"
@@ -1082,19 +1150,18 @@ fs.writeFileSync(dst, text);
         evidence="authorization_mode=independent;contract_sha=$contract_sha;spec_commit=$spec_commit;feature=$feature;principal=$principal"
     fi
     local add_out todo_id
-    if ! add_out="$(loopx --format json $REGISTRY_FLAG todo add --goal-id "$goal_id" --role user --task-class user_gate --text "Gate1 specification authorization: $feature" --decision-scope "other:goal:$contract_sha" --global-gate 2>&1)"; then
+    if ! add_out="$(run_loopx --format json todo add --goal-id "$goal_id" --role user --task-class user_gate --text "Gate1 specification authorization: $feature" --decision-scope "other:goal:$contract_sha" --global-gate 2>&1)"; then
         rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] 写 user_gate 授权记录失败: $add_out" >&2; exit 1
     fi
     todo_id="$(node -e 'const fs=require("fs");let d={};try{d=JSON.parse(fs.readFileSync(0,"utf8"))}catch(_){};process.stdout.write(String(d.todo_id||""))' <<< "$add_out")"
     [[ -n "$todo_id" ]] || { rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] user_gate 未返回 todo_id" >&2; exit 1; }
     local complete_out
-    if ! complete_out="$(loopx --format json $REGISTRY_FLAG todo complete --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent" --decision-outcome approve --evidence "$evidence" 2>&1)"; then
+    if ! complete_out="$(run_loopx --format json todo complete --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent" --decision-outcome approve --evidence "$evidence" 2>&1)"; then
         rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] 完成 user_gate 授权记录失败: $complete_out" >&2; exit 1
     fi
 
     mv "$temp_contract" "$contract_file"
-    APPROVE_TEMP_CONTRACT=""
-    trap - EXIT INT TERM
+    wf_unregister_temp_file "$temp_contract"
 
     if [[ -f "$decision_file" ]]; then
         node -e '
@@ -1176,7 +1243,7 @@ cmd_check() {
         local archive_contract="$PROJECT_ROOT/specs/archive/$feature/04-contract.md"
         if [[ -f "$contract_file" || -f "$archive_contract" ]]; then
             echo -e "${BOLD}[0/3] 先验证冻结节契约 (gate verify contract)...${NC}"
-            if ! "$PROJECT_ROOT/bin/loopx-flow" gate verify contract "$feature"; then
+            if ! "$WORKFLOW_ROOT/bin/loopx-flow" ${REGISTRY_ARGS[@]+"${REGISTRY_ARGS[@]}"} gate verify contract "$feature"; then
                 echo -e "${RED}[-] [FAIL-CLOSED] 契约门禁未通过，禁止进入 check。${NC}" >&2
                 exit 1
             fi
@@ -1184,9 +1251,8 @@ cmd_check() {
     fi
 
     echo -e "${BOLD}[1/3] 正在运行本地四大硬门禁 (Typecheck, Lint, Build, Test)...${NC}"
-    ensure_loopx_tmp_dir
-    gate_results_file="$(mktemp "${LOOPX_TMP_DIR}/loopx-flow-gate-results.XXXXXX")"
-    trap 'rm -f -- "$gate_results_file"' EXIT
+    wf_run_dir check
+    gate_results_file="$WF_RUN_DIR/gate-results.json"
     node -e '
 const fs = require("fs");
 fs.writeFileSync(process.argv[1], JSON.stringify({ schema_version: "loopx_flow_gate_results_v0", gates: [] }, null, 2));
@@ -1204,7 +1270,7 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
 ' "$gate_results_file" "$gate_name"
             continue
         fi
-        if gate_out="$(npm run "$gate_name" 2>&1)"; then
+        if gate_out="$(cd "$PROJECT_ROOT" && npm run "$gate_name" 2>&1)"; then
             gate_code=0; gate_status="passed"
         else
             gate_code=$?; gate_status="failed"
@@ -1234,10 +1300,10 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
             exit 1
         fi
         echo -e "    检测到启用阿里 OCR 选配项，调用技能内自闭环脚本..."
-        "$PROJECT_ROOT/skills/open-code-review/run-ocr.sh" "$cq_base_ref" "$feature" "$gate_results_file"
+        "$WORKFLOW_ROOT/skills/open-code-review/run-ocr.sh" "$cq_base_ref" "$feature" "$gate_results_file"
     else
         echo -e "    调用默认语义契约审查并送入 LoopX Quality 适配器..."
-        node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" ${feature:+--feature "$feature"} --goal-id "$resolved_goal" --base-ref "$cq_base_ref" --gate-results "$gate_results_file"
+        node "$WORKFLOW_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" ${feature:+--feature "$feature"} --goal-id "$resolved_goal" --base-ref "$cq_base_ref" --gate-results "$gate_results_file"
     fi
     if [[ "$gate_failed" -ne 0 ]]; then
         echo -e "${RED}[-] [FAIL-CLOSED] 四门禁未全绿；已写 05-evidence 实测状态，交付阻断。${NC}" >&2
@@ -1248,11 +1314,11 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
     if ! command -v loopx >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] 严格收据核验失败: 未检测到 loopx CLI，禁止进入交付阶段。${NC}" >&2
         echo -e "💡 为什么阻断？质量门禁收据核验是强阻断项，必须依赖 LoopX 校验不可篡改凭据。" >&2
-        echo -e "🛠️ 修复指令: 安装 loopx (python3 -m pip install --upgrade loopx) 后重试。" >&2
+        echo -e "🛠️ 修复指令: 安装 loopx (python3 -m pip install --upgrade loopx) 后重试。" >&2 # loopx-allow: install hint text
         exit 1
     fi
     local cq_json cq_ok
-    cq_json="$(loopx $REGISTRY_FLAG change-quality verify --goal-id "$resolved_goal" --repo-path . --base-ref "$cq_base_ref" --format json 2>&1 || echo '{}')"
+    cq_json="$(run_loopx change-quality verify --goal-id "$resolved_goal" --repo-path "$PROJECT_ROOT" --base-ref "$cq_base_ref" --format json 2>&1 || echo '{}')"
     cq_ok="$(node -e '
 const fs = require("fs");
 let d = {};
@@ -1336,7 +1402,7 @@ cmd_review() {
     export REVIEW_DEBOUNCE_SECONDS="${REVIEW_DEBOUNCE_SECONDS:-60}"
     export REVIEW_UPSERT_PUBLISH="${REVIEW_UPSERT_PUBLISH:-1}"
 
-    if ! node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" "${args[@]}"; then
+    if ! node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" "${args[@]}"; then
         echo -e "${RED}[-] [FAIL-CLOSED] 真实审查管线未通过 (NOT_VERIFIED / HEAD 漂移 / 门禁失败 / check-result 拒绝)。${NC}" >&2
         exit 1
     fi
@@ -1355,7 +1421,7 @@ cmd_respond() {
         cat << 'HELPTXT'
 用法: loopx-flow respond <pr_id> [--result-file <path>] [--resolutions-file <path>] [--dry-run]
 说明: 复用 LoopX `pr-review` 的 `review_template` 五段式格式（动机/改动思路/具体改动/对主干的风险/我的整体评价），
-      基于原生评审产物 (.loopx/reviews/<pr>@<head>.json) 逐项闭环 Review findings，并附带实测验证矩阵。
+      基于原生评审缓存 (.loopx/cache/reviews/<pr>@<head>.json) 逐项闭环 Review findings，并附带实测验证矩阵。
       失败一票熔断：找不到原生评审产物或门禁不通过时拒绝发布。
 HELPTXT
         exit 0
@@ -1415,7 +1481,7 @@ HELPTXT
     echo -e "    [5/5] 执行 LoopX Status..."
     local loopx_status="PASSED"
     if command -v loopx >/dev/null 2>&1; then
-        if ! loopx $REGISTRY_FLAG status >/dev/null 2>&1; then
+        if ! run_loopx status >/dev/null 2>&1; then
             echo -e "${RED}[-] [FAIL-CLOSED] LoopX status 检查失败，阻断回复发布！${NC}" >&2
             exit 1
         fi
@@ -1426,12 +1492,12 @@ HELPTXT
     local gates_json
     gates_json="$(printf '{"typecheck":"PASSED","lint":"PASSED","build":"PASSED","test":"PASSED","loopx_status":"%s"}' "$loopx_status")"
 
-    local helper_args=(--pr "$pr_id" --head "$head_oid" --review-dir "$PROJECT_ROOT/.loopx/reviews" --gates-json "$gates_json")
+    local helper_args=(--pr "$pr_id" --head "$head_oid" --review-dir "$LOOPX_REVIEW_CACHE_DIR" --gates-json "$gates_json")
     [[ -n "$result_file" ]] && helper_args+=(--result-file "$result_file")
     [[ -n "$resolutions_file" ]] && helper_args+=(--resolutions-file "$resolutions_file")
 
     if [[ "$dry_run" == "true" ]]; then
-        if ! node "$PROJECT_ROOT/skills/code-review/scripts/respond-report.js" "${helper_args[@]}" --print; then
+        if ! node "$WORKFLOW_ROOT/skills/code-review/scripts/respond-report.js" "${helper_args[@]}" --print; then
             echo -e "${RED}[-] [FAIL-CLOSED] 原生格式回复生成失败（dry-run），未发布。${NC}" >&2
             exit 1
         fi
@@ -1439,14 +1505,15 @@ HELPTXT
         exit 0
     fi
 
-    local report_file
-    if ! report_file="$(node "$PROJECT_ROOT/skills/code-review/scripts/respond-report.js" "${helper_args[@]}")"; then
+    # 流优先（ADR-0013 / §2.1）：正文通过 stdout 捕获并由 stdin 管道直传 gh，零临时文件。
+    local report_body
+    if ! report_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/respond-report.js" "${helper_args[@]}" --print)"; then
         echo -e "${RED}[-] [FAIL-CLOSED] 原生格式回复生成失败（缺少评审产物或格式不符），未发布。${NC}" >&2
         exit 1
     fi
 
-    if [[ ! -f "$report_file" ]]; then
-        echo -e "${RED}[-] [FAIL-CLOSED] 回复报告文件不存在: $report_file${NC}" >&2
+    if [[ -z "$report_body" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 回复报告正文为空，拒绝发布。${NC}" >&2
         exit 1
     fi
 
@@ -1454,20 +1521,16 @@ HELPTXT
     # 标记行置于正文尾部（HTML 注释，页面不可见），与 review 侧 upsert 保持一致，不破坏首行结构
     local marker="<!-- loopx-flow:respond:${pr_id}@${short_sha} -->"
     local posted_body
-    posted_body="$(cat "$report_file")
+    posted_body="${report_body}
 
 ${marker}"
-    local posted_file
-    posted_file="$(mktemp)"
-    printf '%s' "$posted_body" > "$posted_file"
     local existing_comment_id=""
     if [[ "${REVIEW_UPSERT_PUBLISH:-1}" == "1" ]]; then
         if existing_comment_id="$(gh api "repos/${repo}/issues/${pr_id}/comments?per_page=100" 2>/dev/null \
             | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const a=JSON.parse(d);const m=a.find(c=>c.body&&c.body.includes(process.argv[1]));process.stdout.write(m?String(m.id):'')}catch(_){process.stdout.write('')}})" "$marker" 2>/dev/null || true)"; then
             if [[ -n "$existing_comment_id" ]]; then
                 echo -e "${YELLOW}[THROTTLE-UPSERT] 复用既有 respond comment id=${existing_comment_id}（PATCH 更新，不再新增）${NC}"
-                if gh api -X PATCH "repos/${repo}/issues/comments/${existing_comment_id}" -F body=@"$posted_file" >/dev/null 2>&1; then
-                    rm -f "$posted_file" "$report_file"
+                if printf '%s' "$posted_body" | gh api -X PATCH "repos/${repo}/issues/comments/${existing_comment_id}" -F body=@- >/dev/null 2>&1; then
                     echo -e "${GREEN}[✓] 已更新既有 respond 汇报（comment ${existing_comment_id}，head $short_sha）！${NC}"
                     exit 0
                 fi
@@ -1475,12 +1538,10 @@ ${marker}"
             fi
         fi
     fi
-    if ! gh pr comment "$pr_id" --repo "$repo" --body-file "$posted_file"; then
-        rm -f "$posted_file"
+    if ! printf '%s' "$posted_body" | gh pr comment "$pr_id" --repo "$repo" --body-file -; then
         echo -e "${RED}[-] [FAIL-CLOSED] gh pr comment 失败，回复未发布。${NC}" >&2
         exit 1
     fi
-    rm -f "$posted_file" "$report_file"
     echo -e "${GREEN}[✓] 已发布 LoopX 原生五段式更新汇报至 PR #${pr_id}（head $short_sha）！${NC}"
 }
 
@@ -1527,7 +1588,7 @@ HELPTXT
                 echo -e "${RED}[-] 错误: 请指定特性名称或检出 feature/<name> 分支。${NC}" >&2
                 exit 1
             fi
-            node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature"
+            node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature"
             ;;
         create)
             local base="main"
@@ -1580,20 +1641,16 @@ HELPTXT
                 title="feat(${feature}): implement ${feature} aligned with PR #7545 protocol"
             fi
 
-            local tmp_body
-            ensure_loopx_tmp_dir
-            tmp_body="$(mktemp "${LOOPX_TMP_DIR}/pr-body-${feature}.XXXXXX")"
-            node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature" --output-file "$tmp_body"
+            local pr_body
+            pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
 
             echo -e "${BLUE}==> [PR 提交] 正在通过 GitHub CLI 创建 PR (对齐 PR #7545 双语 4-Part 体系)...${NC}"
             local pr_url
             local -a draft_args=()
             [[ "$draft" == "true" ]] && draft_args=(--draft)
-            if pr_url="$(gh pr create --title "$title" --body-file "$tmp_body" "${draft_args[@]}" "$@")"; then
-                rm -f "$tmp_body"
+            if pr_url="$(printf '%s' "$pr_body" | gh pr create --title "$title" --body-file - "${draft_args[@]}" "$@")"; then
                 echo -e "${GREEN}[✓] PR 创建成功: ${pr_url}${NC}"
             else
-                rm -f "$tmp_body"
                 echo -e "${RED}[-] PR 创建失败。${NC}" >&2
                 exit 1
             fi
@@ -1618,17 +1675,13 @@ HELPTXT
                 exit 1
             fi
 
-            local tmp_body
-            ensure_loopx_tmp_dir
-            tmp_body="$(mktemp "${LOOPX_TMP_DIR}/pr-body-${feature}.XXXXXX")"
-            node "$PROJECT_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature" --output-file "$tmp_body"
+            local pr_body
+            pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
 
             echo -e "${BLUE}==> [PR 更新] 正在更新 PR #${pr_id} 描述 (对齐 PR #7545 双语 4-Part 体系)...${NC}"
-            if gh pr edit "$pr_id" --body-file "$tmp_body"; then
-                rm -f "$tmp_body"
+            if printf '%s' "$pr_body" | gh pr edit "$pr_id" --body-file -; then
                 echo -e "${GREEN}[✓] PR #${pr_id} 描述已成功更新！${NC}"
             else
-                rm -f "$tmp_body"
                 echo -e "${RED}[-] PR 更新失败。${NC}" >&2
                 exit 1
             fi
@@ -1915,7 +1968,7 @@ cmd_merge() {
         fi
 
         local out status
-        if out="$(loopx $REGISTRY_FLAG goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "Feature delivered and archived" --execute 2>&1)"; then
+        if out="$(run_loopx goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "Feature delivered and archived" --execute 2>&1)"; then
             step_names+=("stop"); step_states+=("done"); step_details+=("")
             echo -e "    ${GREEN}[✓] Goal $goal_id 已停机。${NC}"
         else
@@ -1930,7 +1983,7 @@ cmd_merge() {
             fi
         fi
 
-        if out="$(loopx $REGISTRY_FLAG retire-global-goal --goal-id "$goal_id" --execute 2>&1)"; then
+        if out="$(run_loopx retire-global-goal --goal-id "$goal_id" --execute 2>&1)"; then
             step_names+=("retire"); step_states+=("done"); step_details+=("")
             echo -e "    ${GREEN}[✓] 全局 Goal $goal_id 已退役。${NC}"
         else
@@ -1945,7 +1998,7 @@ cmd_merge() {
             fi
         fi
 
-        if out="$(loopx $REGISTRY_FLAG sync-global --goal-id "$goal_id" 2>&1)"; then
+        if out="$(run_loopx sync-global --goal-id "$goal_id" 2>&1)"; then
             step_names+=("sync"); step_states+=("done"); step_details+=("")
             echo -e "    ${GREEN}[✓] 全局 registry 已同步 ${goal_id}。${NC}"
         else
@@ -2121,7 +2174,8 @@ cmd_gate() {
             local locked_sha=""
             local goal_found="false"
             # 允许测试/CI 用独立 registry 隔离（避免污染真实项目控制面状态，见 ADR-0007 INV-ENV-6）
-            local reg_file="${LOOPX_REGISTRY:-$PROJECT_ROOT/.loopx/registry.json}"
+            wf_require_registry
+            local reg_file="$LOOPX_REGISTRY_PATH"
             if [[ ! -f "$reg_file" ]]; then
                 echo -e "${RED}[-] [FAIL-CLOSED] 本地注册表缺失 ($reg_file)，无法核验控制面契约锁定状态！${NC}" >&2
                 echo -e "💡 为什么阻断？契约标记为已冻结，但本地注册表未就绪，禁止绕过物理指纹核验。" >&2
@@ -2201,7 +2255,7 @@ cmd_context() {
 
 write_archive_state_snapshot() {
     local feature="$1" goal_id="$2" archive_dir="$3"
-    local reg_file="${LOOPX_REGISTRY:-$PROJECT_ROOT/.loopx/registry.json}"
+    local reg_file="$LOOPX_REGISTRY_PATH"
     node -e '
 const fs = require("fs");
 const path = require("path");
@@ -2326,7 +2380,7 @@ process.stdout.write(String(d.title ?? ""));
     echo -e "${BLUE}==> 调用 LoopX issue-fix feasibility 执行因果路由裁决...${NC}"
 
     local feasibility_json
-    if ! feasibility_json="$(loopx $REGISTRY_FLAG issue-fix feasibility \
+    if ! feasibility_json="$(run_loopx issue-fix feasibility \
         --repo "$repo_label" \
         --issue-ref "$issue_id" \
         --reproduction-status "$repro" \
@@ -2397,7 +2451,7 @@ cmd_integrate() {
 
     if [[ "$mode" == "status" ]]; then
         echo -e "${BLUE}==> 正在查询 LoopX 集成分支状态 (base/source/integration heads)...${NC}"
-        if ! loopx $REGISTRY_FLAG integration-branch status --repo-path "$PROJECT_ROOT"; then
+        if ! run_loopx integration-branch status --repo-path "$PROJECT_ROOT"; then
             echo -e "${RED}[-] [FAIL-CLOSED] LoopX 集成分支状态查询失败，请核查 integration-branch configure。${NC}" >&2
             exit 1
         fi
@@ -2406,14 +2460,14 @@ cmd_integrate() {
 
     if [[ "$execute" == "true" ]]; then
         echo -e "${BLUE}==> 正在执行 LoopX 本地集成合入 (temporary worktree, --execute)...${NC}"
-        if ! loopx $REGISTRY_FLAG integration-branch sync --repo-path "$PROJECT_ROOT" --execute; then
+        if ! run_loopx integration-branch sync --repo-path "$PROJECT_ROOT" --execute; then
             echo -e "${RED}[-] [FAIL-CLOSED] LoopX 本地集成合入失败: 源头未按序合入，操作已阻断。${NC}" >&2
             exit 1
         fi
         echo -e "${GREEN}[✓] 本地预集成已落盘完成。${NC}"
     else
         echo -e "${BLUE}==> 正在预演 LoopX 本地集成 (preview, 不落盘)...${NC}"
-        if ! loopx $REGISTRY_FLAG integration-branch sync --repo-path "$PROJECT_ROOT"; then
+        if ! run_loopx integration-branch sync --repo-path "$PROJECT_ROOT"; then
             echo -e "${RED}[-] [FAIL-CLOSED] LoopX 本地集成预演失败，操作已阻断。${NC}" >&2
             exit 1
         fi
@@ -2423,7 +2477,7 @@ cmd_integrate() {
 
 cmd_status() {
     if command -v loopx >/dev/null 2>&1; then
-        loopx $REGISTRY_FLAG status || true
+        run_loopx status || true
     else
         echo -e "${YELLOW}[!] 未安装 loopx CLI。正在显示本地 specs/features/ 状态:${NC}"
         ls -la "$PROJECT_ROOT/specs/features" || true
@@ -2449,10 +2503,9 @@ print_register_agent_repair() {
 # 活动且同一 owner 复用该代际键；过期、释放或其他代际用 epoch/version 生成下一把键。
 # 没有租约记录时，仍用 goal、todo、owner 的稳定键，方便首次申领重试。
 claim_idempotency_key() {
-    node - "$1" "$2" "$3" "$4" "$5" <<'NODE'
+    INSPECT_RAW="${5:-}" node - "$1" "$2" "$3" "$4" <<'NODE'
 const crypto = require("crypto");
-const fs = require("fs");
-const [goalId, todoId, owner, explicit, inspectFile] = process.argv.slice(2);
+const [goalId, todoId, owner, explicit] = process.argv.slice(2);
 if (!goalId || !todoId || !owner) process.exit(2);
 const token = /^[A-Za-z0-9_.:@\/-]{1,160}$/;
 function emit(key) {
@@ -2487,14 +2540,9 @@ function firstJson(text) {
   }
   return null;
 }
-if (!inspectFile) {
+const raw = process.env.INSPECT_RAW || "";
+if (!raw) {
   process.stderr.write("缺少 task-lease inspect 结果，已阻断申领\n");
-  process.exit(4);
-}
-let raw = "";
-try { raw = fs.readFileSync(inspectFile, "utf8"); }
-catch (_) {
-  process.stderr.write("无法读取 task-lease inspect 结果，已阻断申领\n");
   process.exit(4);
 }
 let payload;
@@ -2565,8 +2613,9 @@ NODE
 resolve_claim_owner() {
     local goal_id="$1"
     local page_dir cursor="" page_index=0 meta next_cursor
-    ensure_loopx_tmp_dir
-    page_dir="$(mktemp -d "${LOOPX_TMP_DIR}/loopx-flow-agents.XXXXXX")"
+    wf_run_dir todo-claim
+    page_dir="$WF_RUN_DIR/agents"
+    mkdir -p "$page_dir"
 
     while true; do
         page_index=$((page_index + 1))
@@ -2577,9 +2626,9 @@ resolve_claim_owner() {
         fi
         local page_file="$page_dir/$(printf 'page-%03d.json' "$page_index")"
         if [[ -z "$cursor" ]]; then
-            loopx $REGISTRY_FLAG --format json agent-directory --goal-id "$goal_id" >"$page_file" 2>/dev/null || true
+            run_loopx --format json agent-directory --goal-id "$goal_id" >"$page_file" 2>/dev/null || true
         else
-            loopx $REGISTRY_FLAG --format json agent-directory --goal-id "$goal_id" --cursor "$cursor" >"$page_file" 2>/dev/null || true
+            run_loopx --format json agent-directory --goal-id "$goal_id" --cursor "$cursor" >"$page_file" 2>/dev/null || true
         fi
         meta="$(node - "$page_file" <<'NODE'
 const fs = require("fs");
@@ -2820,13 +2869,13 @@ cmd_todo() {
 
     case "$subaction" in
         list)
-            loopx $REGISTRY_FLAG todo list "$@"
+            run_loopx todo list "$@"
             ;;
         claim|done)
             cmd_todo_lease "$subaction" "$@"
             ;;
         *)
-            loopx $REGISTRY_FLAG todo "$subaction" "$@"
+            run_loopx todo "$subaction" "$@"
             ;;
     esac
 }
@@ -2875,33 +2924,27 @@ cmd_todo_lease() {
 
     if [[ "$mode" == "claim" ]]; then
         echo -e "${BLUE}==> [租约流转] 正在申领排他租约: $todo_id @ $goal_id ...${NC}"
-        local owner="" inspect_file="" explicit_key="$idempotency_key"
+        local owner="" inspect_raw="" explicit_key="$idempotency_key"
         owner="$(resolve_claim_owner "$goal_id")" || exit 1
         if [[ -z "$explicit_key" ]]; then
-            inspect_file="$(mktemp)"
             local inspect_rc=0
-            loopx $REGISTRY_FLAG --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" >"$inspect_file" 2>&1 || inspect_rc=$?
+            inspect_raw="$(run_loopx --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || inspect_rc=$?
             if [[ "$inspect_rc" -ne 0 ]]; then
                 echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的租约状态，已阻断申领。${NC}" >&2
-                cat "$inspect_file" >&2
-                rm -f "$inspect_file"
+                printf '%s\n' "$inspect_raw" >&2
                 exit 1
             fi
         fi
-        if ! idempotency_key="$(claim_idempotency_key "$goal_id" "$todo_id" "$owner" "$explicit_key" "$inspect_file")"; then
+        if ! idempotency_key="$(claim_idempotency_key "$goal_id" "$todo_id" "$owner" "$explicit_key" "$inspect_raw")"; then
             echo -e "${RED}[-] [FAIL-CLOSED] 无法为 Todo ${todo_id} 生成 public-safe 幂等键，已阻断租约申领。${NC}" >&2
-            rm -f "$inspect_file"
             exit 1
         fi
-        rm -f "$inspect_file"
-        local acquire_log acquire_rc=0 acquire_code=""
-        acquire_log="$(mktemp)"
-        loopx $REGISTRY_FLAG --format json task-lease acquire --goal-id "$goal_id" --todo-id "$todo_id" --owner "$owner" --idempotency-key "$idempotency_key" >"$acquire_log" 2>&1 || acquire_rc=$?
+        local acquire_out="" acquire_rc=0 acquire_code=""
+        acquire_out="$(run_loopx --format json task-lease acquire --goal-id "$goal_id" --todo-id "$todo_id" --owner "$owner" --idempotency-key "$idempotency_key" 2>&1)" || acquire_rc=$?
         if [[ "$acquire_rc" -ne 0 ]]; then
-            cat "$acquire_log" >&2
-            acquire_code="$(node - "$acquire_log" <<'NODE'
-const fs = require("fs");
-const raw = fs.readFileSync(process.argv[2], "utf8");
+            printf '%s\n' "$acquire_out" >&2
+            acquire_code="$(ACQUIRE_OUT="$acquire_out" node - <<'NODE'
+const raw = process.env.ACQUIRE_OUT || "";
 function firstJson(text) {
   const start = text.indexOf("{");
   if (start < 0) return null;
@@ -2950,18 +2993,16 @@ NODE
                     fi
                     ;;
             esac
-            rm -f "$acquire_log"
             exit 1
         fi
-        cat "$acquire_log"
-        rm -f "$acquire_log"
+        printf '%s\n' "$acquire_out"
         echo -e "${GREEN}[✓] 排他租约已获取 (ACQUIRED): $todo_id${NC}"
     else
         if [[ -z "$agent_id" ]]; then
             agent_id="$(resolve_claim_owner "$goal_id")" || exit 1
         fi
         local inspect_json lease_meta lease_version lease_owner lease_status
-        inspect_json="$(loopx --format json $REGISTRY_FLAG task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || {
+        inspect_json="$(run_loopx --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || {
             echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的租约状态，拒绝变更 Todo 状态: $inspect_json${NC}" >&2
             exit 1
         }
@@ -3012,11 +3053,11 @@ process.stdout.write(`loopx-flow:release:${digest}`);
 NODE
 )" || exit 1
         echo -e "${BLUE}==> [租约流转] 正在完成 Todo 并释放租约: $todo_id @ $goal_id (owner=$agent_id)...${NC}"
-        if ! loopx $REGISTRY_FLAG todo --goal-id "$goal_id" --todo-id "$todo_id" --status done; then
+        if ! run_loopx todo --goal-id "$goal_id" --todo-id "$todo_id" --status done; then
             echo -e "${RED}[-] [FAIL-CLOSED] Todo 完成回写失败: $todo_id，租约保留以便重试。${NC}" >&2
             exit 1
         fi
-        if ! loopx $REGISTRY_FLAG task-lease release --goal-id "$goal_id" --todo-id "$todo_id" --owner "$agent_id" --idempotency-key "$identity_key" --expected-version "$lease_version"; then
+        if ! run_loopx task-lease release --goal-id "$goal_id" --todo-id "$todo_id" --owner "$agent_id" --idempotency-key "$identity_key" --expected-version "$lease_version"; then
             echo -e "${RED}[-] [FAIL-CLOSED] 租约释放失败: $todo_id，请通过 task-lease inspect 人工核查。${NC}" >&2
             exit 1
         fi
@@ -3027,6 +3068,15 @@ NODE
 # 命令路由
 ACTION="${1:-help}"
 shift || true
+
+# D1 全量命令分类矩阵：仅需要 LoopX 权威状态的命令入口 fail-closed 校验 registry（含附属 worktree）。
+case "$ACTION" in
+    approve|check|merge|issue|integrate|todo)
+        if [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
+            wf_require_registry
+        fi
+        ;;
+esac
 
 case "$ACTION" in
     feature|start) cmd_feature "$@" ;;
@@ -3043,6 +3093,7 @@ case "$ACTION" in
     issue) cmd_issue "$@" ;;
     integrate) cmd_integrate "$@" ;;
     doctor) cmd_doctor "$@" ;;
+    gc) cmd_gc "$@" ;;
     init) cmd_init "$@" ;;
     status)
         if [[ "${1:-}" == "--next" ]]; then shift; cmd_status_next "${1:-}"; else cmd_status "$@"; fi ;;

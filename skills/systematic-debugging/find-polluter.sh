@@ -35,7 +35,7 @@ echo "Test pattern: $TEST_PATTERN"
 echo ""
 
 # Keep paths intact and check discovery itself before claiming evidence.
-TEST_LIST=$(mktemp) || exit 2
+TEST_LIST=$(mktemp) || exit 2 # loopx-allow: standalone generic debugging skill without repo dependency
 trap 'rm -f -- "$TEST_LIST"' EXIT
 if ! find . -type f -path "$TEST_PATTERN" -print0 > "$TEST_LIST"; then
   echo "Inconclusive: test discovery failed"

@@ -82,7 +82,7 @@ test("8. Response Safety & Native Format Reuse: cmd_respond delegates to respond
   assert.doesNotMatch(flowCode, /All unit suites passed 100% green/, "cmd_respond must not hardcode a static verification matrix");
   // 必须复用原生评审产物 + 原生五段式报告生成器
   assert.match(flowCode, /respond-report\.js/, "cmd_respond must reuse respond-report.js (LoopX native five-section format)");
-  assert.match(flowCode, /\.loopx\/reviews/, "cmd_respond must read native review artifacts from .loopx/reviews");
+  assert.match(flowCode, /LOOPX_REVIEW_CACHE_DIR|\.loopx\/cache\/reviews/, "cmd_respond must read native review cache from LOOPX_REVIEW_CACHE_DIR (.loopx/cache/reviews)");
 });
 
 test("9. Cross-Model CLI Adaptation: runReviewAgent supports claude -p vs codex exec and parseArgs handles --agent-bin", () => {

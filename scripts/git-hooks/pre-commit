@@ -20,4 +20,28 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
     exit 1
 fi
 
+# ------------------------------------------------------------------------------
+# 防复发守卫 (ADR-0007 / R3 / R20)：物理拦截暂存区中的私有运行态、凭据与本机绝对路径
+# ------------------------------------------------------------------------------
+STAGED_FILES="$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)"
+if [[ -n "$STAGED_FILES" ]]; then
+    FORBIDDEN_PATHS="$(printf '%s\n' "$STAGED_FILES" | grep -E '^(\.loopx/|\.codex/|qa-acceptance/)' || true)"
+    if [[ -n "$FORBIDDEN_PATHS" ]]; then
+        echo -e "\033[0;31m[!] [FAIL-CLOSED] 禁止提交私有运行态/验收残留目录 (.loopx/ .codex/ qa-acceptance/):\033[0m" >&2
+        printf '%s\n' "$FORBIDDEN_PATHS" | sed 's/^/    - /' >&2
+        echo -e "    修复: git reset HEAD -- <path>" >&2
+        exit 1
+    fi
+
+    # 扫描暂存区新增行中的飞书凭据形态与本机绝对路径（排除守卫脚本与测试自身正则定义）
+    STAGED_DIFF="$(git diff --cached -U0 -- . ':!scripts/check-invariants.js' ':!scripts/git-hooks/pre-commit' ':!tests/' 2>/dev/null || true)"
+    LEAKED_LINES="$(printf '%s\n' "$STAGED_DIFF" | grep -E '^\+[^+]' | grep -E '(oc_[0-9a-f]{32}|ou_[0-9a-f]{32}|cli_[0-9a-f]{16}|"app_secret"[[:space:]]*:[[:space:]]*"[^"*<]{8,}|/Users/[A-Za-z0-9_.-]+/|/home/[A-Za-z0-9_.-]+/)' | head -5 || true)"
+    if [[ -n "$LEAKED_LINES" ]]; then
+        echo -e "\033[0;31m[!] [FAIL-CLOSED] 暂存区检测到疑似飞书凭据/ID 或本机绝对路径，提交已被拦截:\033[0m" >&2
+        printf '%s\n' "$LEAKED_LINES" | sed 's/^/    /' >&2
+        echo -e "    修复: 替换为 ** 或 <repo-root>/<loopx-runtime-root> 占位符后重试。" >&2
+        exit 1
+    fi
+fi
+
 exit 0

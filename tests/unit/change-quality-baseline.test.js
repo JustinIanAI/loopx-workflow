@@ -35,6 +35,8 @@ function makeTrunkRepo(refs, headRef) {
   if (headRef) {
     execFileSync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${headRef}`], { cwd: dir });
   }
+  fs.mkdirSync(path.join(dir, '.loopx'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.loopx/registry.json'), JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
   return dir;
 }
 

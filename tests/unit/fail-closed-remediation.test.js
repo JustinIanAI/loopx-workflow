@@ -11,7 +11,8 @@ const h = require('./helpers/m0-sandbox');
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const INGEST = path.join(PROJECT_ROOT, 'skills/code-review/scripts/ingest-to-loopx-quality.js');
-const MOCK_BIN = path.join(PROJECT_ROOT, '.tmp-mock-bin-fc');
+const MOCK_BIN = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-mock-bin-fc-'));
+process.on('exit', () => { try { fs.rmSync(MOCK_BIN, { recursive: true, force: true }); } catch (_) {} });
 
 function resetMock() {
   fs.rmSync(MOCK_BIN, { recursive: true, force: true });
@@ -133,6 +134,11 @@ test('4. ingest without feature or goal exits 1', () => {
 test('5. check without feature/goal exits 1 before gates', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-check-'));
   try {
+    execSync('git init -q && git config user.email t@example.com && git config user.name test', { cwd: tmp });
+    fs.writeFileSync(path.join(tmp, 'README.md'), 'init\n');
+    execSync('git add README.md && git commit -qm init', { cwd: tmp });
+    fs.mkdirSync(path.join(tmp, '.loopx'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, '.loopx/registry.json'), JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
     resetMock();
     writeScript('loopx', '#!/usr/bin/env bash\nexit 0\n');
     const r = runFlow(['check'], {}, tmp);

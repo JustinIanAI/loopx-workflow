@@ -81,7 +81,7 @@
 ```
 [BLOCKED] LoopX change-quality record failed:
 [Errno 1] Operation not permitted:
-'/Users/freecisco_yan/.codex/loopx/goals/review-pipeline-remediation-goal/change-quality/receipts/...json.lock'
+'<loopx-runtime-root>/goals/review-pipeline-remediation-goal/change-quality/receipts/...json.lock'
 ```
 
 另：`review-pipeline-throttle-goal` 尚未注册进 LoopX 全局 registry

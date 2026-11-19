@@ -203,21 +203,34 @@ function run(sbx, args, envExtra, cwd, debounceSeconds) {
 }
 
 function seedArtifact(repo, pr, headOid) {
-  // 预置一个 native_check.ok=true 的评审 artifact，模拟「同一 head 已完成一次完整评审」
-  const dir = path.join(repo, '.loopx', 'reviews');
+  // 预置一个 native_check.ok=true 的 v1 评审缓存，模拟「同一 head 已完成一次完整评审」
+  const dir = path.join(repo, '.loopx', 'cache', 'reviews');
   fs.mkdirSync(dir, { recursive: true });
   const p = path.join(dir, `${pr}@${headOid.toLowerCase()}.json`);
+  const reviewBody = nativeReviewBody('request_changes', 'seeded');
+  const findings = [{ file: 'src/app.js', line: 1, severity: 'blocker', summary: 'seeded' }];
+  const reviewer = { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: 'codex', declared_provider: 'openai' };
   fs.writeFileSync(p, JSON.stringify({
-    schema_version: 'loopx_flow_review_artifact_v0',
+    schema_version: 'loopx_flow_review_cache_v1',
     pr: Number(pr),
     head_oid: headOid.toLowerCase(),
     reviewed_at: new Date().toISOString(),
     verdict: 'REQUEST_CHANGES',
-    reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: 'codex', declared_provider: 'openai' },
-    findings: [{ file: 'src/app.js', line: 1, severity: 'blocker', summary: 'seeded' }],
+    reviewer,
+    findings,
     native_check: { ok: true, approval_consistent: true },
-    review_body: nativeReviewBody('request_changes', 'seeded'),
+    review_body: reviewBody,
     published: { commentId: 901, headOid: headOid.toLowerCase() },
+    result_payload: {
+      schema_version: 'pull_request_review_result_v1',
+      review_policy_revision: 26,
+      target_exact_head: `${pr}@${headOid.toLowerCase()}`,
+      evidence: { problem_context: { status: 'verified', summary: 'seeded' } },
+      findings,
+      verdict: 'REQUEST_CHANGES',
+      review_body: reviewBody,
+      reviewer,
+    },
   }, null, 2));
   return p;
 }
@@ -236,13 +249,16 @@ describe('T1 head-oid 幂等短路', () => {
     assert.strictEqual(r2.code, 0, r2.out);
     assert.match(r2.out, /head-oid 幂等|复用既有评审结果/i, '应提示 head-oid 幂等短路');
     const calls = fs.readFileSync(sbx.logs, 'utf8');
-    // 第一次: 起始 prView + INV2 复核 prView + diff + 模型; 第二次: 仅 1 次 prView
+    // 第一次: 起始 prView + INV2 复核 prView + diff + codex 模型;
+    // 第二次: 1 次 prView + 拉取 packet 重验 --check-result（D2 禁止跳过权威校验），但不重取 diff、不重跑模型。
     const totalView = (calls.match(/gh .*pr view/g) || []).length;
     const totalDiff = (calls.match(/gh .*pr diff/g) || []).length;
-    const totalReviewExec = (calls.match(/loopx .*pr-review .*--format json/g) || []).length;
+    const totalModelExec = (calls.match(/^.*\/codex\s+exec\b/gm) || []).length;
+    const totalCheckResult = (calls.match(/loopx .*--check-result/g) || []).length;
     assert.strictEqual(totalView, 3, `gh pr view 应为 3 次（第一次 2 次 + 第二次幂等探测 1 次），实际 ${totalView}`);
     assert.strictEqual(totalDiff, 1, `gh pr diff 应只发生 1 次（幂等后不得重取 diff），实际 ${totalDiff}`);
-    assert.strictEqual(totalReviewExec, 1, `模型执行应只发生 1 次（幂等后不得重跑），实际 ${totalReviewExec}`);
+    assert.strictEqual(totalModelExec, 1, `模型执行应只发生 1 次（幂等后不得重跑），实际 ${totalModelExec}`);
+    assert.strictEqual(totalCheckResult, 2, `D2 要求缓存命中仍须重跑 --check-result，实际 ${totalCheckResult}`);
   });
 
   test('head 已漂移时不得复用旧 artifact（跨 head 复用是 fail-open）', () => {

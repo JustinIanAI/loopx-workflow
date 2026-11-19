@@ -6,7 +6,11 @@
 # ==============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../lib/paths.sh
+source "$SCRIPT_DIR/../lib/paths.sh"
+wf_init_paths
+TARGET_ROOT="${REPO_ROOT:-$PWD}"
 
 AUTO_FIX=false
 if [[ "${1:-}" == "--fix" ]]; then
@@ -25,32 +29,33 @@ WARNINGS=0
 # LoopX doctor 把技能检查标成 required:false，退出码 0 不能当成技能就绪。
 # 本机没有 loopx 时不调用这里（ADR-0003：缺 CLI 只告警）。
 verify_loopx_skill_readiness() {
-    local doctor_out doctor_err doctor_status
-    doctor_out="$(mktemp)"
-    doctor_err="$(mktemp)"
-    set +e
-    loopx doctor --format json >"$doctor_out" 2>"$doctor_err"
-    doctor_status=$?
-    set -e
-    if [[ "$doctor_status" -ne 0 ]]; then
-        echo -e "      - LoopX skills/routes/新鲜度: ${RED}FAIL${NC} (loopx doctor 退出码 ${doctor_status})"
-        echo -e "        ${RED}[FAIL-CLOSED] loopx doctor 验证未通过，不得把环境标记为就绪。${NC}"
-        if [[ -s "$doctor_err" ]]; then
-            sed 's/^/        /' "$doctor_err"
-        fi
-        echo -e "        修复指令: loopx doctor --format json"
-        echo -e "        若提示 skills 缺失或过期，再执行: loopx workflow-skills --install && loopx slash-commands --install && loopx doctor --format json"
-        rm -f "$doctor_out" "$doctor_err"
-        return 1
-    fi
-    if ! node "$SCRIPT_DIR/loopx-skill-readiness.js" <"$doctor_out"; then
-        echo -e "      - LoopX skills/routes/新鲜度: ${RED}FAIL${NC}"
-        rm -f "$doctor_out" "$doctor_err"
-        return 1
-    fi
-    echo -e "      - LoopX skills/routes/新鲜度: ${GREEN}PASS${NC}"
-    rm -f "$doctor_out" "$doctor_err"
-    return 0
+    node - "$SCRIPT_DIR/loopx-skill-readiness.js" <<'NODE'
+const { spawnSync } = require('node:child_process');
+const { evaluateDoctorPayload, formatFailure } = require(process.argv[2]);
+const r = spawnSync('loopx', ['doctor', '--format', 'json'], { encoding: 'utf8' });
+if (r.status !== 0) {
+  process.stdout.write(`      - LoopX skills/routes/新鲜度: \x1b[0;31mFAIL\x1b[0m (loopx doctor 退出码 ${r.status ?? 1})\n`);
+  process.stdout.write('        \x1b[0;31m[FAIL-CLOSED] loopx doctor 验证未通过，不得把环境标记为就绪。\x1b[0m\n');
+  if (r.stderr && r.stderr.trim()) {
+    for (const line of r.stderr.replace(/\n$/, '').split('\n')) {
+      process.stdout.write(`        ${line}\n`);
+    }
+  }
+  process.stdout.write('        修复指令: loopx doctor --format json\n');
+  process.stdout.write('        若提示 skills 缺失或过期，再执行: loopx workflow-skills --install && loopx slash-commands --install && loopx doctor --format json\n');
+  process.exit(1);
+}
+let payload = null;
+try { payload = r.stdout && r.stdout.trim() ? JSON.parse(r.stdout) : null; } catch (_) {}
+const result = evaluateDoctorPayload(payload);
+if (!result.ok) {
+  process.stderr.write(formatFailure(result));
+  process.stdout.write('      - LoopX skills/routes/新鲜度: \x1b[0;31mFAIL\x1b[0m\n');
+  process.exit(1);
+}
+process.stdout.write('LoopX required skills、routes 与安装新鲜度通过。\n');
+process.stdout.write('      - LoopX skills/routes/新鲜度: \x1b[0;32mPASS\x1b[0m\n');
+NODE
 }
 
 echo -e "${BLUE}======================================================================${NC}"
@@ -91,13 +96,13 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
                 process.stdout.write(ok ? "true" : "false");
             ')
             if [[ "$NODE_OK" == "true" ]]; then
-                echo -e "      - 必需工具 node: ${GREEN}INSTALLED${NC} ($(which node), v${NODE_VER} >= 22.22.3)"
+                echo -e "      - 必需工具 node: ${GREEN}INSTALLED${NC} ($(command -v node), v${NODE_VER} >= 22.22.3)"
             else
                 echo -e "      - 必需工具 node: ${RED}VERSION MISMATCH${NC} (v${NODE_VER} < 22.22.3, LoopX 2.x 要求 Node >= 22.22.3)"
                 ERRORS=$((ERRORS + 1))
             fi
         else
-            echo -e "      - 必需工具 $tool: ${GREEN}INSTALLED${NC} ($(which "$tool"))"
+            echo -e "      - 必需工具 $tool: ${GREEN}INSTALLED${NC} ($(command -v "$tool"))"
         fi
     else
         echo -e "      - 必需工具 $tool: ${RED}NOT FOUND${NC}"
@@ -107,7 +112,7 @@ done
 
 for tool in "${RECOMMENDED_TOOLS[@]}"; do
     if command -v "$tool" >/dev/null 2>&1; then
-        echo -e "      - 推荐工具 $tool: ${GREEN}INSTALLED${NC} ($(which "$tool"))"
+        echo -e "      - 推荐工具 $tool: ${GREEN}INSTALLED${NC} ($(command -v "$tool"))"
         if [[ "$tool" == "loopx" ]]; then
             if ! verify_loopx_skill_readiness; then
                 ERRORS=$((ERRORS + 1))
@@ -130,11 +135,11 @@ fi
 
 # 4. 检查 package.json 与四大硬门禁配置
 echo -n "[4/6] 检查本地四大硬门禁 (Typecheck, Lint, Build, Test)... "
-if [[ -f "package.json" ]]; then
+if [[ -f "$TARGET_ROOT/package.json" ]]; then
     REQUIRED_GATES=("typecheck" "lint" "build" "test")
     MISSING_GATES=()
     for gate in "${REQUIRED_GATES[@]}"; do
-        if ! grep -q "\"$gate\":" package.json; then
+        if ! grep -q "\"$gate\":" "$TARGET_ROOT/package.json"; then
             MISSING_GATES+=("$gate")
         fi
     done
@@ -165,7 +170,7 @@ REQUIRED_DIRS=(
 
 MISSING_DIRS=()
 for dir in "${REQUIRED_DIRS[@]}"; do
-    if [[ -d "$dir" ]]; then
+    if [[ -d "$TARGET_ROOT/$dir" ]]; then
         echo -e "      - 目录 $dir: ${GREEN}EXISTS${NC}"
     else
         echo -e "      - 目录 $dir: ${RED}MISSING${NC}"
@@ -177,7 +182,7 @@ if [[ ${#MISSING_DIRS[@]} -gt 0 ]]; then
     if [[ "$AUTO_FIX" == true ]]; then
         echo -e "      ${BLUE}[Auto-Fix] 正在自动创建缺失目录...${NC}"
         for dir in "${MISSING_DIRS[@]}"; do
-            mkdir -p "$dir"
+            mkdir -p "$TARGET_ROOT/$dir"
             echo -e "        ${GREEN}[✓] 已创建: $dir${NC}"
         done
     else
@@ -202,7 +207,7 @@ CORE_SKILLS=(
     "anti-entropy-governance"
 )
 for s in "${CORE_SKILLS[@]}"; do
-    if [[ ! -f "skills/$s/SKILL.md" ]]; then
+    if [[ ! -f "$TARGET_ROOT/skills/$s/SKILL.md" && ! -f "$WORKFLOW_ROOT/skills/$s/SKILL.md" ]]; then
         MISSING_SKILLS=$((MISSING_SKILLS + 1))
     fi
 done

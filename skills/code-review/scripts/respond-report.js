@@ -7,26 +7,34 @@
  *   - 评审/回复报告格式以 `loopx pr-review` 返回的 `review_template` 为唯一权威：
  *     动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价（代码类变更需 `### 关键代码讲解`）。
  *   - 禁止自造 "5-Block / Block 1~5" 版式。
- *   - findings 来源为 authentic-review.js 落盘的原生评审产物
- *     `.loopx/reviews/<pr>@<head>.json`（review_body 本身不承载 findings）。
+ *   - findings 来源为 authentic-review.js 落盘的原生评审缓存
+ *     `<REPO_ROOT>/.loopx/cache/reviews/<pr>@<head>.json`（review_body 本身不承载 findings）。
  *
  * 用法:
- *   node respond-report.js --pr 13 --head <sha> --review-dir .loopx/reviews \
- *     --gates-json '{"typecheck":"PASSED",...}' [--result-file f] [--resolutions-file f] [--print]
+ *   node respond-report.js --pr 13 --head <sha> [--review-dir <dir>] \
+ *     --gates-json '{"typecheck":"PASSED",...}' [--result-file f] [--resolutions-file f] (--print | --output-file f)
  *
- * 输出: 报告文件路径（stdout）；`--print` 时直接输出 Markdown 正文。
+ * 输出: `--print` 直接输出 Markdown 正文（流优先，零临时文件）；或 `--output-file <f>` 写入显式指定路径。
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
+const {
+  resolveRepoRoot,
+  resolveReviewCacheDir,
+  resolveLegacyReviewDir,
+} = require('../../../lib/paths');
 
 const NATIVE_SECTIONS = ['动机', '改动思路', '具体改动', '对主干的风险', '我的整体评价'];
 
 function parseArgs(argv) {
+  const repoRoot = resolveRepoRoot(process.cwd());
   const o = {
     pr: '',
     head: '',
-    reviewDir: path.join('.loopx', 'reviews'),
+    reviewDir: resolveReviewCacheDir(repoRoot),
+    reviewDirExplicit: false,
+    repoRoot,
     resultFile: '',
     resolutionsFile: '',
     gatesJson: '{}',
@@ -37,7 +45,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--pr') o.pr = argv[++i];
     else if (a === '--head') o.head = argv[++i];
-    else if (a === '--review-dir') o.reviewDir = argv[++i];
+    else if (a === '--review-dir') { o.reviewDir = argv[++i]; o.reviewDirExplicit = true; }
     else if (a === '--result-file') o.resultFile = argv[++i];
     else if (a === '--resolutions-file') o.resolutionsFile = argv[++i];
     else if (a === '--gates-json') o.gatesJson = argv[++i];
@@ -61,7 +69,7 @@ function validateNativeReviewBody(body) {
   return { valid: reasons.length === 0, reasons };
 }
 
-function loadReviewResult({ pr, head, reviewDir, resultFile }) {
+function loadReviewResult({ pr, head, reviewDir, reviewDirExplicit, repoRoot, resultFile }) {
   if (resultFile) {
     if (!fs.existsSync(resultFile)) {
       throw new Error(`指定的评审产物不存在: ${resultFile}`);
@@ -69,6 +77,9 @@ function loadReviewResult({ pr, head, reviewDir, resultFile }) {
     return { artifactPath: resultFile, artifact: JSON.parse(fs.readFileSync(resultFile, 'utf8')) };
   }
   if (!fs.existsSync(reviewDir)) {
+    if (!reviewDirExplicit && fs.existsSync(resolveLegacyReviewDir(repoRoot))) {
+      console.error('[i] 检测到旧目录 .loopx/reviews/ 已弃用（现已降级迁至 .loopx/cache/reviews/），缓存不自动迁移。');
+    }
     throw new Error(`评审产物目录不存在: ${reviewDir}；请先执行 loopx-flow review <pr_id>`);
   }
   const files = fs.readdirSync(reviewDir)
@@ -201,7 +212,11 @@ function buildReport({ pr, head, review, gates, resolutions }) {
 function main() {
   const o = parseArgs(process.argv);
   if (!o.pr || !o.head) {
-    console.error('usage: respond-report.js --pr N --head <sha> [--review-dir d] [--result-file f] [--resolutions-file f] [--gates-json json] [--print]');
+    console.error('usage: respond-report.js --pr N --head <sha> [--review-dir d] [--result-file f] [--resolutions-file f] [--gates-json json] (--print | --output-file f)');
+    process.exit(2);
+  }
+  if (!o.print && !o.outputFile) {
+    console.error('[FAIL-CLOSED] 请指定 --print（走 stdout/stdin 流）或显式 --output-file <path>；已禁止静默落盘系统临时目录。');
     process.exit(2);
   }
   let gates = {};
@@ -218,10 +233,12 @@ function main() {
     const body = buildReport({
       pr: o.pr, head: o.head, review, gates, resolutions,
     });
+    if (o.outputFile) {
+      fs.mkdirSync(path.dirname(path.resolve(o.outputFile)), { recursive: true });
+      fs.writeFileSync(o.outputFile, body, 'utf8');
+    }
     if (o.print) process.stdout.write(body + '\n');
-    const out = o.outputFile || path.join(require('node:os').tmpdir(), `pr-response-${o.pr}-${Date.now()}.md`);
-    fs.writeFileSync(out, body, 'utf8');
-    if (!o.print) process.stdout.write(out + '\n');
+    else process.stdout.write(o.outputFile + '\n');
   } catch (e) {
     console.error(`[FAIL-CLOSED] ${e.message}`);
     process.exit(1);

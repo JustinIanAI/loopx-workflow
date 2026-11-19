@@ -12,7 +12,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const INGEST = path.join(PROJECT_ROOT, 'skills/code-review/scripts/ingest-to-loopx-quality.js');
@@ -91,9 +91,15 @@ describe('committedScopeFiles：证据 refs 只取已提交 exact scope', () => 
 describe('运行时工件隔离（INV-ENV-3）', () => {
   test('.gitignore 覆盖 .loopx/**/*.lock 与 .loopx/goals/', () => {
     const ignore = fs.readFileSync(path.join(PROJECT_ROOT, '.gitignore'), 'utf8');
-    assert.match(ignore, /^\.loopx\/\*\*\/\*\.lock$/m, '应忽略 .loopx 下所有锁文件');
-    assert.match(ignore, /^\.loopx\/goals\/$/m, '应忽略 .loopx/goals 私有状态');
+    assert.ok(
+      /^\.loopx\/$/m.test(ignore) || (/^\.loopx\/\*\*\/\*\.lock$/m.test(ignore) && /^\.loopx\/goals\/$/m.test(ignore)),
+      '应忽略整个 .loopx/ 目录或覆盖 .loopx/**/*.lock 与 .loopx/goals/',
+    );
     assert.match(ignore, /^\.codex\/$/m, '应忽略 .codex 私有状态');
+    for (const probe of ['.loopx/goals/g1/state.md', '.loopx/tmp/a.lock', '.loopx/cache/reviews/1@abc.json']) {
+      const res = spawnSync('git', ['check-ignore', '-q', probe], { cwd: PROJECT_ROOT });
+      assert.strictEqual(res.status, 0, `git check-ignore 必须命中 ${probe}`);
+    }
   });
 
   test('git ls-files 中不含 .codex/ 或 .loopx 锁文件', () => {

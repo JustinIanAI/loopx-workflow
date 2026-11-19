@@ -25,28 +25,11 @@ __pycache__/
 coverage/
 *.log
 
-# LoopX private runtime artifacts
-.loopx/shadow/
-
-# 项目本地临时工件沙箱（禁止硬编码系统 /tmp 固定文件名，见 AGENTS.md 铁律 6）
-.loopx/tmp/
+# LoopX 项目本地私有运行态与工作流临时/缓存目录（ADR-0007 / D2：整目录不入 Git）
+.loopx/
 
 # LoopX local IDE runtime state (goal leases / active states)
 .codex/
-
-# Test mock binaries
-.tmp-mock-bin*
-
-# LoopX private runtime registry & state (boundary compliance)
-.loopx/registry.json
-.loopx/domain-state/
-.loopx/state/
-.loopx/cache/
-.loopx/reviews/
-.loopx/*.sqlite*
-.loopx/**/*.lock
-.loopx/goals/
-.loopx/domain-state/
 
 # LoopX runtime active state（ADR-0008：运行态不入 Git，归档只允许 ACTIVE_STATE.snapshot.md）
 specs/**/ACTIVE_STATE.md

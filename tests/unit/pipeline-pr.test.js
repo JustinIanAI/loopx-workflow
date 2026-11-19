@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync, execSync } = require('node:child_process');
 const crypto = require('node:crypto');
@@ -9,7 +10,8 @@ const { detachRepoConfig, withoutRepoConfig } = require('./helpers/repo-isolatio
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
-const MOCK_BIN_DIR = path.join(PROJECT_ROOT, '.tmp-mock-bin');
+const MOCK_BIN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-mock-bin-pr-'));
+process.on('exit', () => { try { fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true }); } catch (_) {} });
 const REG_PATH = path.join(PROJECT_ROOT, '.loopx/registry.json');
 
 function registerE2eGoal(featureDir) {

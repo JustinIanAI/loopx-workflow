@@ -34,8 +34,8 @@
   3. 清理全局 registry 中对应 9 条登记（`retire-global-goal` 因 live state_file 拒绝，改为备份后移除）
   4. 归档 `e2e-pipeline-demo-goal` 运行时目录（`loopx archive-runtime --allow-registered --execute`）
 - 迁移后校验：
-  - `loopx status` → `runtime_root: /Users/freecisco_yan/.loopx`
-  - 项目 `.loopx/registry.json` → `common_runtime_root: /Users/freecisco_yan/.loopx`
+  - `loopx status` → `runtime_root: <loopx-runtime-root>`
+  - 项目 `.loopx/registry.json` → `common_runtime_root: <loopx-runtime-root>`
   - `loopx-flow doctor` 控制面段 **三绿无告警**
   - `loopx-flow gate verify contract env-governance` 重新审批后通过
   - `loopx-flow check env-governance` 3/3 收据 `ok=true`，收据文件落在 `~/.loopx/goals/...`
@@ -55,7 +55,7 @@
 
 ```
 ==> [2/3] 控制面一致性检查 (runtime route / registry / 运行时工件)...
-[✓] runtime root 路由一致: /Users/freecisco_yan/.codex/loopx
+[✓] runtime root 路由一致: <loopx-runtime-root>
 [WARN] ~/.loopx 存在半迁移残留（1 项，无 registry.global.json）→ 会阻塞 loopx migrate-local-state
 [WARN] registry 存在缺 state_file 的 goal（会阻塞迁移/审批）: .loopx/registry.json#hard-guard-goal
 [✓] 运行时工件未被 Git 跟踪

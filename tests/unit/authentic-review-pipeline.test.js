@@ -291,10 +291,11 @@ describe('S2b native review_template drives the prompt (LoopX packet)', () => {
     const sbx = makeSandbox();
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
     assert.strictEqual(r.code, 0, r.out);
-    const artifact = path.join(PROJECT_ROOT, '.loopx', 'reviews', `7@${HEAD}.json`);
-    assert.strictEqual(fs.existsSync(artifact), true, 'review artifact must be persisted under .loopx/reviews');
+    const artifact = path.join(PROJECT_ROOT, '.loopx', 'cache', 'reviews', `7@${HEAD}.json`);
+    assert.strictEqual(fs.existsSync(artifact), true, 'review artifact must be persisted under .loopx/cache/reviews');
     const data = JSON.parse(fs.readFileSync(artifact, 'utf8'));
-    assert.strictEqual(data.schema_version, 'loopx_flow_review_artifact_v0');
+    assert.strictEqual(data.schema_version, 'loopx_flow_review_cache_v1');
+    assert.strictEqual(data.result_payload.schema_version, 'pull_request_review_result_v1');
     assert.strictEqual(data.reviewer.declaration_source, 'self_reported');
     assert.strictEqual(Array.isArray(data.findings), true);
     fs.rmSync(artifact, { force: true });
@@ -547,9 +548,13 @@ describe('R3 carryover adjudication', () => {
     fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/a.js', severity: 'P1', summary: 'still here' }] }));
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
     assert.strictEqual(r.code, 0, r.out);
-    const result = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
+    const cacheFile = path.join(PROJECT_ROOT, '.loopx', 'cache', 'reviews', `7@${HEAD}.json`);
+    const cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    const result = cache.result_payload;
     assert.ok(result.review_body.includes('上轮 findings 裁决'));
     assert.ok(result.review_body.indexOf('上轮 findings 裁决') < result.review_body.indexOf('English verdict'));
+    assert.deepStrictEqual(fs.readdirSync(sbx.tmpDir), [], '成功路径必须清理本次运行临时目录');
+    fs.rmSync(cacheFile, { force: true });
   });
 
   test('no prior findings does not require carryover adjudication', () => {
@@ -694,10 +699,14 @@ exit 0
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { REVIEW_KEEP_PROMPT: '1' });
     assert.strictEqual(r.code, 0, r.out);
     assert.match(r.out, /阶段 2 证据对齐/);
-    assert.strictEqual(fs.existsSync(path.join(sbx.tmpDir, `review-prompt-7-${HEAD.slice(0, 10)}.md`)), true);
-    assert.strictEqual(fs.existsSync(path.join(sbx.tmpDir, `review-prompt-7-${HEAD.slice(0, 10)}-stage2.md`)), true);
-    const resultJson = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
+    const runDirs = fs.readdirSync(sbx.tmpDir).filter((d) => d.startsWith('review-pr7-'));
+    assert.strictEqual(runDirs.length, 1, 'REVIEW_KEEP_PROMPT=1 应保留本次唯一运行目录');
+    const runPath = path.join(sbx.tmpDir, runDirs[0]);
+    assert.strictEqual(fs.existsSync(path.join(runPath, `review-prompt-7-${HEAD.slice(0, 10)}.md`)), true);
+    assert.strictEqual(fs.existsSync(path.join(runPath, `review-prompt-7-${HEAD.slice(0, 10)}-stage2.md`)), true);
+    const resultJson = JSON.parse(fs.readFileSync(path.join(runPath, 'result.json'), 'utf8'));
     assert.strictEqual(resultJson.evidence.e1.status, 'verified');
+    fs.rmSync(path.join(PROJECT_ROOT, '.loopx', 'cache', 'reviews', `7@${HEAD}.json`), { force: true });
   });
 
   test('ghApiWithBackoff PATCH passes separate -X and PATCH tokens (no leading space method)', () => {
@@ -785,7 +794,8 @@ exit 0
 `, { mode: 0o755 });
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--packet-file', packetFile]);
     assert.strictEqual(r.code, 0, r.out);
-    const resultJson = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
+    const cacheFile = path.join(PROJECT_ROOT, '.loopx', 'cache', 'reviews', `7@${HEAD}.json`);
+    const resultJson = JSON.parse(fs.readFileSync(cacheFile, 'utf8')).result_payload;
     assert.strictEqual(resultJson.evidence.change_proportionality.status, 'verified');
     assert.strictEqual(
       resultJson.evidence.change_proportionality.architecture_assessment.validation_evidence,
@@ -794,5 +804,7 @@ exit 0
     const boundaryIdx = resultJson.review_body.indexOf('> 当前 PR 边界：skills/code-review/ only');
     const verdictIdx = resultJson.review_body.indexOf('English verdict:');
     assert.ok(boundaryIdx > 0 && verdictIdx > boundaryIdx, 'boundary note must appear before English verdict');
+    assert.deepStrictEqual(fs.readdirSync(sbx.tmpDir), [], '成功路径必须清理本次运行临时目录');
+    fs.rmSync(cacheFile, { force: true });
   });
 });

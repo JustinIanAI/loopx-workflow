@@ -14,6 +14,7 @@ const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 function makeSandbox(prefix = 'm0-sandbox-') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'specs/features'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'specs/archive'), { recursive: true });
@@ -21,7 +22,10 @@ function makeSandbox(prefix = 'm0-sandbox-') {
   fs.mkdirSync(path.join(dir, '.mockbin'), { recursive: true });
   fs.copyFileSync(path.join(PROJECT_ROOT, 'bin/loopx-flow'), path.join(dir, 'bin/loopx-flow'));
   fs.chmodSync(path.join(dir, 'bin/loopx-flow'), 0o755);
+  fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.sh'), path.join(dir, 'lib/paths.sh'));
+  fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.js'), path.join(dir, 'lib/paths.js'));
   fs.writeFileSync(path.join(dir, 'README.md'), '# sandbox\n');
+  fs.writeFileSync(path.join(dir, '.gitignore'), '.loopx/\n');
   fs.writeFileSync(path.join(dir, '.loopx/registry.json'), JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
   execSync('git init -q && git config user.email sandbox@example.com && git config user.name sandbox && git add -A && git commit -qm sandbox-init', { cwd: dir, stdio: 'ignore' });
   return dir;

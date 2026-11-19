@@ -13,12 +13,12 @@
  *      字数下限、English verdict 行、Reviewer 行、精确 head）做硬门禁。
  *   5. 仅当原生 check-result 返回 `ok === true` 才发布；原生 review_template 不可用时
  *      直接 fail-closed（禁止自造降级版式），证据完整度（approval_blockers）不足时诚实标注。
- *   6. 评审结果（findings / reviewer 声明 / 原生校验）落盘 `.loopx/reviews/<pr>@<head>.json`，
- *      供 `loopx-flow respond` 复用原生格式逐项闭环。
- *   7. 降载三件套（review-pipeline-throttle）：head-oid 幂等短路（同一 pr@head 已有
- *      native_check.ok 的 artifact 且在 REVIEW_DEBOUNCE_SECONDS 窗口内时跳过模型重跑）、
- *      comment upsert（按标记行检索既有 comment，命中 PATCH 不新增 POST）、
- *      gh api 429/503 指数退避。
+ *   6. 评审结果缓存（findings / reviewer 声明 / 原生校验 / result_payload）落盘
+ *      `<REPO_ROOT>/.loopx/cache/reviews/<pr>@<head>.json`（D2 降级为可丢弃缓存），
+ *      供 `loopx-flow respond` 复用原生格式逐项闭环；命中缓存仍必须重跑原生 `--check-result`。
+ *   7. 降载三件套（review-pipeline-throttle）：head-oid 幂等短路（命中 v1 缓存跳过模型重跑，
+ *      发布前仍拉取最新评审包并重跑 `--check-result`）、comment upsert（按标记行检索既有 comment，
+ *      命中 PATCH 不新增 POST，全链路 stdin 零临时文件）、gh api 429/503 指数退避。
  *
  * 设计原则：版式与提示词来自 LoopX 原生能力，本脚本只做"拿包 → 透传提示词 → 跑原生校验 → 发布"。
  *
@@ -33,7 +33,6 @@ const REQUIRED_FINAL_SECTIONS = ['动机', '改动思路', '具体改动', '对�
 const THREE_D_EVAL = ['delivery', 'long_horizon', 'user_experience'];
 
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
@@ -46,26 +45,41 @@ const {
   describeFileFromDiff,
   scanDiff,
 } = require('./evidence-builder');
-const { resolveTmpDir } = require('./ingest-to-loopx-quality');
+const {
+  resolveRepoRoot,
+  resolveTmpDir,
+  resolveReviewCacheDir,
+  resolveLegacyReviewDir,
+  createRunDir,
+  isExecutableFile,
+  findOnPath,
+  activeRuntimeCandidates,
+  resolveLoopxExecutable,
+  discoverBaseRef,
+} = require('../../../lib/paths');
 
-function ensureSandboxTmpDir() {
-  const dir = resolveTmpDir();
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-function writePromptArtifact(pr, headOid, prompt, stage = 'stage1') {
-  const tmpDir = ensureSandboxTmpDir();
+function writePromptArtifact(runDir, pr, headOid, prompt, stage = 'stage1') {
   const head10 = String(headOid || 'unknown').slice(0, 10);
   const suffix = stage === 'stage1' ? '' : `-${stage}`;
-  const file = path.join(tmpDir, `review-prompt-${pr}-${head10}${suffix}.md`);
+  const file = runDir.file(`review-prompt-${pr}-${head10}${suffix}.md`);
   fs.writeFileSync(file, String(prompt || ''), 'utf8');
   return file;
 }
 
 const TIMEOUT_MS = 600000;
-// 评审结果私有落盘目录（不入 Git；供 loopx-flow respond 复用原生格式核销）
-const REVIEW_RESULT_DIR = path.join('.loopx', 'reviews');
+const REVIEW_CACHE_SCHEMA_V1 = 'loopx_flow_review_cache_v1';
+let _legacyCacheNoticePrinted = false;
+
+// 评审缓存目录（D2：锚定目标仓库 REPO_ROOT/.loopx/cache/reviews，可丢弃缓存，非权威状态）
+function getReviewCacheDir(repoRoot) {
+  const root = repoRoot || resolveRepoRoot(process.cwd());
+  const cacheDir = resolveReviewCacheDir(root);
+  if (!_legacyCacheNoticePrinted && !fs.existsSync(cacheDir) && fs.existsSync(resolveLegacyReviewDir(root))) {
+    _legacyCacheNoticePrinted = true;
+    console.error('[i] 检测到旧目录 .loopx/reviews/ 已弃用（现已降级迁至 .loopx/cache/reviews/），缓存不自动迁移。');
+  }
+  return cacheDir;
+}
 
 // --- 降载三件套（契约: specs/features/review-pipeline-throttle/04-contract.md）---
 // INV-T3: 节流与退避失败一律 fail-closed（非零退出），不静默吞掉。
@@ -84,29 +98,32 @@ const THROTTLE = {
 function reviewCommentMarker(pr, headOid) {
   return `<!-- loopx-flow:review:${pr}@${String(headOid).toLowerCase()} -->`;
 }
-// 读既有评审 artifact；仅 native_check.ok===true 的 artifact 允许短路复用（INV-T1）
-function loadReviewArtifact(pr, headOid) {
-  const p = path.join(REVIEW_RESULT_DIR, `${pr}@${String(headOid).toLowerCase()}.json`);
+// 读既有评审缓存（v1）；旧 v0 缺 result_payload 自动视为 cache miss 触发重跑（D2 / R16）。
+function loadReviewArtifact(pr, headOid, repoRoot) {
+  const cacheDir = getReviewCacheDir(repoRoot);
+  const p = path.join(cacheDir, `${pr}@${String(headOid).toLowerCase()}.json`);
   if (!fs.existsSync(p)) return null;
   try {
     const a = JSON.parse(fs.readFileSync(p, 'utf8'));
-    if (a.schema_version !== 'loopx_flow_review_artifact_v0') return null;
+    if (a.schema_version !== REVIEW_CACHE_SCHEMA_V1) return null;
     if (!a.native_check || a.native_check.ok !== true) return null;
+    if (!a.result_payload || a.result_payload.schema_version !== 'pull_request_review_result_v1') return null;
     return a;
   } catch (_) { return null; }
 }
 // 列出某 PR 的全部评审 artifact（按 pr 数字前缀匹配），仅供 T3 节流计算"上次完整执行"时间；
 // 绝不用它跨 head 复用评审结果（那会把旧 head 的结论当作当前 head 发布）。
-function listReviewArtifactsForPr(pr) {
+function listReviewArtifactsForPr(pr, repoRoot) {
   try {
-    if (!fs.existsSync(REVIEW_RESULT_DIR)) return [];
+    const cacheDir = getReviewCacheDir(repoRoot);
+    if (!fs.existsSync(cacheDir)) return [];
     const prefix = `${pr}@`;
     const out = [];
-    for (const f of fs.readdirSync(REVIEW_RESULT_DIR)) {
+    for (const f of fs.readdirSync(cacheDir)) {
       if (!f.startsWith(prefix) || !f.endsWith('.json')) continue;
       try {
-        const a = JSON.parse(fs.readFileSync(path.join(REVIEW_RESULT_DIR, f), 'utf8'));
-        if (a.schema_version === 'loopx_flow_review_artifact_v0' && a.native_check && a.native_check.ok === true) {
+        const a = JSON.parse(fs.readFileSync(path.join(cacheDir, f), 'utf8'));
+        if (a.schema_version === REVIEW_CACHE_SCHEMA_V1 && a.native_check && a.native_check.ok === true) {
           out.push(a);
         }
       } catch (_) { /* 跳过损坏 artifact */ }
@@ -117,9 +134,9 @@ function listReviewArtifactsForPr(pr) {
 }
 // T3 节流：距该 PR 上次完整管线执行还需等待的毫秒数（窗口内为剩余量，窗口外/无记录为 0）。
 // 只用于"合并突发完整执行"，不参与 head-oid 幂等判定。
-function throttleRemainingMs(pr) {
+function throttleRemainingMs(pr, repoRoot) {
   if (THROTTLE.debounceSeconds <= 0) return 0;
-  const latest = listReviewArtifactsForPr(pr)[0];
+  const latest = listReviewArtifactsForPr(pr, repoRoot)[0];
   if (!latest || !latest.reviewed_at) return 0;
   const ageMs = Date.now() - Date.parse(latest.reviewed_at);
   if (!(ageMs >= 0)) return 0;
@@ -130,10 +147,10 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 // gh api 调用 + 429/503 指数退避（Retry-After 优先，上限 maxRetries 次）
-function ghApiWithBackoff(apiArgs, { repo } = {}) {
+function ghApiWithBackoff(apiArgs, { input } = {}) {
   let attempt = 0;
   for (;;) {
-    const r = sh('gh', ['api', ...apiArgs], 60000);
+    const r = sh('gh', ['api', ...apiArgs], 60000, undefined, input);
     if (r.status === 0) return { ok: true, out: r.stdout };
     const text = (r.stderr || r.stdout || '');
     const m429 = text.match(/(?:429|503)[\s\S]{0,200}retry[- ]?after[:\s]+([0-9]+)/i)
@@ -141,8 +158,7 @@ function ghApiWithBackoff(apiArgs, { repo } = {}) {
     if (attempt < THROTTLE.maxRetries && /429|503|abuse|rate.?limit|secondary/i.test(text)) {
       const waitMs = m429 ? Math.min(parseInt(m429[1], 10) * 1000, 120000) : THROTTLE.backoffBaseMs * 2 ** attempt;
       console.error(`[THROTTLE-RETRY] gh api 限流 (429/503)，${Math.ceil(waitMs / 1000)}s 后重试 (${attempt + 1}/${THROTTLE.maxRetries})...`);
-      const slept = spawnSync('sleep', [String(Math.ceil(waitMs / 1000))], { timeout: waitMs + 5000 });
-      if (slept.status !== 0) console.error(`[i] 退避 sleep 未完成，继续下一轮`);
+      sleepSync(waitMs);
       attempt += 1;
       continue;
     }
@@ -158,9 +174,7 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
   const trimmed = String(body).replace(/\s+$/g, '');
   const postedBody = trimmed.includes(marker) ? trimmed : `${trimmed}\n\n${marker}`;
   if (!useUpsert) {
-    const postedFile = path.join(ensureSandboxTmpDir(), `authentic-review-report-${pr}.md`);
-    fs.writeFileSync(postedFile, trimmed);
-    const cm = sh('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', postedFile]);
+    const cm = sh('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', '-'], 120000, undefined, trimmed);
     if (cm.status !== 0) {
       throw new Error(`gh pr comment failed: ${(cm.stderr || cm.stdout || '').slice(0, 200)}`);
     }
@@ -170,8 +184,6 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
     console.log(`[✓] 原生五段式第三方评审报告已发布至 PR #${pr}（head ${String(headOid).slice(0, 10)}）。`);
     return { mode: 'created', commentId };
   }
-  const postedFile = path.join(ensureSandboxTmpDir(), `authentic-review-report-upsert-${pr}.md`);
-  fs.writeFileSync(postedFile, postedBody);
   // 检索既有 comment（按 PR 评论列表过滤标记；GET 1 次，失败不阻塞发布）
   // 注意：gh api GET 默认 method 即 GET，无需显式传 "GET" 位置参数
   const listRes = ghApiWithBackoff([
@@ -188,8 +200,8 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
     if (existing && existing.id) {
       const patchRes = ghApiWithBackoff([
         '-X', 'PATCH', `repos/${repo}/issues/comments/${existing.id}`,
-        `-F body=@${postedFile}`,
-      ]);
+        '-F', 'body=@-',
+      ], { input: postedBody });
       if (patchRes.ok) {
         console.log(`[THROTTLE-UPSERT] 复用既有评审 comment id=${existing.id}（PATCH 更新，不再新增）`);
         return { mode: 'updated', commentId: existing.id };
@@ -200,7 +212,7 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
     console.error(`[THROTTLE-UPSERT] 检索既有 comment 失败（限流/网络），回退 POST 新建: ${listRes.out}`);
   }
   // POST 路径：gh pr comment（gh CLI 自身含限流处理）
-  const cm = sh('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', postedFile]);
+  const cm = sh('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', '-'], 120000, undefined, postedBody);
   if (cm.status !== 0) {
     throw new Error(`gh pr comment failed: ${(cm.stderr || cm.stdout || '').slice(0, 200)}`);
   }
@@ -230,12 +242,13 @@ function parseArgs(argv) {
   return o;
 }
 
-function sh(bin, args, timeoutMs, env) {
+function sh(bin, args, timeoutMs, env, input) {
   return spawnSync(bin, args, {
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
     timeout: timeoutMs || 120000,
     ...(env ? { env } : {}),
+    ...(input !== undefined ? { input: String(input) } : {}),
   });
 }
 
@@ -247,69 +260,6 @@ function parsePolicyRevision(value) {
   return null;
 }
 
-function isExecutableFile(filePath) {
-  try {
-    const st = fs.statSync(filePath);
-    if (!st.isFile()) return false;
-    fs.accessSync(filePath, fs.constants.X_OK);
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-function findOnPath(name, pathEnv) {
-  for (const dir of String(pathEnv || '').split(path.delimiter)) {
-    if (!dir) continue;
-    const candidate = path.join(dir, name);
-    if (isExecutableFile(candidate)) return candidate;
-  }
-  return null;
-}
-
-function activeRuntimeCandidates(env) {
-  const roots = [
-    ['CONDA_PREFIX', env.CONDA_PREFIX],
-    ['VIRTUAL_ENV', env.VIRTUAL_ENV],
-    ['MAMBA_ROOT_PREFIX', env.MAMBA_ROOT_PREFIX],
-  ];
-  const out = [];
-  for (const [source, root] of roots) {
-    if (!root) continue;
-    out.push({ source, file: path.join(root, 'bin', 'loopx') });
-  }
-  if (env.CONDA_EXE) {
-    out.push({ source: 'CONDA_EXE', file: path.join(path.dirname(env.CONDA_EXE), 'loopx') });
-  }
-  return out;
-}
-
-function resolveLoopxExecutable(env = process.env) {
-  const explicit = typeof env.LOOPX_BIN === 'string' ? env.LOOPX_BIN.trim() : '';
-  if (explicit) {
-    let candidate = null;
-    if (explicit.includes('/') || explicit.includes('\\')) {
-      const abs = path.isAbsolute(explicit) ? explicit : path.resolve(explicit);
-      if (isExecutableFile(abs)) candidate = abs;
-    } else {
-      candidate = findOnPath(explicit, env.PATH);
-    }
-    if (candidate) return { ok: true, bin: candidate, source: 'LOOPX_BIN' };
-    return {
-      ok: false,
-      error: `LOOPX_BIN is set to "${explicit}" but it is not an executable file. Refusing to fall back to PATH (fail-closed).`,
-    };
-  }
-  const fromPath = findOnPath('loopx', env.PATH);
-  if (fromPath) return { ok: true, bin: fromPath, source: 'PATH' };
-  for (const item of activeRuntimeCandidates(env)) {
-    if (isExecutableFile(item.file)) return { ok: true, bin: item.file, source: item.source };
-  }
-  return {
-    ok: false,
-    error: 'No executable loopx found via LOOPX_BIN, PATH, or the active runtime (CONDA_PREFIX, CONDA_EXE, VIRTUAL_ENV, MAMBA_ROOT_PREFIX). Set LOOPX_BIN to an executable path (fail-closed).',
-  };
-}
 
 function readShebangProgram(filePath) {
   let fd;
@@ -479,8 +429,9 @@ function extractJson(text) {
   return null;
 }
 
-function capsuleSection(feature, file, maxChars) {
-  const p = path.join('specs', 'features', feature, file);
+function capsuleSection(feature, file, maxChars, repoRoot) {
+  const root = repoRoot || resolveRepoRoot(process.cwd());
+  const p = path.join(root, 'specs', 'features', feature, file);
   if (!fs.existsSync(p)) return null;
   const raw = fs.readFileSync(p, 'utf8');
   return raw.length > maxChars ? `${raw.slice(0, maxChars)}\n\n[TRUNCATED]` : raw;
@@ -494,8 +445,8 @@ function describeFile(f, fileDiff) {
   return 'NOT_PROVIDED（diff 中无该文件明细，禁止套用固定模板）';
 }
 
-function extractMotivation(feature) {
-  const raw = capsuleSection(feature, '02-prd.md', 6000);
+function extractMotivation(feature, repoRoot) {
+  const raw = capsuleSection(feature, '02-prd.md', 6000, repoRoot);
   if (!raw) return 'NOT_PROVIDED';
   const prdClean = raw.replace(/^#\s+[^\n]+\n+/, '');
   const m = prdClean.match(/##\s+1\.[^\n]*\n+([\s\S]*?)(?=\n##\s+2\.|\n##\s+承重假设|$)/i);
@@ -505,8 +456,8 @@ function extractMotivation(feature) {
   return prdClean.slice(0, 800).trim();
 }
 
-function extractApproach(feature) {
-  const raw = capsuleSection(feature, '01-decisions.md', 6000);
+function extractApproach(feature, repoRoot) {
+  const raw = capsuleSection(feature, '01-decisions.md', 6000, repoRoot);
   if (!raw) return 'NOT_PROVIDED';
   const noFrontmatter = raw.replace(/^---[\s\S]*?---\s*/, '');
   const adrs = [...noFrontmatter.matchAll(/- id:\s*([^\n]+)[\s\S]*?question:\s*"?([^\n"]+)"?[\s\S]*?recommendation:\s*"?([^\n"]+)"?[\s\S]*?reason:\s*"?([^\n"]+)"?/g)];
@@ -518,8 +469,8 @@ function extractApproach(feature) {
   return noFrontmatter.slice(0, 800).trim();
 }
 
-function extractRisks(feature) {
-  const raw = capsuleSection(feature, '02-prd.md', 6000);
+function extractRisks(feature, repoRoot) {
+  const raw = capsuleSection(feature, '02-prd.md', 6000, repoRoot);
   if (!raw) return 'NOT_PROVIDED';
   const riskMatch = raw.match(/##\s+2\.[^\n]*\n+([\s\S]*?)(?=\n##\s+3\.|\n##\s+验收准则|$)/i);
   if (riskMatch && riskMatch[1].trim()) return riskMatch[1].trim();
@@ -528,7 +479,8 @@ function extractRisks(feature) {
   return 'NOT_PROVIDED';
 }
 
-function buildBody(feature, diff) {
+function buildBody(feature, diff, repoRoot) {
+  const root = repoRoot || resolveRepoRoot(process.cwd());
   const files = [...new Set([...diff.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)].map(m => m[2]))];
   const fileDiffs = splitFileDiffs(diff);
   const changes = files.length
@@ -536,13 +488,13 @@ function buildBody(feature, diff) {
     : 'NOT_PROVIDED';
 
   let body = '';
-  body += '## 动机 / Motivation\n\n' + extractMotivation(feature) + '\n\n';
-  body += '---\n\n## 改动思路 / Approach\n\n' + extractApproach(feature) + '\n\n';
+  body += '## 动机 / Motivation\n\n' + extractMotivation(feature, root) + '\n\n';
+  body += '---\n\n## 改动思路 / Approach\n\n' + extractApproach(feature, root) + '\n\n';
   body += '---\n\n## 具体改动 / Changes (关键代码讲解)\n\n' + changes + '\n\n';
-  body += '---\n\n## 对主干的风险 / Risks\n\n' + extractRisks(feature) + '\n\n';
+  body += '---\n\n## 对主干的风险 / Risks\n\n' + extractRisks(feature, root) + '\n\n';
 
   let matrix = '';
-  const evFile = path.join('specs', 'features', feature, '05-evidence.md');
+  const evFile = path.join(root, 'specs', 'features', feature, '05-evidence.md');
   if (fs.existsSync(evFile)) {
     const evText = fs.readFileSync(evFile, 'utf8');
     const mMatch = evText.match(/###\s+验证矩阵[\s\S]*?(?=\n##|$)/);
@@ -672,9 +624,16 @@ function loadPriorFindings(carryPath) {
   } catch (_) { return []; }
 }
 
-function carryoverModifiedInDiff(carryPath) {
+function carryoverModifiedInDiff(carryPath, repoRoot) {
   if (!carryPath || !fs.existsSync(carryPath)) return false;
-  const r = sh('git', ['diff', '--name-only', 'origin/main...HEAD', '--', carryPath]);
+  const root = repoRoot || resolveRepoRoot(process.cwd());
+  let baseRef = '';
+  try {
+    baseRef = discoverBaseRef(root);
+  } catch (_) {
+    return false;
+  }
+  const r = sh('git', ['-C', root, 'diff', '--name-only', `${baseRef}...HEAD`, '--', carryPath]);
   return r.status === 0 && String(r.stdout || '').trim().length > 0;
 }
 
@@ -952,30 +911,40 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
   ].join('\n');
 }
 
-function runReviewAgent(agentBin, prompt, timeoutMs) {
-  const which = sh('which', [agentBin]);
-  if (which.status !== 0) return { unavailable: true };
+function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
+  const resolvedBin = findOnPath(agentBin, process.env.PATH);
+  if (!resolvedBin) return { unavailable: true };
   // ADR-0013 / REQ-REVIEW-2: 通过 stdin 流式传输提示词，禁止用 CLI argv 传巨型字符串触碰 ARG_MAX。
   const args = agentBin.includes('claude') ? ['-p'] : ['exec', '-'];
   let tmpMsg = null;
   if (!agentBin.includes('claude')) {
-    tmpMsg = path.join(ensureSandboxTmpDir(), `codex-review-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+    if (runDir) {
+      tmpMsg = runDir.file(`codex-review-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.txt`);
+    } else {
+      const tmpRoot = resolveTmpDir();
+      fs.mkdirSync(tmpRoot, { recursive: true });
+      tmpMsg = path.join(tmpRoot, `codex-review-${process.pid}-${crypto.randomBytes(6).toString('hex')}.txt`);
+    }
     args.splice(1, 0, '-o', tmpMsg);
   }
-  const r = spawnSync(agentBin, args, {
-    input: String(prompt || ''),
-    encoding: 'utf8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: timeoutMs || TIMEOUT_MS,
-  });
-  if (r.status !== 0) return { error: `exit ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}` };
-  if (tmpMsg && fs.existsSync(tmpMsg)) {
-    const out = fs.readFileSync(tmpMsg, 'utf8');
-    try { fs.rmSync(tmpMsg, { force: true }); } catch (_) {}
-    return { stdout: out };
+  try {
+    const r = spawnSync(resolvedBin, args, {
+      input: String(prompt || ''),
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: timeoutMs || TIMEOUT_MS,
+    });
+    if (r.status !== 0) return { error: `exit ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}` };
+    if (tmpMsg && fs.existsSync(tmpMsg)) {
+      return { stdout: fs.readFileSync(tmpMsg, 'utf8') };
+    }
+    return { stdout: r.stdout };
+  } finally {
+    if (tmpMsg && !runDir) {
+      try { fs.rmSync(tmpMsg, { force: true }); } catch (_) {}
+    }
   }
-  return { stdout: r.stdout };
 }
 
 // 把模型 verdict 归一为大写原生值
@@ -1173,13 +1142,14 @@ function assertKeyCodeWalkthrough(reviewBody, behaviorBearing) {
     : { pass: false, reason: '原生 review_template 要求「具体改动」下包含 ### 关键代码讲解（代码类变更）' };
 }
 
-// 落盘评审产物（私有、不入 Git），供 loopx-flow respond 复用原生五段式格式逐项核销。
-function persistReviewArtifact({ pr, headOid, verdict, reviewBody, findings, reviewer, nativeCheck, published }) {
+// 落盘评审缓存 v1（D2 可丢弃缓存，含完整 result_payload 支撑命中重验 --check-result）。
+function persistReviewArtifact({ pr, headOid, verdict, reviewBody, findings, reviewer, nativeCheck, published, resultPayload, repoRoot }) {
   try {
-    fs.mkdirSync(REVIEW_RESULT_DIR, { recursive: true });
-    const artifactPath = path.join(REVIEW_RESULT_DIR, `${pr}@${headOid.toLowerCase()}.json`);
+    const cacheDir = getReviewCacheDir(repoRoot);
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const artifactPath = path.join(cacheDir, `${pr}@${headOid.toLowerCase()}.json`);
     const payload = {
-      schema_version: 'loopx_flow_review_artifact_v0',
+      schema_version: REVIEW_CACHE_SCHEMA_V1,
       pr: Number(pr),
       head_oid: headOid.toLowerCase(),
       reviewed_at: new Date().toISOString(),
@@ -1188,10 +1158,11 @@ function persistReviewArtifact({ pr, headOid, verdict, reviewBody, findings, rev
       findings,
       native_check: nativeCheck || null,
       review_body: reviewBody,
+      result_payload: resultPayload || null,
       ...(published ? { published } : {}),
     };
     fs.writeFileSync(artifactPath, JSON.stringify(payload, null, 2));
-    console.log(`[✓] 评审产物已落盘: ${artifactPath}`);
+    console.log(`[✓] 评审缓存已落盘: ${artifactPath}`);
     return artifactPath;
   } catch (e) {
     console.error(`[NOT_VERIFIED] 评审产物落盘失败，无法支撑 respond 核销: ${e.message}`);
@@ -1249,10 +1220,11 @@ function main() {
   const o = parseArgs(process.argv);
 
   // PR 提交版式预览（对齐 PR #7545 双语 4-Part）
+  const repoRoot = resolveRepoRoot(process.cwd());
   if (o.generatePrBody) {
     let feature = o.feature || '';
     if (!feature) {
-      const branchRes = sh('git', ['rev-parse', '--abbrev-ref', 'HEAD']);
+      const branchRes = sh('git', ['-C', repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD']);
       const branch = branchRes.stdout ? branchRes.stdout.trim() : '';
       if (branch.startsWith('feature/')) feature = branch.replace(/^feature\//, '');
       else if (branch.startsWith('fix/')) feature = branch.replace(/^fix\//, '');
@@ -1263,10 +1235,17 @@ function main() {
     } else if (o.pr && o.repo) {
       diff = prDiff(o.repo, o.pr);
     } else {
-      const diffRes = sh('git', ['diff', 'origin/main...HEAD']);
-      diff = (diffRes.status === 0 && diffRes.stdout) ? diffRes.stdout : (sh('git', ['diff', 'main...HEAD']).stdout || '');
+      let baseRef = '';
+      try { baseRef = discoverBaseRef(repoRoot); } catch (_) { baseRef = ''; }
+      const diffRes = baseRef ? sh('git', ['-C', repoRoot, 'diff', `${baseRef}...HEAD`]) : { status: 1, stdout: '' };
+      if (diffRes.status === 0 && diffRes.stdout) {
+        diff = diffRes.stdout;
+      } else {
+        const fbMain = sh('git', ['-C', repoRoot, 'diff', 'main...HEAD']);
+        diff = (fbMain.status === 0 && fbMain.stdout) ? fbMain.stdout : (sh('git', ['-C', repoRoot, 'diff', 'master...HEAD']).stdout || '');
+      }
     }
-    const body = buildBody(feature, diff);
+    const body = buildBody(feature, diff, repoRoot);
     if (o.outputFile) {
       fs.writeFileSync(o.outputFile, body, 'utf8');
       console.log(`[✓] Generated PR #7545 compliant body to ${o.outputFile}`);
@@ -1296,37 +1275,97 @@ function main() {
     process.exit(1);
   }
   const headOid = head.headRefOid;
+  if (process.env.REVIEW_KEEP_PROMPT === '1') {
+    process.env.LOOPX_KEEP_TMP = '1';
+  }
+  const runDir = createRunDir(`review-pr${o.pr}`, repoRoot);
 
+  let loopxResolved = null;
+  let packet = null;
+  let pkt = null;
+  let policy = null;
+  const ensureNativePacket = () => {
+    if (packet && pkt && policy && loopxResolved) return;
+    loopxResolved = resolveLoopxExecutable(process.env);
+    if (!loopxResolved.ok) {
+      console.error(`[BLOCKED] ${loopxResolved.error}`);
+      process.exit(1);
+    }
+    console.log(`[i] loopx executable: ${loopxResolved.bin} (${loopxResolved.source})`);
+    try {
+      packet = fetchPacket(o.repo, o.pr, headOid, o.packetFile, loopxResolved.bin);
+    } catch (e) {
+      console.error(`[NATIVE_UNAVAILABLE] ${e.message}`);
+      console.error('[NOT_VERIFIED] 无法获取 LoopX 原生评审包（review_template 是唯一格式权威），禁止发布自造降级报告。');
+      process.exit(1);
+    }
+    pkt = extractPacketReview(packet, o.pr, headOid);
+    if (!pkt.hasNativeTemplate) {
+      console.error('[NOT_VERIFIED] 原生评审包未提供 review_template，禁止发布自造版式报告。');
+      process.exit(1);
+    }
+    policy = resolveReviewPolicyRevision({
+      packet,
+      pr: o.pr,
+      headOid,
+      loopxBin: loopxResolved.bin,
+      env: process.env,
+    });
+    if (!policy.ok) {
+      console.error(`[NOT_VERIFIED] ${policy.error}`);
+      process.exit(1);
+    }
+  };
+
+  // --- 0. T1 head-oid 幂等（D2 / R6 / R16）：命中 v1 缓存仅跳过 gh pr diff 与模型调用，
+  //        发布前仍须拉取最新评审包并重跑 `loopx pr-review --check-result`；
+  //        策略版本变化或复核失败时作废缓存并回退完整审查。
   if (!o.forceRecheck && THROTTLE.shortCircuit) {
-    const sameHead = loadReviewArtifact(o.pr, headOid);
+    const sameHead = loadReviewArtifact(o.pr, headOid, repoRoot);
     if (sameHead) {
-      const short = String(headOid).toLowerCase().slice(0, 10);
-      console.log(`[THROTTLE] 命中 head-oid 幂等：.loopx/reviews/${o.pr}@${short}.json（当前 head 已评审且 native_check.ok；跳过 gh pr diff / 模型重跑，发布走 comment upsert）。如需强制重检请加 --force-recheck。`);
-      const reused = publishReviewCommentUpsert({
-        repo: o.repo, pr: o.pr, headOid, body: sameHead.review_body,
-        useUpsert: true, // 幂等复用路径始终走 upsert，避免每次重跑堆叠新评论
-      });
-      console.log(`[✓] 复用既有评审结果（verdict=${sameHead.verdict}，发布模式=${reused.mode}）。Authentic 审查管线完成（幂等短路）。`);
-      process.exit(0);
+      ensureNativePacket();
+      const cachedPayload = sameHead.result_payload;
+      const expectedTarget = `${o.pr}@${String(headOid).toLowerCase()}`;
+      const revMatched = cachedPayload.review_policy_revision === policy.revision
+        && String(cachedPayload.target_exact_head || '').toLowerCase() === expectedTarget;
+      if (revMatched) {
+        const packetPath = o.packetFile && fs.existsSync(o.packetFile)
+          ? o.packetFile
+          : runDir.file('packet.json');
+        if (!o.packetFile) fs.writeFileSync(packetPath, JSON.stringify(packet, null, 2));
+        const resultPath = runDir.file('cached-result.json');
+        fs.writeFileSync(resultPath, JSON.stringify(cachedPayload, null, 2));
+        const recheck = runNativeCheckResult(resultPath, packetPath, loopxResolved.bin);
+        const recheckFmt = bodyFormatPasses(recheck);
+        if (recheckFmt.pass && recheck.parsed && recheck.parsed.ok === true) {
+          const short = String(headOid).toLowerCase().slice(0, 10);
+          console.log(`[THROTTLE] 命中 head-oid 幂等缓存：.loopx/cache/reviews/${o.pr}@${short}.json（已重跑 --check-result 通过；跳过 gh pr diff / 模型重跑，发布走 comment upsert）。如需强制重检请加 --force-recheck。`);
+          const reused = publishReviewCommentUpsert({
+            repo: o.repo, pr: o.pr, headOid, body: cachedPayload.review_body || sameHead.review_body,
+            useUpsert: true,
+          });
+          console.log(`[✓] 复用既有评审结果（verdict=${cachedPayload.verdict || sameHead.verdict}，发布模式=${reused.mode}）。Authentic 审查管线完成（幂等短路）。`);
+          process.exit(0);
+        }
+        console.error(`[THROTTLE] 缓存复核 --check-result 未通过（${recheckFmt.reason}），作废缓存并重跑完整审查。`);
+      } else {
+        console.error(`[THROTTLE] 缓存策略版本或 head 不匹配（cached rev=${cachedPayload.review_policy_revision}, current rev=${policy.revision}），作废缓存并重跑完整审查。`);
+      }
     }
   }
 
   // --- 0b. T3 客户端节流：同一 PR 的完整管线执行间隔不足 debounceSeconds 时，
   //        合并突发（有界等待，最多 debounceSeconds），避免 push→评审 热循环打爆限流。
   if (!o.forceRecheck && THROTTLE.shortCircuit) {
-    const waitMs = throttleRemainingMs(o.pr);
+    const waitMs = throttleRemainingMs(o.pr, repoRoot);
     if (waitMs > 0) {
       console.log(`[THROTTLE] 距该 PR 上次完整评审不足 ${THROTTLE.debounceSeconds}s，合并突发：等待 ${Math.ceil(waitMs / 1000)}s 后再执行（上限 ${THROTTLE.debounceSeconds}s）。`);
       sleepSync(waitMs);
     }
   }
 
-  const loopxResolved = resolveLoopxExecutable(process.env);
-  if (!loopxResolved.ok) {
-    console.error(`[BLOCKED] ${loopxResolved.error}`);
-    process.exit(1);
-  }
-  console.log(`[i] loopx executable: ${loopxResolved.bin} (${loopxResolved.source})`);
+  // --- 1. 取原生评审包（若缓存重验阶段未拉取则在此拉取）---
+  ensureNativePacket();
 
   let diff;
   try {
@@ -1335,36 +1374,10 @@ function main() {
     console.error(`[BLOCKED] ${e.message}`);
     process.exit(1);
   }
-
-  // --- 1. 取原生评审包（格式与提示词的唯一权威；不可用即 fail-closed）---
-  let packet = null;
-  try {
-    packet = fetchPacket(o.repo, o.pr, headOid, o.packetFile, loopxResolved.bin);
-  } catch (e) {
-    console.error(`[NATIVE_UNAVAILABLE] ${e.message}`);
-    console.error('[NOT_VERIFIED] 无法获取 LoopX 原生评审包（review_template 是唯一格式权威），禁止发布自造降级报告。');
-    process.exit(1);
-  }
-  const pkt = extractPacketReview(packet, o.pr, headOid);
-  if (!pkt.hasNativeTemplate) {
-    console.error('[NOT_VERIFIED] 原生评审包未提供 review_template，禁止发布自造版式报告。');
-    process.exit(1);
-  }
-  const policy = resolveReviewPolicyRevision({
-    packet,
-    pr: o.pr,
-    headOid,
-    loopxBin: loopxResolved.bin,
-    env: process.env,
-  });
-  if (!policy.ok) {
-    console.error(`[NOT_VERIFIED] ${policy.error}`);
-    process.exit(1);
-  }
   console.log(`[i] 评审模式: LoopX 原生 review_template 驱动`);
   console.log(`[i] review_policy_revision: ${policy.revision} (${policy.source})`);
 
-  const contractFile = path.join('specs', 'features', feature, '04-contract.md');
+  const contractFile = path.join(repoRoot, 'specs', 'features', feature, '04-contract.md');
   const contractSha = fs.existsSync(contractFile)
     ? crypto.createHash('sha256').update(fs.readFileSync(contractFile)).digest('hex')
     : 'NOT_FOUND';
@@ -1380,9 +1393,9 @@ function main() {
   }
 
   // --- 3. 构建提示词：原生 review_template（透传，不重写）---
-  const carryPath = o.carryoverFile || path.join('specs', 'features', feature, 'review-carryover.json');
+  const carryPath = o.carryoverFile || path.join(repoRoot, 'specs', 'features', feature, 'review-carryover.json');
   const priorFindings = loadPriorFindings(carryPath);
-  if (priorFindings.length && carryoverModifiedInDiff(carryPath)) {
+  if (priorFindings.length && carryoverModifiedInDiff(carryPath, repoRoot)) {
     console.error('[NOT_VERIFIED] carryover 文件在本 PR 被修改，历史 findings 完整性不可信；请从私有 review artifact 提供。');
     process.exit(1);
   }
@@ -1397,12 +1410,9 @@ function main() {
 
   // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
   const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || 'codex';
-  const stage1PromptFile = writePromptArtifact(o.pr, headOid, prompt, 'stage1');
+  const stage1PromptFile = writePromptArtifact(runDir, o.pr, headOid, prompt, 'stage1');
   console.log(`[i] 阶段 1 评审提示词已写入沙箱文件: ${stage1PromptFile} (通过 stdin 流式传入 ${primaryAgent})`);
-  const agentRun = runReviewAgent(primaryAgent, prompt);
-  if (process.env.REVIEW_KEEP_PROMPT !== '1') {
-    try { fs.rmSync(stage1PromptFile, { force: true }); } catch (_) {}
-  }
+  const agentRun = runReviewAgent(primaryAgent, prompt, undefined, runDir);
   if (agentRun.unavailable) {
     console.error(`[NOT_VERIFIED] ${primaryAgent} CLI unavailable; refusing to publish an unreviewed report.`);
     process.exit(1);
@@ -1481,12 +1491,9 @@ function main() {
       evidenceText,
       validation,
     });
-    const stage2PromptFile = writePromptArtifact(o.pr, headOid, stage2Prompt, 'stage2');
+    const stage2PromptFile = writePromptArtifact(runDir, o.pr, headOid, stage2Prompt, 'stage2');
     console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length + unverifiedValidationCases.length} 项): ${stage2PromptFile}`);
-    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt);
-    if (process.env.REVIEW_KEEP_PROMPT !== '1') {
-      try { fs.rmSync(stage2PromptFile, { force: true }); } catch (_) {}
-    }
+    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt, undefined, runDir);
     if (!stage2Run.unavailable && !stage2Run.error) {
       const parsedStage2 = extractJson(stage2Run.stdout || '');
       const stage2Evidence = parsedStage2 && parsedStage2.evidence && typeof parsedStage2.evidence === 'object'
@@ -1556,7 +1563,7 @@ function main() {
   if (o.crossValidate) {
     const secondaryAgent = primaryAgent.includes('claude') ? 'codex' : 'claude';
     console.log(`==> [S5] Cross-validating with ${secondaryAgent} (default model)...`);
-    const cv = runReviewAgent(secondaryAgent, prompt);
+    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir);
     if (!cv.unavailable && !cv.error) {
       const sec = acceptModelOutput(extractJson(cv.stdout || ''));
       if (sec) {
@@ -1581,14 +1588,13 @@ function main() {
 
   // --- 7. 原生 check-result 硬门禁（ok=true 才允许发布）---
   {
-    const sandboxTmp = ensureSandboxTmpDir();
     const packetPath = o.packetFile && fs.existsSync(o.packetFile)
       ? o.packetFile
-      : path.join(sandboxTmp, `loopx-pr-review-packet-${o.pr}.json`);
+      : runDir.file('packet.json');
     if (!o.packetFile) fs.writeFileSync(packetPath, JSON.stringify(packet, null, 2));
 
     const evidence = Object.keys(autoEvidence).length ? autoEvidence : { problem_context: { status: 'unverified' } };
-    const resultPath = path.join(sandboxTmp, `authentic-review-result-${o.pr}.json`);
+    const resultPath = runDir.file('result.json');
     const buildResultFile = () => ({
       schema_version: 'pull_request_review_result_v1',
       review_policy_revision: policy.revision,
@@ -1609,8 +1615,10 @@ function main() {
     });
     let check = null;
     let fmt = null;
+    let finalResultPayload = null;
     const runCheck = () => {
-      fs.writeFileSync(resultPath, JSON.stringify(buildResultFile(), null, 2));
+      finalResultPayload = buildResultFile();
+      fs.writeFileSync(resultPath, JSON.stringify(finalResultPayload, null, 2));
       check = runNativeCheckResult(resultPath, packetPath, loopxResolved.bin);
       fmt = bodyFormatPasses(check);
     };
@@ -1626,7 +1634,7 @@ function main() {
       runCheck();
     }
 
-    const reportOut = path.join(sandboxTmp, `authentic-review-check-${o.pr}.json`);
+    const reportOut = runDir.file('check-result.json');
     fs.writeFileSync(reportOut, check.raw || JSON.stringify(check, null, 2));
     if (check.parsed) {
       console.log(`[✓] loopx pr-review --check-result: ok=${check.parsed.ok} approval_consistent=${check.parsed.approval_consistent}`);
@@ -1648,16 +1656,16 @@ function main() {
       pr: o.pr, headOid, verdict, reviewBody, findings, reviewer,
       nativeCheck: check.parsed || null,
       published: { commentId: publishRes.commentId, headOid: headOid.toLowerCase(), mode: publishRes.mode },
+      resultPayload: finalResultPayload,
+      repoRoot,
     });
   }
 
   // --- 9. 可选：用胶囊重建 PR body ---
   if (o.rebuildBody) {
-    const body = buildBody(feature, diff);
-    const bodyFile = path.join(ensureSandboxTmpDir(), `authentic-body-${o.pr}.md`);
-    fs.writeFileSync(bodyFile, body);
+    const body = buildBody(feature, diff, repoRoot);
     console.log(body);
-    const ed = sh('gh', ['pr', 'edit', String(o.pr), '--repo', o.repo, '--body-file', bodyFile]);
+    const ed = sh('gh', ['pr', 'edit', String(o.pr), '--repo', o.repo, '--body-file', '-'], 120000, undefined, body);
     if (ed.status !== 0) {
       console.error(`[BLOCKED] gh pr edit failed: ${(ed.stderr || ed.stdout || '').slice(0, 200)}`);
       process.exit(1);

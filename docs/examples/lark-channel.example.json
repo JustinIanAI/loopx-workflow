@@ -1,0 +1,32 @@
+{
+  "schema_version": "loopx_goal_channel_lark_binding_v0",
+  "bindings": {
+    "<goal-id>": {
+      "goal_id": "<goal-id>",
+      "provider": "lark",
+      "enabled": true,
+      "channel": {
+        "pinned_message_id": "**",
+        "chat_id": "**",
+        "chat_name": "LoopX · <feature>"
+      },
+      "kanban": {
+        "config_path": ".loopx/lark-kanban.json",
+        "base_token": "**",
+        "table_id": "**",
+        "base_url": "https://my.feishu.cn/base/**"
+      },
+      "identity": {
+        "mode": "project_bot",
+        "sender_profile": "**",
+        "sender_identity": "bot",
+        "bot_app_id": "**",
+        "bot_display_name": "<bot-name>",
+        "cli_bin": "lark-cli"
+      },
+      "automation": {
+        "human_gate_auto_notify_enabled": true
+      }
+    }
+  }
+}

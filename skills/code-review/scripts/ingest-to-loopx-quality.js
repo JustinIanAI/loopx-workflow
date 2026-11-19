@@ -10,42 +10,18 @@
  */
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync, execFileSync, spawnSync } = require('child_process');
-
-// GitHub Issue #13：按仓库真实存在的远程默认基线解析，顺序 origin/HEAD → origin/main → origin/master。
-// 禁止伪造 origin/main；master 主干且无 origin/main 的仓库必须能生成质量收据。
-function discoverBaseRef(repoPath = process.cwd()) {
-  for (const ref of ['origin/HEAD', 'origin/main', 'origin/master']) {
-    try {
-      execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], {
-        stdio: 'ignore',
-      });
-      return ref;
-    } catch (_) {
-      // 该 ref 不存在，尝试下一个
-    }
-  }
-  throw new Error('无法解析远程默认基线：origin/HEAD / origin/main / origin/master 均不存在；请先 git fetch origin && git remote set-head origin -a');
-}
-
-// 项目本地临时沙箱：临时工件必须写入项目内已 gitignore 的 .loopx/tmp/，
-// 禁止硬编码系统 /tmp 固定文件名（多 Agent/多进程会互相覆写、重启或清理后证据丢失、
-// macOS /private/tmp 与 Windows %TEMP% 不可移植）。LOOPX_TMP_DIR 可覆盖该目录（CI/隔离测试）。
-function resolveTmpDir() {
-  const override = process.env.LOOPX_TMP_DIR;
-  const repoRoot = path.resolve(__dirname, '../../..');
-  return override ? path.resolve(override) : path.join(repoRoot, '.loopx/tmp');
-}
-
-// 唯一临时工件路径：<tmpDir>/<prefix>-<pid>-<rand>.json，保证并行进程零覆写。
-function allocateTempArtifactPath(prefix = 'change-quality-agent-result', ext = 'json') {
-  const tmpDir = resolveTmpDir();
-  fs.mkdirSync(tmpDir, { recursive: true });
-  return path.join(tmpDir, `${prefix}-${process.pid}-${crypto.randomBytes(6).toString('hex')}.${ext}`);
-}
+const { execFileSync, spawnSync } = require('child_process');
+const {
+  resolveRepoRoot,
+  resolveTmpDir,
+  allocateTempArtifactPath,
+  createRunDir,
+  discoverBaseRef,
+  resolveLoopxExecutable,
+  sanitizeEvidenceText,
+} = require('../../../lib/paths');
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -79,7 +55,10 @@ function parseArgs() {
   // Infer feature from git branch if omitted
   if (!options.feature) {
     try {
-      const branch = execSync('git rev-parse --abbrev-ref HEAD 2>/dev/null', { encoding: 'utf8' }).trim();
+      const branch = execFileSync('git', ['-C', resolveRepoRoot(process.cwd()), 'rev-parse', '--abbrev-ref', 'HEAD'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
       if (branch.startsWith('feature/')) {
         options.feature = branch.replace('feature/', '');
       }
@@ -97,15 +76,15 @@ function parseArgs() {
   return options;
 }
 
-function resolveExactScope(goalId, baseRef) {
+function resolveExactScope(goalId, baseRef, repoRoot, loopxBin) {
   // Authoritative exact-scope resolution via LoopX prepare packet.
   // 必须把解析出的真实基线传给原生命令，否则 loopx 默认值 origin/main 会在 master 主干仓库
   // 以 `fatal: Needed a single rev` 失败（GitHub Issue #13）。
   try {
-    const prep = spawnSync('loopx', [
+    const prep = spawnSync(loopxBin || 'loopx', [
       'change-quality', 'prepare',
       '--goal-id', goalId,
-      '--repo-path', '.',
+      '--repo-path', repoRoot || resolveRepoRoot(process.cwd()),
       '--base-ref', baseRef,
       '--format', 'json'
     ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -140,12 +119,13 @@ function qualificationDiagnostic(goalId, scope) {
   return true;
 }
 
-function getScopeDiff(baseCommit) {
+function getScopeDiff(baseCommit, repoRoot) {
+  const root = repoRoot || resolveRepoRoot(process.cwd());
   try {
     if (baseCommit) {
-      return execSync(`git diff ${baseCommit}`, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      return execFileSync('git', ['-C', root, 'diff', baseCommit], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     }
-    return execSync('git diff HEAD', { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    return execFileSync('git', ['-C', root, 'diff', 'HEAD'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   } catch (_) {
     return '';
   }
@@ -180,10 +160,11 @@ function isRuntimeArtifact(relPath) {
 
 // 仅取「已提交」的 exact-scope 变更文件（<base-ref>...HEAD），并过滤运行时工件。
 // 与 getScopeDiff() 的差别：后者含工作区改动，会把锁文件/反向前进的分支基线算进证据。
-function committedScopeFiles(baseCommit) {
+function committedScopeFiles(baseCommit, repoRoot) {
   if (!baseCommit) return [];
+  const root = repoRoot || resolveRepoRoot(process.cwd());
   try {
-    const out = execSync(`git diff --name-only ${baseCommit}...HEAD`, {
+    const out = execFileSync('git', ['-C', root, 'diff', '--name-only', `${baseCommit}...HEAD`], {
       encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
     });
     return out.split('\n').map((line) => line.trim()).filter(Boolean).filter((f) => !isRuntimeArtifact(f));
@@ -384,23 +365,27 @@ ${gateRows}
 }
 
 // 仅在 feature 胶囊目录存在时写 05-evidence（与既有 fail-closed 行为一致）。
-function writeEvidence(opts, content) {
-  const evidencePath = path.resolve(process.cwd(), `specs/features/${opts.feature}/05-evidence.md`);
+function writeEvidence(opts, content, repoRoot) {
+  const root = repoRoot || resolveRepoRoot(process.cwd());
+  const evidencePath = path.join(root, 'specs', 'features', opts.feature, '05-evidence.md');
   if (!fs.existsSync(path.dirname(evidencePath))) {
     return '';
   }
-  fs.writeFileSync(evidencePath, content, 'utf8');
+  fs.writeFileSync(evidencePath, sanitizeEvidenceText(content, { repoRoot: root }), 'utf8');
   return evidencePath;
 }
 
 function main() {
   const opts = parseArgs();
+  const repoRoot = resolveRepoRoot(process.cwd());
+  const resolvedLoopx = resolveLoopxExecutable(process.env);
+  const loopxBin = resolvedLoopx.ok ? resolvedLoopx.bin : '';
   console.log(`[LoopX Quality Ingestion] Processing for feature: ${opts.feature || 'default'}, goal: ${opts.goalId || 'default'}`);
 
   // 0. 解析真实远程默认基线（GitHub Issue #13）；显式 --base-ref 优先。
   let baseRef;
   try {
-    baseRef = opts.baseRef || discoverBaseRef(process.cwd());
+    baseRef = opts.baseRef || discoverBaseRef(repoRoot);
   } catch (err) {
     console.error(`[BLOCKED] ${err.message}`);
     process.exit(1);
@@ -413,13 +398,13 @@ function main() {
   let warningCount = 0;
 
   // 0.1 Resolve LoopX authoritative exact-scope (fingerprint + base) when goal is bound
-  const scope = opts.goalId ? resolveExactScope(opts.goalId, baseRef) : null;
+  const scope = (opts.goalId && loopxBin) ? resolveExactScope(opts.goalId, baseRef, repoRoot, loopxBin) : null;
   if (scope) {
     console.log(`[✓] Exact-scope resolved: fingerprint=${scope.fingerprint.slice(0, 12)}... base=${scope.baseRef}@${scope.baseCommit.slice(0, 10)}`);
   }
   // 资格未启用时前置 fail-closed，不必等到 record 阶段才失败。
   if (qualificationDiagnostic(opts.goalId, scope)) process.exit(1);
-  const scopeDiff = getScopeDiff(scope && scope.baseCommit);
+  const scopeDiff = getScopeDiff(scope && scope.baseCommit, repoRoot);
   const evidenceRel = opts.feature ? `specs/features/${opts.feature}/05-evidence.md` : '';
   const hashedDiff = diffExcludingEvidence(scopeDiff, evidenceRel);
   const diffSha256 = crypto.createHash('sha256').update(hashedDiff || 'clean').digest('hex');
@@ -517,7 +502,7 @@ function main() {
       console.warn(`[!] ${gateSnapshot.error}；四门禁按 not_run 处理。`);
     }
     if (opts.feature) {
-      const nonPassingEvidence = writeEvidence(opts, buildEvidenceContent(evidenceContext));
+      const nonPassingEvidence = writeEvidence(opts, buildEvidenceContent(evidenceContext), repoRoot);
       if (nonPassingEvidence) {
         console.warn(`[!] 已写入非全绿证据: ${nonPassingEvidence}`);
       }
@@ -546,7 +531,7 @@ function main() {
     : [`path:package.json`];
   // 证据 refs 必须落在「已提交 exact scope」内；工作区 diff 里的运行时锁文件与
   // 落后基线的反向改动都在此被过滤（否则 record 会 fail-closed）。
-  const committedFiles = scope && scope.baseCommit ? committedScopeFiles(scope.baseCommit) : [];
+  const committedFiles = scope && scope.baseCommit ? committedScopeFiles(scope.baseCommit, repoRoot) : [];
   const groundedRefs = committedFiles.length > 0
     ? committedFiles.slice(0, 3).map(f => `path:${f}`)
     : (changedFiles.length > 0
@@ -575,12 +560,8 @@ function main() {
     qualityResult.scope_fingerprint = scope.fingerprint;
   }
 
-  const tempResultPath = allocateTempArtifactPath();
-  // 注意：process.exit() 不会展开 finally 块，因此用 exit 钩子保证沙箱临时工件
-  // 在成功/失败/异常等所有退出路径上都被清理（record/verify 期间文件必须存活）。
-  process.on('exit', () => {
-    try { fs.rmSync(tempResultPath, { force: true }); } catch (_) {}
-  });
+  const runDir = createRunDir('change-quality', repoRoot);
+  const tempResultPath = runDir.file('agent-result.json');
   fs.writeFileSync(tempResultPath, JSON.stringify(qualityResult, null, 2));
   console.log(`[✓] Generated standardized quality payload: ${tempResultPath}`);
 
@@ -588,7 +569,7 @@ function main() {
   //    Order matters: any file write after record/verify would drift the
   //    exact-scope fingerprint and break the strict verification gate.
   if (opts.feature) {
-    const evidencePath = writeEvidence(opts, buildEvidenceContent(evidenceContext));
+    const evidencePath = writeEvidence(opts, buildEvidenceContent(evidenceContext), repoRoot);
     if (evidencePath) {
       console.log(`[✓] Synced quality evidence to: ${evidencePath}`);
     }
@@ -600,10 +581,9 @@ function main() {
   let receiptVerified = false;
   let loopxError = '';
 
-  const hasLoopX = spawnSync('which', ['loopx'], { encoding: 'utf8' }).status === 0;
-  if (hasLoopX && opts.goalId) {
+  if (loopxBin && opts.goalId) {
     try {
-      const finalScope = resolveExactScope(opts.goalId, baseRef);
+      const finalScope = resolveExactScope(opts.goalId, baseRef, repoRoot, loopxBin);
       if (finalScope && (!scope || finalScope.fingerprint !== scope.fingerprint)) {
         qualityResult.scope_fingerprint = finalScope.fingerprint;
         fs.writeFileSync(tempResultPath, JSON.stringify(qualityResult, null, 2));
@@ -611,10 +591,10 @@ function main() {
       }
 
       console.log(`==> [LoopX] Recording receipt into goal: ${opts.goalId}...`);
-      const rec = spawnSync('loopx', [
+      const rec = spawnSync(loopxBin, [
         'change-quality', 'record',
         '--goal-id', opts.goalId,
-        '--repo-path', '.',
+        '--repo-path', repoRoot,
         '--base-ref', baseRef,
         '--result-json', tempResultPath,
         '--execute',
@@ -631,10 +611,10 @@ function main() {
       }
 
       console.log(`==> [LoopX] Verifying receipt...`);
-      const ver = spawnSync('loopx', [
+      const ver = spawnSync(loopxBin, [
         'change-quality', 'verify',
         '--goal-id', opts.goalId,
-        '--repo-path', '.',
+        '--repo-path', repoRoot,
         '--base-ref', baseRef,
         '--format', 'json'
       ], { encoding: 'utf8' });

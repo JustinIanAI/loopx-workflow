@@ -5,20 +5,20 @@
 # ==============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../../lib/paths.sh
+source "$SCRIPT_DIR/../../lib/paths.sh"
+wf_init_paths
 
-BASE_REF="${1:-origin/main}"
+BASE_REF="${1:-}"
+if [[ -z "$BASE_REF" ]]; then
+    BASE_REF="$(wf_discover_base_ref "$EFFECTIVE_ROOT" || echo "origin/main")"
+fi
 FEATURE="${2:-}"
 GATE_RESULTS_FILE="${3:-}"
 
-# 项目本地临时沙箱（issue #8）：临时工件禁止硬编码系统 /tmp 固定文件名；
-# 默认写入项目内已 gitignore 的 .loopx/tmp/，文件名带 PID 保证多进程零覆写。
-# LOOPX_TMP_DIR 可覆盖沙箱目录（CI/隔离测试）。
-LOOPX_TMP_DIR="${LOOPX_TMP_DIR:-$PROJECT_ROOT/.loopx/tmp}"
-mkdir -p "$LOOPX_TMP_DIR"
-OUTPUT_JSON="$LOOPX_TMP_DIR/ocr-audit-report-$$.json"
-trap 'rm -f "$OUTPUT_JSON"' EXIT
+wf_run_dir ocr
+OUTPUT_JSON="$WF_RUN_DIR/ocr-audit-report.json"
 
 echo "==> [OCR 选配闭环] [1/3] 执行环境自检 (Self-Check)..."
 export PATH="$PATH:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin"
@@ -32,18 +32,18 @@ if ! command -v ocr >/dev/null 2>&1; then
         exit 1
     fi
 else
-    echo "    [✓] 阿里 OCR CLI 已就绪: $(which ocr)"
+    echo "    [✓] 阿里 OCR CLI 已就绪: $(command -v ocr)"
 fi
 
 echo "==> [OCR 选配闭环] [2/3] 执行深度代码审查扫描 (from $BASE_REF to HEAD)..."
-ocr review --audience agent --repo "$PROJECT_ROOT" --from "$BASE_REF" --to HEAD --format json --output "$OUTPUT_JSON" || true
+ocr review --audience agent --repo "$EFFECTIVE_ROOT" --from "$BASE_REF" --to HEAD --format json --output "$OUTPUT_JSON" || true
 
 if [[ ! -f "$OUTPUT_JSON" ]]; then
     echo "{\"comments\": []}" > "$OUTPUT_JSON"
 fi
 
 echo "==> [OCR 选配闭环] [3/3] 将 OCR 审查结果送入 LoopX 代码质量契约适配器..."
-node "$PROJECT_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" \
+node "$WORKFLOW_ROOT/skills/code-review/scripts/ingest-to-loopx-quality.js" \
   --ocr-json "$OUTPUT_JSON" \
   --base-ref "$BASE_REF" \
   ${GATE_RESULTS_FILE:+--gate-results "$GATE_RESULTS_FILE"} \
