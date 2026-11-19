@@ -59,3 +59,26 @@ specs/features/cq-isolated-*/
 # Multica runtime-injected agent instructions (not product source)
 CODEBUDDY.md
 .codebuddy/
+
+# 凭据（本地密钥严禁入库）
+.env
+.env.*
+
+# 主流 AI 助手项目目录（本地工具链状态）
+.claude/
+.cursor/
+
+# 审计产物（相对路径落仓库根场景）
+l1-review-evidence.md
+ocr-audit-report.json
+
+# 测试产出（预防项：Playwright / Puppeteer 等）
+test-results/
+playwright-report/
+
+# LoopX 运行时：global registry 变体 + inbox 消息队列 + e2e 演示残留状态
+.loopx/registry.global.json
+.loopx/inbox/
+.loopx/goal-channel.json
+.loopx/goal-channel.*.json
+.loopx/lark-kanban.json

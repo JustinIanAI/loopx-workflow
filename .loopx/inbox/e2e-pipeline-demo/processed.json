@@ -1,8 +1,0 @@
-{
-  "schema_version": "lark_event_inbox_processed_v0",
-  "message_ids": [
-    "om_x100b61740f4378a8df815c8f36eafaa",
-    "om_x100b617462134480c061c2ff20a5095"
-  ],
-  "last_processed_at": "2026-10-30T02:43:35.109463+00:00"
-}
