@@ -728,4 +728,50 @@ test('ADR-0013 schema hardening: coerces string arrays on problem_context/archit
   assert.match(stage2Prompt, /evidence-ok/);
   assert.match(stage2Prompt, /严禁输出空数组/);
   assert.doesNotMatch(stage2Prompt, /\+new evidence line/);
+
+  // Array test_path in validation_matrix is executed when all elements are valid repo test files
+  const arrRan = [];
+  const arrEv = build({
+    modelEvidence: {
+      validation_matrix: {
+        changed_invariant_positive: {
+          test_path: [
+            'tests/unit/authentic-review-evidence.test.js',
+            'tests/unit/authentic-review-pipeline.test.js',
+          ],
+        },
+      },
+    },
+    runNodeTest: (relPath) => {
+      arrRan.push(relPath);
+      return { status: 0, stdout: 'ok', stderr: '' };
+    },
+  });
+  assert.deepStrictEqual(arrRan, [
+    'tests/unit/authentic-review-evidence.test.js',
+    'tests/unit/authentic-review-pipeline.test.js',
+  ]);
+  const arrPos = arrEv.validation_matrix.items.find(i => i.case_id === 'changed_invariant_positive');
+  assert.strictEqual(arrPos.status, 'passed');
+
+  // Reject whole array if any path tries to escape repo
+  const badRan = [];
+  const badEv = build({
+    modelEvidence: {
+      validation_matrix: {
+        changed_invariant_positive: {
+          test_path: [
+            'tests/unit/authentic-review-evidence.test.js',
+            '../outside.test.js',
+          ],
+        },
+      },
+    },
+    runNodeTest: (relPath) => {
+      badRan.push(relPath);
+      return { status: 0, stdout: 'ok', stderr: '' };
+    },
+  });
+  assert.deepStrictEqual(badRan, []);
+  assert.strictEqual(badEv.validation_matrix.items.find(i => i.case_id === 'changed_invariant_positive').status, 'unverified');
 });

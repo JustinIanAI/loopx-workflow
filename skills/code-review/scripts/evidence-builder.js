@@ -176,9 +176,31 @@ function defaultRunNodeTest(relPath, cwd) {
   return spawnSync(process.execPath, ['--test', relPath], { cwd, env: isolatedNodeTestEnv(process.env), encoding: 'utf8', timeout: 120000 });
 }
 
+function resolveRepoTestPaths(candidate, repoRoot) {
+  let arr = null;
+  if (Array.isArray(candidate)) {
+    arr = candidate;
+  } else if (isPlainObject(candidate)) {
+    const field = candidate.test_path ?? candidate.path ?? candidate.file ?? candidate.command_or_check;
+    if (Array.isArray(field)) arr = field;
+  }
+  if (arr) {
+    if (!arr.length) return null;
+    const list = [];
+    for (const item of arr) {
+      const r = resolveRepoTestPath(item, repoRoot);
+      if (!r) return null;
+      list.push(r);
+    }
+    return list;
+  }
+  const single = resolveRepoTestPath(candidate, repoRoot);
+  return single ? [single] : null;
+}
+
 function buildInvariantRow(caseId, label, candidate, opts = {}) {
-  const resolved = resolveRepoTestPath(candidate, opts.repoRoot);
-  if (!resolved) {
+  const resolvedList = resolveRepoTestPaths(candidate, opts.repoRoot);
+  if (!resolvedList || !resolvedList.length) {
     return {
       case_id: caseId,
       invariant_or_case: label,
@@ -189,34 +211,37 @@ function buildInvariantRow(caseId, label, candidate, opts = {}) {
       skip_or_failure_reason: 'unverified: npm run test passing does not prove this invariant',
     };
   }
-  const cmd = `node --test ${resolved.rel}`;
   const runner = typeof opts.runNodeTest === 'function'
     ? opts.runNodeTest
     : defaultRunNodeTest;
-  const res = runner(resolved.rel, resolved.root);
-  const exitCode = res && typeof res.status === 'number' ? res.status : 1;
-  if (exitCode === 0) {
-    return {
-      case_id: caseId,
-      invariant_or_case: label,
-      command_or_check: cmd,
-      exit_code: 0,
-      status: 'passed',
-      result: `${cmd} (exit 0)`,
-      required: true,
-      skip_or_failure_reason: 'not applicable: command passed',
-    };
+  for (const resolved of resolvedList) {
+    const res = runner(resolved.rel, resolved.root);
+    const exitCode = res && typeof res.status === 'number' ? res.status : 1;
+    if (exitCode !== 0) {
+      const failCmd = `node --test ${resolved.rel}`;
+      return {
+        case_id: caseId,
+        invariant_or_case: label,
+        command_or_check: failCmd,
+        exit_code: exitCode,
+        status: 'failed',
+        result: `${failCmd} failed (exit ${exitCode})`,
+        required: true,
+        skip_or_failure_reason: `${failCmd} exited with code ${exitCode}`,
+        failure_attribution: buildUnresolvedAttribution(failCmd, exitCode, opts.headOid, label),
+      };
+    }
   }
+  const cmd = `node --test ${resolvedList.map(r => r.rel).join(' ')}`;
   return {
     case_id: caseId,
     invariant_or_case: label,
     command_or_check: cmd,
-    exit_code: exitCode,
-    status: 'failed',
-    result: `${cmd} failed (exit ${exitCode})`,
+    exit_code: 0,
+    status: 'passed',
+    result: `${cmd} (exit 0)`,
     required: true,
-    skip_or_failure_reason: `${cmd} exited with code ${exitCode}`,
-    failure_attribution: buildUnresolvedAttribution(cmd, exitCode, opts.headOid, label),
+    skip_or_failure_reason: 'not applicable: command passed',
   };
 }
 

@@ -893,7 +893,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ].join('\n');
 }
 
-function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, missingIds, evidenceContract, reviewPlan, evidenceText, validation }) {
+function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, missingIds, missingValidationCases, evidenceContract, reviewPlan, evidenceText, validation }) {
   const files = listFiles(diff || '');
   const st = diffStats(diff || '');
   const filteredPlan = {
@@ -907,6 +907,7 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
     ? validation.map(v => `- \`${v.case_id}\`: status=${v.status}; cmd=\`${v.command_or_check || ''}\`; result=${v.result || ''}`).join('\n')
     : '(无)';
   const evText = String(evidenceText || '').trim().slice(0, 8000);
+  const valCases = Array.isArray(missingValidationCases) ? missingValidationCases : [];
 
   return [
     '你是一名证据结构化对齐助手（ADR-0013 阶段 2）。请仅根据下方已经完成的阶段 1 五段式评审报告、文件改动清单和证据契约，补齐缺失的结构化判断类 `evidence` JSON。',
@@ -927,6 +928,12 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
     '## 待补齐的证据项契约',
     reqText || '(无)',
     '',
+    ...(valCases.length ? [
+      '## 待补齐的 validation_matrix 不变量测试路径',
+      `- 尚未指定仓库内测试文件的 case_id: ${valCases.join(', ')}`,
+      '- 请根据下方阶段 1 评审报告及本次改动文件列表，在 `evidence.validation_matrix` 中补充仓库内已存在的 `tests/**/*.test.js` 文件路径（例如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），主机将在阶段 2 后直接执行 `node --test <path>` 实测核验。',
+      '',
+    ] : []),
     '## 阶段 1 已产出的评审报告正文',
     String(reviewBody || ''),
     '',
@@ -1454,7 +1461,12 @@ function main() {
   const unverifiedForStage2 = Object.entries(autoEvidence)
     .filter(([k, v]) => k !== 'validation_matrix' && v && v.status === 'unverified')
     .map(([k]) => k);
-  if (verdict === 'APPROVE' && unverifiedForStage2.length > 0 && process.env.REVIEW_TWO_STAGE_ALIGNMENT !== '0') {
+  const unverifiedValidationCases = (autoEvidence.validation_matrix && Array.isArray(autoEvidence.validation_matrix.items))
+    ? autoEvidence.validation_matrix.items
+        .filter(it => it && (it.case_id === 'changed_invariant_positive' || it.case_id === 'material_negative_or_failure') && it.status === 'unverified')
+        .map(it => it.case_id)
+    : [];
+  if (verdict === 'APPROVE' && (unverifiedForStage2.length > 0 || unverifiedValidationCases.length > 0) && process.env.REVIEW_TWO_STAGE_ALIGNMENT !== '0') {
     const stage2Prompt = buildStage2Prompt({
       pr: o.pr,
       headOid,
@@ -1463,13 +1475,14 @@ function main() {
       reviewBody: modelOut.review_body,
       diff,
       missingIds: unverifiedForStage2,
+      missingValidationCases: unverifiedValidationCases,
       evidenceContract: pkt.evidenceContract || {},
       reviewPlan: pkt.reviewPlan || {},
       evidenceText,
       validation,
     });
     const stage2PromptFile = writePromptArtifact(o.pr, headOid, stage2Prompt, 'stage2');
-    console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length} 项): ${stage2PromptFile}`);
+    console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length + unverifiedValidationCases.length} 项): ${stage2PromptFile}`);
     const stage2Run = runReviewAgent(primaryAgent, stage2Prompt);
     if (process.env.REVIEW_KEEP_PROMPT !== '1') {
       try { fs.rmSync(stage2PromptFile, { force: true }); } catch (_) {}
@@ -1485,6 +1498,20 @@ function main() {
           if (stage2Evidence[id] && typeof stage2Evidence[id] === 'object') {
             nextInput[id] = stage2Evidence[id];
           }
+        }
+        if (unverifiedValidationCases.length && stage2Evidence.validation_matrix && typeof stage2Evidence.validation_matrix === 'object') {
+          const prevVm = nextInput.validation_matrix && typeof nextInput.validation_matrix === 'object'
+            ? { ...nextInput.validation_matrix }
+            : {};
+          for (const cid of unverifiedValidationCases) {
+            if (stage2Evidence.validation_matrix[cid] !== undefined) {
+              prevVm[cid] = stage2Evidence.validation_matrix[cid];
+            } else if (Array.isArray(stage2Evidence.validation_matrix.items)) {
+              const found = stage2Evidence.validation_matrix.items.find(it => it && it.case_id === cid);
+              if (found) prevVm[cid] = found;
+            }
+          }
+          nextInput.validation_matrix = prevVm;
         }
         mergedModelEvidence = nextInput;
         autoEvidence = buildEvidenceGraph({
