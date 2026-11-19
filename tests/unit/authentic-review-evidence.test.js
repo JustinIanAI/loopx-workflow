@@ -622,3 +622,110 @@ test('buildNativePrompt includes nested evidence specs, remote checks, and capVe
   assert.match(capped, /Request changes conclusion \(author-owned PR/);
   assert.match(capped, /^English verdict:\s*REQUEST_CHANGES\s*$/m);
 });
+
+test('ADR-0013 schema hardening: coerces string arrays on problem_context/architecture_assessment and rejects disallowed not_applicable', () => {
+  const naDisallowedContract = {
+    evidence_requirements: [
+      ...CONTRACT.evidence_requirements,
+      {
+        evidence_id: 'observable_semantics',
+        fields: ['baseline_revision', 'reviewed_head', 'caller_branch_inventory', 'comparison_rows', 'execution_receipts', 'normalization_rules', 'intentional_deltas', 'regression_sensitivity', 'state_projection_counterfactuals', 'scope_coverage', 'decision_text_assessment', 'unverified_dimensions', 'verdict'],
+        verdict_values: ['equivalent', 'intentional_change_validated', 'unintended_drift', 'not_yet_proven'],
+      },
+    ],
+  };
+  const ev = buildEvidenceGraph({
+    contract: naDisallowedContract,
+    plan: {
+      required_evidence_ids: ['problem_context', 'change_proportionality', 'observable_semantics'],
+    },
+    diff: DIFF,
+    headOid: 'a'.repeat(40),
+    pr: 36,
+    motivation: 'm',
+    validation: [],
+    modelEvidence: {
+      problem_context: {
+        status: 'verified',
+        verdict: 'goal_achieved',
+        goal_basis: 'gb',
+        author_claim: 'ac',
+        old_behavior: 'ob',
+        affected_caller_or_operator: ['reviewer', 'maintainer'],
+        compounding_cost: 'cc',
+        before_after_scenario: 'ba',
+        smaller_fix_analysis: 'sfa',
+        observable_outcome: 'oo',
+        non_goals: ['no python core change', 'no UI change'],
+        outcome_impact: {
+          long_horizon: { decision: 'improved', reason: 'r' },
+          user_experience: { decision: 'improved', reason: 'r', visual_review: { decision: 'not_applicable', reason: 'CLI only' } },
+        },
+        spec_basis: { decision: 'no_spec', spec_source: 'none', reason: 'r' },
+      },
+      change_proportionality: {
+        status: 'verified',
+        verdict: 'proportionate',
+        original_problem: 'op',
+        frequency_or_severity: 'fs',
+        affected_users_or_operators: 'auo',
+        failure_cost_and_recovery: 'fcr',
+        smallest_viable_fix: 'svf',
+        production_mechanism_cost: 'pmc',
+        new_state_contract_or_cli_surface: 'nsc',
+        maintenance_and_migration_cost: 'mmc',
+        alternatives_considered: 'alt',
+        scope_growth_since_initial_review: 'sg',
+        repository_architecture_constraints: 'rac',
+        strongest_case_against_shipping: 'scas',
+        why_smaller_or_existing_owner_is_insufficient: 'wse',
+        architecture_assessment: {
+          decision: 'retain',
+          reason: 'clean boundary',
+          current_pr_boundary: ['skills/code-review/', 'tests/unit/'],
+          validation_evidence: ['tests/unit/a.test.js', 'tests/unit/b.test.js'],
+          mechanisms: [
+            {
+              mechanism: 'stdin streaming',
+              responsibility: 'provider_io',
+              owning_boundary: 'authentic-review.js',
+              activation_and_default: 'always on',
+              failure_and_recovery: 'non-zero exit',
+              placement_basis: 'ADR-0013',
+            },
+          ],
+        },
+      },
+      observable_semantics: {
+        status: 'not_applicable',
+        reason: 'must not bypass verdict_values without not_applicable',
+      },
+    },
+  });
+  assert.strictEqual(ev.problem_context.status, 'verified');
+  assert.strictEqual(ev.problem_context.non_goals, 'no python core change；no UI change');
+  assert.strictEqual(ev.problem_context.affected_caller_or_operator, 'reviewer；maintainer');
+  assert.strictEqual(ev.change_proportionality.status, 'verified');
+  assert.strictEqual(ev.change_proportionality.architecture_assessment.current_pr_boundary, 'skills/code-review/；tests/unit/');
+  assert.strictEqual(ev.change_proportionality.architecture_assessment.validation_evidence, 'tests/unit/a.test.js；tests/unit/b.test.js');
+  assert.deepStrictEqual(ev.observable_semantics, { status: 'unverified' });
+
+  const stage2Prompt = buildStage2Prompt({
+    pr: 36,
+    headOid: 'a'.repeat(40),
+    branch: 'refactor/adr-0013',
+    baseRef: 'main',
+    reviewBody: '## 动机\n报告正文',
+    diff: DIFF,
+    missingIds: ['observable_semantics'],
+    evidenceContract: naDisallowedContract,
+    reviewPlan: { required_evidence_ids: ['observable_semantics'], target: { base_ref: 'main' } },
+    evidenceText: '### `echo evidence-ok`\n```\nevidence-ok\n```',
+    validation: [{ case_id: 'test', status: 'passed', command_or_check: 'npm run test', result: 'ok' }],
+  });
+  assert.match(stage2Prompt, /基准 `main`/);
+  assert.match(stage2Prompt, /npm run test/);
+  assert.match(stage2Prompt, /evidence-ok/);
+  assert.match(stage2Prompt, /严禁输出空数组/);
+  assert.doesNotMatch(stage2Prompt, /\+new evidence line/);
+});

@@ -754,7 +754,7 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
     }
     if (r.architecture_assessment) {
       const aa = r.architecture_assessment;
-      lines.push(`  - architecture_assessment (object): {${(aa.fields || []).join(', ')}}; decision_values=${(aa.decision_values || []).join('|')}; when decision!="not_applicable" also require [${(aa.applicable_fields || []).join(', ')}] with mechanisms=[{${(aa.mechanism_fields || []).join(', ')}}] (responsibility=${(aa.responsibility_values || []).join('|')})`);
+      lines.push(`  - architecture_assessment (object): {${(aa.fields || []).join(', ')}}; decision_values=${(aa.decision_values || []).join('|')}; when decision!="not_applicable" also require [${(aa.applicable_fields || []).join(', ')}] (current_pr_boundary & validation_evidence MUST be non-empty strings, NOT arrays) with mechanisms=[{${(aa.mechanism_fields || []).join(', ')}}] (all strings; responsibility=${(aa.responsibility_values || []).join('|')})`);
     }
     if (r.scope_coverage) {
       const sc = r.scope_coverage;
@@ -766,6 +766,9 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
         ? Object.entries(dt.fields_by_verdict).map(([k, v]) => `${k}=[${(v || []).join(', ')}]`).join('; ')
         : '';
       lines.push(`  - decision_text_assessment (object): {${(dt.fields || []).join(', ')}}; verdict_values=${(dt.verdict_values || []).join('|')}${dtByVerdict ? `; fields_by_verdict: ${dtByVerdict}` : ''}; when verdict!="not_applicable" also require [${(dt.applicable_fields || []).join(', ')}] (clause_fields=[${(dt.clause_fields || []).join(', ')}], counterfactual_fields=[${(dt.counterfactual_fields || []).join(', ')}])`);
+    }
+    if (r.state_projection_counterfactuals && Array.isArray(r.state_projection_counterfactuals.cases)) {
+      lines.push(`  - state_projection_counterfactuals (non-empty array/string/object): cases=[${r.state_projection_counterfactuals.cases.join(', ')}] (or "not_applicable: <reason>" when no state projection drives behavior)`);
     }
     if (r.state_model_assessment) {
       lines.push(`  - state_model_assessment (object): classification_values=${(r.state_model_assessment.classification_values || []).join('|')}; item_fields=[${(r.state_model_assessment.item_fields || []).join(', ')}] (or {classification, reason} when no new state)`);
@@ -890,7 +893,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ].join('\n');
 }
 
-function buildStage2Prompt({ pr, headOid, branch, reviewBody, diff, missingIds, evidenceContract, reviewPlan }) {
+function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, missingIds, evidenceContract, reviewPlan, evidenceText, validation }) {
   const files = listFiles(diff || '');
   const st = diffStats(diff || '');
   const filteredPlan = {
@@ -899,15 +902,28 @@ function buildStage2Prompt({ pr, headOid, branch, reviewBody, diff, missingIds, 
   };
   const reqText = formatEvidenceRequirementsForPrompt(evidenceContract, filteredPlan);
   const head10 = String(headOid || '').slice(0, 10);
+  const effectiveBase = baseRef || (reviewPlan && reviewPlan.target && reviewPlan.target.base_ref) || 'main';
+  const validationSummary = Array.isArray(validation) && validation.length
+    ? validation.map(v => `- \`${v.case_id}\`: status=${v.status}; cmd=\`${v.command_or_check || ''}\`; result=${v.result || ''}`).join('\n')
+    : '(无)';
+  const evText = String(evidenceText || '').trim().slice(0, 8000);
 
   return [
     '你是一名证据结构化对齐助手（ADR-0013 阶段 2）。请仅根据下方已经完成的阶段 1 五段式评审报告、文件改动清单和证据契约，补齐缺失的结构化判断类 `evidence` JSON。',
     '约束：对已由阶段 1 报告和文件清单核实的项，必须输出 `"status": "verified"` 并填全契约列出的全部 `fields`、`verdict`（取自 `verdict_values`）与嵌套子对象；若某项不适用（如无特性开关的 `default_off_isolation`、无领域措辞变更的 `domain_neutrality`、无权限模型变更的 `authority_semantics`、无状态分类规则变更的 `typed_state_rule`、无默认行为变更的 `behavior_change_disclosure`、无建议/义务边界变更的 `guidance_vs_obligation`、无术语契约变更的 `semantic_alignment`），请直接输出 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若报告中缺乏足够依据，则保留 `"status": "unverified"`。',
+    '类型与非空硬性规范（LoopX result_check.py 校验规则）：',
+    '1. 严禁输出空数组 `[]` 或空对象 `{}`（会被判定为缺失）：例如无未核实维度时 `unverified_dimensions` 写 `["none: all applicable dimensions verified"]`，无变更时 `intentional_deltas` / `normalization_rules` 写 `["none: ..."]` 或 `"none: ..."`。',
+    '2. `problem_context` 的 `affected_caller_or_operator` / `before_after_scenario` / `observable_outcome` / `non_goals` / `remaining_gap` 以及 `architecture_assessment` 的 `reason` / `current_pr_boundary` / `validation_evidence` / `mechanisms[*].*` 必须是**字符串**（不得输出数组）。',
+    '3. `observable_semantics` 顶层不允许 `not_applicable`（`verdict_values=equivalent|intentional_change_validated|unintended_drift|not_yet_proven`），请结合基准分支、精确 head、阶段 1 报告与下方校验实测填全全部 13 个 `fields`（仅其内部嵌套的 `scope_coverage` / `decision_text_assessment` 在确实无门控范围或决策文本语义变化时可使用 `not_applicable`）。',
     '执行铁律：直接输出单一 fenced json 块 `{"evidence": { ... }}`，严禁调用任何 shell / 文件读取工具。',
     '',
-    `- PR: #${pr} · 分支 \`${branch}\` · 精确 head \`${head10}\` (\`${headOid}\`)`,
+    `- PR: #${pr} · 基准 \`${effectiveBase}\` · 分支 \`${branch}\` · 精确 head \`${head10}\` (\`${headOid}\`)`,
     `- 改动文件列表（共 ${files.length} 个文件，+${st.additions}/-${st.deletions}）：${files.join(', ') || '(无)'}`,
     '',
+    '## 主机本地校验与门禁摘要',
+    validationSummary,
+    '',
+    ...(evText ? ['## 证据采集命令输出摘要', evText, ''] : []),
     '## 待补齐的证据项契约',
     reqText || '(无)',
     '',
@@ -1443,11 +1459,14 @@ function main() {
       pr: o.pr,
       headOid,
       branch: head.headRefName,
+      baseRef: (pkt.reviewPlan && pkt.reviewPlan.target && pkt.reviewPlan.target.base_ref) || 'main',
       reviewBody: modelOut.review_body,
       diff,
       missingIds: unverifiedForStage2,
       evidenceContract: pkt.evidenceContract || {},
       reviewPlan: pkt.reviewPlan || {},
+      evidenceText,
+      validation,
     });
     const stage2PromptFile = writePromptArtifact(o.pr, headOid, stage2Prompt, 'stage2');
     console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length} 项): ${stage2PromptFile}`);
@@ -1490,7 +1509,7 @@ function main() {
     reviewBody = reviewBody.replace(/(##\s*改动思路[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 架构边界：${archAssessment.reason}`);
   }
   if (archAssessment && archAssessment.current_pr_boundary && !reviewBody.includes(archAssessment.current_pr_boundary)) {
-    reviewBody = reviewBody.replace(/(##\s*我的整体评价[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 当前 PR 边界：${archAssessment.current_pr_boundary}`);
+    reviewBody = reviewBody.replace(/(##\s*我的整体评价[\s\S]*?)(?=\n##\s|\nEnglish verdict:|$)/, (m) => `${m}\n\n> 当前 PR 边界：${archAssessment.current_pr_boundary}`);
   }
   const walkthrough = assertKeyCodeWalkthrough(reviewBody, pkt.behaviorBearing);
   if (!walkthrough.pass) {

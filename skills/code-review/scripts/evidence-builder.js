@@ -463,10 +463,88 @@ function extractNotApplicableReason(modelRow) {
 function isNotApplicableDeclaration(id, modelRow, req) {
   if (!isPlainObject(modelRow)) return false;
   if (id === 'problem_context' || id === 'walkthroughs') return false;
+  if (Array.isArray(req && req.verdict_values) && req.verdict_values.length && !req.verdict_values.includes('not_applicable')) {
+    return false;
+  }
   const hasNaTag = modelRow.status === 'not_applicable'
     || (modelRow.verdict === 'not_applicable' && (!Array.isArray(req.verdict_values) || req.verdict_values.includes('not_applicable')));
   if (!hasNaTag) return false;
   return Boolean(extractNotApplicableReason(modelRow));
+}
+
+function coerceScalarText(val) {
+  if (typeof val === 'string') return val;
+  if (Array.isArray(val) && val.length && val.every(item => typeof item === 'string')) {
+    const joined = val.map(s => s.trim()).filter(Boolean).join('；');
+    if (joined) return joined;
+  }
+  return val;
+}
+
+function isNonEmptyString(val) {
+  return typeof val === 'string' && val.trim().length > 0;
+}
+
+const PROBLEM_CONTEXT_TEXT_FIELDS = [
+  'goal_basis',
+  'author_claim',
+  'old_behavior',
+  'affected_caller_or_operator',
+  'compounding_cost',
+  'before_after_scenario',
+  'smaller_fix_analysis',
+  'observable_outcome',
+  'non_goals',
+  'remaining_gap',
+  'next_step',
+  'boundary_reason',
+  'reason',
+  'minimum_repair',
+];
+
+const PROBLEM_PUBLICATION_FIELDS = [
+  'affected_caller_or_operator',
+  'before_after_scenario',
+  'observable_outcome',
+  'non_goals',
+];
+
+const ARCH_MECHANISM_FIELDS = [
+  'mechanism',
+  'responsibility',
+  'owning_boundary',
+  'activation_and_default',
+  'failure_and_recovery',
+  'placement_basis',
+];
+
+const ARCH_RESPONSIBILITIES = new Set(['invariant', 'policy', 'provider_io', 'projection', 'local_helper']);
+
+function normalizeJudgmentInput(id, modelRow) {
+  if (!isPlainObject(modelRow)) return modelRow;
+  const copy = { ...modelRow };
+  if (id === 'problem_context') {
+    for (const f of PROBLEM_CONTEXT_TEXT_FIELDS) {
+      if (copy[f] !== undefined) copy[f] = coerceScalarText(copy[f]);
+    }
+  } else if (id === 'change_proportionality' && isPlainObject(copy.architecture_assessment)) {
+    const aa = { ...copy.architecture_assessment };
+    for (const f of ['decision', 'reason', 'current_pr_boundary', 'validation_evidence']) {
+      if (aa[f] !== undefined) aa[f] = coerceScalarText(aa[f]);
+    }
+    if (Array.isArray(aa.mechanisms)) {
+      aa.mechanisms = aa.mechanisms.map(m => {
+        if (!isPlainObject(m)) return m;
+        const nm = { ...m };
+        for (const mf of ARCH_MECHANISM_FIELDS) {
+          if (nm[mf] !== undefined) nm[mf] = coerceScalarText(nm[mf]);
+        }
+        return nm;
+      });
+    }
+    copy.architecture_assessment = aa;
+  }
+  return copy;
 }
 
 function isValidJudgmentRow(id, modelRow, req, plan) {
@@ -503,6 +581,10 @@ function isValidJudgmentRow(id, modelRow, req, plan) {
     }
   }
   if (id === 'problem_context') {
+    for (const f of PROBLEM_PUBLICATION_FIELDS) {
+      if ((req.fields || []).includes(f) && !isNonEmptyString(modelRow[f])) return false;
+    }
+    if (modelRow.verdict === 'justified_increment' && !isNonEmptyString(modelRow.remaining_gap)) return false;
     const oi = modelRow.outcome_impact;
     if (!isPlainObject(oi) || !isPlainObject(oi.long_horizon) || !isPlainObject(oi.user_experience)) return false;
     if (isMissingValue(oi.long_horizon.decision) || isMissingValue(oi.long_horizon.reason)) return false;
@@ -517,21 +599,39 @@ function isValidJudgmentRow(id, modelRow, req, plan) {
   }
   if (id === 'change_proportionality') {
     const aa = modelRow.architecture_assessment;
-    if (!isPlainObject(aa) || isMissingValue(aa.decision) || isMissingValue(aa.reason)) return false;
+    if (!isPlainObject(aa) || !isNonEmptyString(aa.decision) || !isNonEmptyString(aa.reason)) return false;
     if (aa.decision !== 'not_applicable') {
-      if (!Array.isArray(aa.mechanisms) || !aa.mechanisms.length || isMissingValue(aa.current_pr_boundary) || isMissingValue(aa.validation_evidence)) {
+      if (!Array.isArray(aa.mechanisms) || !aa.mechanisms.length || !isNonEmptyString(aa.current_pr_boundary) || !isNonEmptyString(aa.validation_evidence)) {
         return false;
+      }
+      for (const m of aa.mechanisms) {
+        if (!isPlainObject(m)) return false;
+        if (ARCH_MECHANISM_FIELDS.some(mf => !isNonEmptyString(m[mf]))) return false;
+        if (!ARCH_RESPONSIBILITIES.has(m.responsibility)) return false;
       }
     }
   }
   if (id === 'observable_semantics') {
     if ((req.fields || []).includes('scope_coverage')) {
       const sc = modelRow.scope_coverage;
-      if (!isPlainObject(sc) || isMissingValue(sc.decision) || isMissingValue(sc.reason)) return false;
+      if (!isPlainObject(sc) || !isNonEmptyString(sc.decision) || !isNonEmptyString(sc.reason)) return false;
+      if (sc.decision !== 'not_applicable') {
+        for (const f of ['authorized_scope', 'scope_source', 'enforcement_selector', 'recovery_owner']) {
+          if (isMissingValue(sc[f])) return false;
+        }
+        if (!Array.isArray(sc.cases) || sc.cases.length < 5) return false;
+      }
     }
     if ((req.fields || []).includes('decision_text_assessment')) {
       const dt = modelRow.decision_text_assessment;
-      if (!isPlainObject(dt) || isMissingValue(dt.verdict) || isMissingValue(dt.checked_scope) || isMissingValue(dt.reason)) return false;
+      if (!isPlainObject(dt) || !isNonEmptyString(dt.verdict) || !isNonEmptyString(dt.checked_scope) || !isNonEmptyString(dt.reason)) return false;
+      if (dt.verdict !== 'not_applicable') {
+        if (isMissingValue(dt.consumer) || !Array.isArray(dt.clause_comparisons) || !dt.clause_comparisons.length
+            || !Array.isArray(dt.counterfactuals) || !dt.counterfactuals.length || isMissingValue(dt.evidence_refs)) {
+          return false;
+        }
+        if (dt.verdict === 'intentional_change_validated' && isMissingValue(dt.authorization_basis)) return false;
+      }
     }
   }
   if (id === 'repository_reuse' && (req.fields || []).includes('state_model_assessment')) {
@@ -543,19 +643,20 @@ function isValidJudgmentRow(id, modelRow, req, plan) {
 
 function buildJudgmentRow(id, req, plan, modelRow) {
   if (!isPlainObject(modelRow)) return { status: 'unverified' };
-  if (!isValidJudgmentRow(id, modelRow, req, plan)) {
+  const normalized = normalizeJudgmentInput(id, modelRow);
+  if (!isValidJudgmentRow(id, normalized, req, plan)) {
     if (id === 'problem_context') {
       const out = { status: 'unverified' };
       for (const k of ['affected_caller_or_operator', 'before_after_scenario', 'observable_outcome', 'non_goals', 'remaining_gap']) {
-        if (typeof modelRow[k] === 'string' && modelRow[k].trim()) out[k] = modelRow[k].trim();
+        if (typeof normalized[k] === 'string' && normalized[k].trim()) out[k] = normalized[k].trim();
       }
       return out;
     }
     return { status: 'unverified' };
   }
-  const out = { ...modelRow };
-  if (isNotApplicableDeclaration(id, modelRow, req)) {
-    const reason = extractNotApplicableReason(modelRow);
+  const out = { ...normalized };
+  if (isNotApplicableDeclaration(id, normalized, req)) {
+    const reason = extractNotApplicableReason(normalized);
     // LoopX result_check.py requires status === 'verified' for all approval-consistent rows,
     // while using verdict === 'not_applicable' (when in verdict_values) and non-empty fields.
     out.status = 'verified';

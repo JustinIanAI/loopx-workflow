@@ -705,4 +705,94 @@ exit 0
     assert.strictEqual(src.includes("'-X', 'PATCH'"), true, 'must pass -X and PATCH as separate args');
     assert.strictEqual(src.includes('`-X PATCH`'), false, 'must not embed space in -X PATCH single arg');
   });
+
+  test('architecture_assessment boundary note is inserted before English verdict line', () => {
+    const sbx = makeSandbox({ verdict: 'approve' });
+    const packetFile = path.join(sbx.dir, 'packet.json');
+    fs.writeFileSync(packetFile, JSON.stringify({
+      schema_version: 'pull_request_review_packet_v0',
+      repository: 'o/r',
+      reviewer_execution: { status: 'unavailable', reason: 'session_not_bound' },
+      agent_response_contract: {
+        review_execution_contract: {
+          policy_revision: 26,
+          evidence_requirements: [
+            {
+              evidence_id: 'change_proportionality',
+              fields: ['architecture_assessment', 'verdict'],
+              verdict_values: ['proportionate'],
+            },
+          ],
+        },
+      },
+      pull_requests: [{
+        number: 7,
+        head_oid: HEAD,
+        headRefOid: HEAD,
+        headRefName: 'feature/x',
+        title: 't',
+        review_action_kind: 'review',
+        review_template: {
+          schema: 'pr_review_five_block_template_v0',
+          sections: [
+            { label: '动机', minimum_prose_characters: 5, agent_instruction: 'm' },
+            { label: '改动思路', minimum_prose_characters: 5, agent_instruction: 'a' },
+            { label: '具体改动', minimum_prose_characters: 5, agent_instruction: 'c' },
+            { label: '对主干的风险', minimum_prose_characters: 5, agent_instruction: 'r' },
+            { label: '我的整体评价', minimum_prose_characters: 5, agent_instruction: 'v' },
+          ],
+          output_hint: 'ok',
+        },
+        review_plan: { required_evidence_ids: ['change_proportionality'], applicability: { behavior_bearing_change: true } },
+        evidence_commands: [],
+        motivation: '',
+      }],
+    }));
+    const stage1File = path.join(sbx.dir, 'stage1-arch.json');
+    const stage2File = path.join(sbx.dir, 'stage2-arch.json');
+    fs.writeFileSync(stage1File, nativeModelOut({ verdict: 'approve', findings: [] }));
+    fs.writeFileSync(stage2File, '```json\n' + JSON.stringify({
+      evidence: {
+        change_proportionality: {
+          status: 'verified',
+          verdict: 'proportionate',
+          architecture_assessment: {
+            decision: 'retain',
+            reason: 'arch boundary reason xyz',
+            current_pr_boundary: 'skills/code-review/ only',
+            validation_evidence: ['tests/unit/a.test.js', 'tests/unit/b.test.js'],
+            mechanisms: [{
+              mechanism: 'stdin',
+              responsibility: 'provider_io',
+              owning_boundary: 'authentic-review.js',
+              activation_and_default: 'always',
+              failure_and_recovery: 'exit 1',
+              placement_basis: 'ADR-0013',
+            }],
+          },
+        },
+      },
+    }) + '\n```');
+    const counterFile = path.join(sbx.dir, 'codex-count-arch');
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/usr/bin/env bash
+if [[ ! -t 0 ]]; then cat >/dev/null; fi
+n=0
+if [[ -f ${JSON.stringify(counterFile)} ]]; then n=$(cat ${JSON.stringify(counterFile)}); fi
+n=$((n+1))
+echo "$n" > ${JSON.stringify(counterFile)}
+if [[ "$n" == "1" ]]; then cat ${JSON.stringify(stage1File)}; else cat ${JSON.stringify(stage2File)}; fi
+exit 0
+`, { mode: 0o755 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--packet-file', packetFile]);
+    assert.strictEqual(r.code, 0, r.out);
+    const resultJson = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
+    assert.strictEqual(resultJson.evidence.change_proportionality.status, 'verified');
+    assert.strictEqual(
+      resultJson.evidence.change_proportionality.architecture_assessment.validation_evidence,
+      'tests/unit/a.test.js；tests/unit/b.test.js',
+    );
+    const boundaryIdx = resultJson.review_body.indexOf('> 当前 PR 边界：skills/code-review/ only');
+    const verdictIdx = resultJson.review_body.indexOf('English verdict:');
+    assert.ok(boundaryIdx > 0 && verdictIdx > boundaryIdx, 'boundary note must appear before English verdict');
+  });
 });
