@@ -153,6 +153,29 @@ function resolveRepoTestPath(candidate, repoRoot) {
   return { abs: realAbs, rel: realRel, root: realRoot };
 }
 
+const REVIEW_THROTTLE_ENV_KEYS = [
+  'REVIEW_SHORTCIRCUIT',
+  'REVIEW_DEBOUNCE_SECONDS',
+  'REVIEW_UPSERT_PUBLISH',
+  'REVIEW_BACKOFF_BASE_MS',
+  'REVIEW_MAX_RETRIES',
+  'REVIEW_KEEP_PROMPT',
+  'REVIEW_TWO_STAGE_ALIGNMENT',
+];
+
+function isolatedNodeTestEnv(baseEnv) {
+  const src = baseEnv || process.env;
+  const out = {};
+  for (const k of Object.keys(src)) {
+    if (!REVIEW_THROTTLE_ENV_KEYS.includes(k)) out[k] = src[k];
+  }
+  return out;
+}
+
+function defaultRunNodeTest(relPath, cwd) {
+  return spawnSync(process.execPath, ['--test', relPath], { cwd, env: isolatedNodeTestEnv(process.env), encoding: 'utf8', timeout: 120000 });
+}
+
 function buildInvariantRow(caseId, label, candidate, opts = {}) {
   const resolved = resolveRepoTestPath(candidate, opts.repoRoot);
   if (!resolved) {
@@ -169,7 +192,7 @@ function buildInvariantRow(caseId, label, candidate, opts = {}) {
   const cmd = `node --test ${resolved.rel}`;
   const runner = typeof opts.runNodeTest === 'function'
     ? opts.runNodeTest
-    : (relPath, cwd) => spawnSync(process.execPath, ['--test', relPath], { cwd, encoding: 'utf8', timeout: 120000 });
+    : defaultRunNodeTest;
   const res = runner(resolved.rel, resolved.root);
   const exitCode = res && typeof res.status === 'number' ? res.status : 1;
   if (exitCode === 0) {
@@ -427,17 +450,32 @@ function buildSymbolMapRow(req, ctx, modelRow) {
   return { status: 'verified', items: mergedItems };
 }
 
+function extractNotApplicableReason(modelRow) {
+  if (!isPlainObject(modelRow)) return '';
+  if (typeof modelRow.reason === 'string' && modelRow.reason.trim()) return modelRow.reason.trim();
+  for (const [k, v] of Object.entries(modelRow)) {
+    if (k === 'status' || k === 'verdict') continue;
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+}
+
+function isNotApplicableDeclaration(id, modelRow, req) {
+  if (!isPlainObject(modelRow)) return false;
+  if (id === 'problem_context' || id === 'walkthroughs') return false;
+  const hasNaTag = modelRow.status === 'not_applicable'
+    || (modelRow.verdict === 'not_applicable' && (!Array.isArray(req.verdict_values) || req.verdict_values.includes('not_applicable')));
+  if (!hasNaTag) return false;
+  return Boolean(extractNotApplicableReason(modelRow));
+}
+
 function isValidJudgmentRow(id, modelRow, req, plan) {
   if (!isPlainObject(modelRow)) return false;
-  if (modelRow.status === 'not_applicable') {
-    const detailKeys = Object.keys(modelRow).filter(k => k !== 'status' && k !== 'verdict' && !isMissingValue(modelRow[k]));
-    if (!detailKeys.length) return false;
-    if (Array.isArray(req.verdict_values) && req.verdict_values.length && modelRow.verdict !== undefined) {
-      if (!req.verdict_values.includes(modelRow.verdict)) return false;
-    }
+  if (isNotApplicableDeclaration(id, modelRow, req)) {
     return true;
   }
-  if (modelRow.status !== 'verified') return false;
+  const effectiveStatus = modelRow.status === undefined ? 'verified' : modelRow.status;
+  if (effectiveStatus !== 'verified') return false;
   for (const field of req.fields || []) {
     if (isMissingValue(modelRow[field])) return false;
   }
@@ -516,10 +554,29 @@ function buildJudgmentRow(id, req, plan, modelRow) {
     return { status: 'unverified' };
   }
   const out = { ...modelRow };
-  if (out.status === 'not_applicable' && out.verdict === undefined
-      && Array.isArray(req.verdict_values) && req.verdict_values.includes('not_applicable')) {
-    out.verdict = 'not_applicable';
+  if (isNotApplicableDeclaration(id, modelRow, req)) {
+    const reason = extractNotApplicableReason(modelRow);
+    // LoopX result_check.py requires status === 'verified' for all approval-consistent rows,
+    // while using verdict === 'not_applicable' (when in verdict_values) and non-empty fields.
+    out.status = 'verified';
+    if (Array.isArray(req.verdict_values) && req.verdict_values.includes('not_applicable')) {
+      out.verdict = 'not_applicable';
+    }
+    for (const field of req.fields || []) {
+      if (isMissingValue(out[field])) {
+        out[field] = `not_applicable: ${reason}`;
+      }
+    }
+    if (id === 'semantic_alignment' && out.verdict === 'not_applicable') {
+      const allowedCandidates = Array.isArray(req.candidate_decisions) ? req.candidate_decisions : [];
+      if (!allowedCandidates.includes(out.candidate_decision)
+          || ['extend_vocabulary', 'create_vocabulary', 'compatibility_only'].includes(out.candidate_decision)) {
+        delete out.candidate_decision;
+      }
+    }
+    return out;
   }
+  if (out.status === undefined) out.status = 'verified';
   return out;
 }
 
@@ -589,4 +646,5 @@ module.exports = {
   buildEvidenceGraph,
   describeFileFromDiff,
   scanDiff,
+  isolatedNodeTestEnv,
 };

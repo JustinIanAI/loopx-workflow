@@ -9,6 +9,7 @@ const {
   buildValidationMatrix,
   describeFileFromDiff,
   scanDiff,
+  isolatedNodeTestEnv,
 } = require('../../skills/code-review/scripts/evidence-builder.js');
 const {
   buildNativePrompt,
@@ -482,9 +483,21 @@ test('ADR-0013：buildNativePrompt 完整透传超 240KB Diff（无人工截断�
       domain_neutrality: { status: 'not_applicable', reason: 'No control-plane domain text touched.' },
     },
   });
-  assert.strictEqual(naGraph.default_off_isolation.status, 'not_applicable');
+  assert.strictEqual(naGraph.default_off_isolation.status, 'verified');
   assert.strictEqual(naGraph.default_off_isolation.verdict, 'not_applicable');
-  assert.strictEqual(naGraph.domain_neutrality.status, 'not_applicable');
+  assert.strictEqual(naGraph.default_off_isolation.opt_in_or_default_off_claim, 'not_applicable: No feature toggle changed.');
+  assert.strictEqual(naGraph.domain_neutrality.status, 'verified');
+  assert.strictEqual(naGraph.domain_neutrality.obligation_or_error_text, 'not_applicable: No control-plane domain text touched.');
+
+  const cleanEnv = isolatedNodeTestEnv({
+    PATH: process.env.PATH,
+    REVIEW_SHORTCIRCUIT: '1',
+    REVIEW_DEBOUNCE_SECONDS: '60',
+    REVIEW_UPSERT_PUBLISH: '1',
+  });
+  assert.strictEqual(cleanEnv.REVIEW_SHORTCIRCUIT, undefined);
+  assert.strictEqual(cleanEnv.REVIEW_DEBOUNCE_SECONDS, undefined);
+  assert.strictEqual(cleanEnv.REVIEW_UPSERT_PUBLISH, undefined);
 
   // Stage 2 prompt stays compact (omits raw diff hunks) and passes Stage 1 reviewBody + missingIds
   const stage2 = buildStage2Prompt({

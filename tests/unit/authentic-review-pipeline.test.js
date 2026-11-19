@@ -212,6 +212,11 @@ function run(sbx, args, envExtra) {
     REVIEW_MODEL: 'codex',
     LOOPX_TMP_DIR: sbx.tmpDir,
   };
+  delete env.REVIEW_SHORTCIRCUIT;
+  delete env.REVIEW_DEBOUNCE_SECONDS;
+  delete env.REVIEW_UPSERT_PUBLISH;
+  delete env.REVIEW_KEEP_PROMPT;
+  delete env.REVIEW_TWO_STAGE_ALIGNMENT;
   if (envExtra) Object.assign(env, envExtra);
   try {
     const out = execFileSync('node', [SCRIPT, ...args], { env, encoding: 'utf8', cwd: PROJECT_ROOT, timeout: 120000 });

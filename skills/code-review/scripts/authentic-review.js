@@ -851,7 +851,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     fullDiff,
     '',
     '## 输出格式（请输出单一 fenced json 块）',
-    '结构如下：优先确保 `review_body`、`verdict`、`findings`、`reviewer`（以及如有上轮 findings 时的 `carryover`）完整准确；`evidence` 中建议先给出 `validation_matrix` 的测试文件路径、`problem_context` 核心字段、适用的 `not_applicable` 声明以及 `symbol_map` 关键符号（剩余嵌套判断字段若本轮未写全，主机将在阶段 2 基于你的报告做轻量结构化对齐）。若代码确无阻塞缺陷，请输出 `verdict: "APPROVE"`；存在阻塞缺陷或核心不变量未验证时输出 `REQUEST_CHANGES`。其中 `evidence.problem_context` 的 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals` 须与「动机」段保持一致：',
+    '结构如下：你必须按上方「评审范围 evidence」逐项填写全部 required_evidence_ids（已独立核实且无缺口的项写 `"status": "verified"` 并填全全部必填字段与嵌套对象；非适用项可直接写 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若个别判断项本轮未写全，主机将在阶段 2 基于你的报告做轻量结构化对齐）。若代码确无阻塞缺陷且所有必填证据均已核实（包括 `validation_matrix.changed_invariant_positive` 与 `material_negative_or_failure` 的真实 `tests/*.test.js` 路径，以及 `symbol_map` 的 2-5 个精确 diff 符号），请输出 `verdict: "APPROVE"`；存在阻塞缺陷时输出 `REQUEST_CHANGES`。其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals`、`outcome_impact`（含 `user_experience.visual_review`）和 `spec_basis` 并写入「动机」段；`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap` 并写入同一段：',
     '```json',
     JSON.stringify({
       review_body: 'Markdown 字符串：首行必须是 `Reviewer: model_agent · model=<model> · provider=<provider> · declaration=<declaration_source> · head=<headOid>`（declaration_source 默认 self_reported）；随后依次出现五个二级标题（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价），各章达到字数下限；「具体改动」下必须含 `### 关键代码讲解`；正文内须含精确 head oid；结尾须有一行 `English verdict: APPROVE` 或 `English verdict: REQUEST_CHANGES`。',
@@ -902,7 +902,7 @@ function buildStage2Prompt({ pr, headOid, branch, reviewBody, diff, missingIds, 
 
   return [
     '你是一名证据结构化对齐助手（ADR-0013 阶段 2）。请仅根据下方已经完成的阶段 1 五段式评审报告、文件改动清单和证据契约，补齐缺失的结构化判断类 `evidence` JSON。',
-    '约束：严禁编造未在评审报告或文件清单中核实的事实；若某项不适用（如无特性开关的 `default_off_isolation`、无领域措辞变更的 `domain_neutrality`、无权限模型变更的 `authority_semantics`），请严格输出 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若报告中缺乏足够依据，则保留 `"status": "unverified"`。',
+    '约束：对已由阶段 1 报告和文件清单核实的项，必须输出 `"status": "verified"` 并填全契约列出的全部 `fields`、`verdict`（取自 `verdict_values`）与嵌套子对象；若某项不适用（如无特性开关的 `default_off_isolation`、无领域措辞变更的 `domain_neutrality`、无权限模型变更的 `authority_semantics`、无状态分类规则变更的 `typed_state_rule`、无默认行为变更的 `behavior_change_disclosure`、无建议/义务边界变更的 `guidance_vs_obligation`、无术语契约变更的 `semantic_alignment`），请直接输出 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若报告中缺乏足够依据，则保留 `"status": "unverified"`。',
     '执行铁律：直接输出单一 fenced json 块 `{"evidence": { ... }}`，严禁调用任何 shell / 文件读取工具。',
     '',
     `- PR: #${pr} · 分支 \`${branch}\` · 精确 head \`${head10}\` (\`${headOid}\`)`,
@@ -916,7 +916,15 @@ function buildStage2Prompt({ pr, headOid, branch, reviewBody, diff, missingIds, 
     '',
     '## 输出格式',
     '```json',
-    JSON.stringify({ evidence: {} }, null, 2),
+    JSON.stringify({
+      evidence: {
+        '<evidence_id>': {
+          status: 'verified 或 not_applicable',
+          verdict: '若契约含 verdict_values 则必填；not_applicable 时写 not_applicable',
+          reason: '当 status 为 not_applicable 时必填具体事实依据；status 为 verified 时按契约填全所有 fields 与嵌套对象',
+        },
+      },
+    }, null, 2),
     '```',
   ].join('\n');
 }
