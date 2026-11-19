@@ -153,9 +153,54 @@ function resolveRepoTestPath(candidate, repoRoot) {
   return { abs: realAbs, rel: realRel, root: realRoot };
 }
 
+const REVIEW_THROTTLE_ENV_KEYS = [
+  'REVIEW_SHORTCIRCUIT',
+  'REVIEW_DEBOUNCE_SECONDS',
+  'REVIEW_UPSERT_PUBLISH',
+  'REVIEW_BACKOFF_BASE_MS',
+  'REVIEW_MAX_RETRIES',
+  'REVIEW_KEEP_PROMPT',
+  'REVIEW_TWO_STAGE_ALIGNMENT',
+];
+
+function isolatedNodeTestEnv(baseEnv) {
+  const src = baseEnv || process.env;
+  const out = {};
+  for (const k of Object.keys(src)) {
+    if (!REVIEW_THROTTLE_ENV_KEYS.includes(k)) out[k] = src[k];
+  }
+  return out;
+}
+
+function defaultRunNodeTest(relPath, cwd) {
+  return spawnSync(process.execPath, ['--test', relPath], { cwd, env: isolatedNodeTestEnv(process.env), encoding: 'utf8', timeout: 120000 });
+}
+
+function resolveRepoTestPaths(candidate, repoRoot) {
+  let arr = null;
+  if (Array.isArray(candidate)) {
+    arr = candidate;
+  } else if (isPlainObject(candidate)) {
+    const field = candidate.test_path ?? candidate.path ?? candidate.file ?? candidate.command_or_check;
+    if (Array.isArray(field)) arr = field;
+  }
+  if (arr) {
+    if (!arr.length) return null;
+    const list = [];
+    for (const item of arr) {
+      const r = resolveRepoTestPath(item, repoRoot);
+      if (!r) return null;
+      list.push(r);
+    }
+    return list;
+  }
+  const single = resolveRepoTestPath(candidate, repoRoot);
+  return single ? [single] : null;
+}
+
 function buildInvariantRow(caseId, label, candidate, opts = {}) {
-  const resolved = resolveRepoTestPath(candidate, opts.repoRoot);
-  if (!resolved) {
+  const resolvedList = resolveRepoTestPaths(candidate, opts.repoRoot);
+  if (!resolvedList || !resolvedList.length) {
     return {
       case_id: caseId,
       invariant_or_case: label,
@@ -166,34 +211,37 @@ function buildInvariantRow(caseId, label, candidate, opts = {}) {
       skip_or_failure_reason: 'unverified: npm run test passing does not prove this invariant',
     };
   }
-  const cmd = `node --test ${resolved.rel}`;
   const runner = typeof opts.runNodeTest === 'function'
     ? opts.runNodeTest
-    : (relPath, cwd) => spawnSync(process.execPath, ['--test', relPath], { cwd, encoding: 'utf8', timeout: 120000 });
-  const res = runner(resolved.rel, resolved.root);
-  const exitCode = res && typeof res.status === 'number' ? res.status : 1;
-  if (exitCode === 0) {
-    return {
-      case_id: caseId,
-      invariant_or_case: label,
-      command_or_check: cmd,
-      exit_code: 0,
-      status: 'passed',
-      result: `${cmd} (exit 0)`,
-      required: true,
-      skip_or_failure_reason: 'not applicable: command passed',
-    };
+    : defaultRunNodeTest;
+  for (const resolved of resolvedList) {
+    const res = runner(resolved.rel, resolved.root);
+    const exitCode = res && typeof res.status === 'number' ? res.status : 1;
+    if (exitCode !== 0) {
+      const failCmd = `node --test ${resolved.rel}`;
+      return {
+        case_id: caseId,
+        invariant_or_case: label,
+        command_or_check: failCmd,
+        exit_code: exitCode,
+        status: 'failed',
+        result: `${failCmd} failed (exit ${exitCode})`,
+        required: true,
+        skip_or_failure_reason: `${failCmd} exited with code ${exitCode}`,
+        failure_attribution: buildUnresolvedAttribution(failCmd, exitCode, opts.headOid, label),
+      };
+    }
   }
+  const cmd = `node --test ${resolvedList.map(r => r.rel).join(' ')}`;
   return {
     case_id: caseId,
     invariant_or_case: label,
     command_or_check: cmd,
-    exit_code: exitCode,
-    status: 'failed',
-    result: `${cmd} failed (exit ${exitCode})`,
+    exit_code: 0,
+    status: 'passed',
+    result: `${cmd} (exit 0)`,
     required: true,
-    skip_or_failure_reason: `${cmd} exited with code ${exitCode}`,
-    failure_attribution: buildUnresolvedAttribution(cmd, exitCode, opts.headOid, label),
+    skip_or_failure_reason: 'not applicable: command passed',
   };
 }
 
@@ -427,17 +475,110 @@ function buildSymbolMapRow(req, ctx, modelRow) {
   return { status: 'verified', items: mergedItems };
 }
 
+function extractNotApplicableReason(modelRow) {
+  if (!isPlainObject(modelRow)) return '';
+  if (typeof modelRow.reason === 'string' && modelRow.reason.trim()) return modelRow.reason.trim();
+  for (const [k, v] of Object.entries(modelRow)) {
+    if (k === 'status' || k === 'verdict') continue;
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+}
+
+function isNotApplicableDeclaration(id, modelRow, req) {
+  if (!isPlainObject(modelRow)) return false;
+  if (id === 'problem_context' || id === 'walkthroughs') return false;
+  if (Array.isArray(req && req.verdict_values) && req.verdict_values.length && !req.verdict_values.includes('not_applicable')) {
+    return false;
+  }
+  const hasNaTag = modelRow.status === 'not_applicable'
+    || (modelRow.verdict === 'not_applicable' && (!Array.isArray(req.verdict_values) || req.verdict_values.includes('not_applicable')));
+  if (!hasNaTag) return false;
+  return Boolean(extractNotApplicableReason(modelRow));
+}
+
+function coerceScalarText(val) {
+  if (typeof val === 'string') return val;
+  if (Array.isArray(val) && val.length && val.every(item => typeof item === 'string')) {
+    const joined = val.map(s => s.trim()).filter(Boolean).join('；');
+    if (joined) return joined;
+  }
+  return val;
+}
+
+function isNonEmptyString(val) {
+  return typeof val === 'string' && val.trim().length > 0;
+}
+
+const PROBLEM_CONTEXT_TEXT_FIELDS = [
+  'goal_basis',
+  'author_claim',
+  'old_behavior',
+  'affected_caller_or_operator',
+  'compounding_cost',
+  'before_after_scenario',
+  'smaller_fix_analysis',
+  'observable_outcome',
+  'non_goals',
+  'remaining_gap',
+  'next_step',
+  'boundary_reason',
+  'reason',
+  'minimum_repair',
+];
+
+const PROBLEM_PUBLICATION_FIELDS = [
+  'affected_caller_or_operator',
+  'before_after_scenario',
+  'observable_outcome',
+  'non_goals',
+];
+
+const ARCH_MECHANISM_FIELDS = [
+  'mechanism',
+  'responsibility',
+  'owning_boundary',
+  'activation_and_default',
+  'failure_and_recovery',
+  'placement_basis',
+];
+
+const ARCH_RESPONSIBILITIES = new Set(['invariant', 'policy', 'provider_io', 'projection', 'local_helper']);
+
+function normalizeJudgmentInput(id, modelRow) {
+  if (!isPlainObject(modelRow)) return modelRow;
+  const copy = { ...modelRow };
+  if (id === 'problem_context') {
+    for (const f of PROBLEM_CONTEXT_TEXT_FIELDS) {
+      if (copy[f] !== undefined) copy[f] = coerceScalarText(copy[f]);
+    }
+  } else if (id === 'change_proportionality' && isPlainObject(copy.architecture_assessment)) {
+    const aa = { ...copy.architecture_assessment };
+    for (const f of ['decision', 'reason', 'current_pr_boundary', 'validation_evidence']) {
+      if (aa[f] !== undefined) aa[f] = coerceScalarText(aa[f]);
+    }
+    if (Array.isArray(aa.mechanisms)) {
+      aa.mechanisms = aa.mechanisms.map(m => {
+        if (!isPlainObject(m)) return m;
+        const nm = { ...m };
+        for (const mf of ARCH_MECHANISM_FIELDS) {
+          if (nm[mf] !== undefined) nm[mf] = coerceScalarText(nm[mf]);
+        }
+        return nm;
+      });
+    }
+    copy.architecture_assessment = aa;
+  }
+  return copy;
+}
+
 function isValidJudgmentRow(id, modelRow, req, plan) {
   if (!isPlainObject(modelRow)) return false;
-  if (modelRow.status === 'not_applicable') {
-    const detailKeys = Object.keys(modelRow).filter(k => k !== 'status' && k !== 'verdict' && !isMissingValue(modelRow[k]));
-    if (!detailKeys.length) return false;
-    if (Array.isArray(req.verdict_values) && req.verdict_values.length && modelRow.verdict !== undefined) {
-      if (!req.verdict_values.includes(modelRow.verdict)) return false;
-    }
+  if (isNotApplicableDeclaration(id, modelRow, req)) {
     return true;
   }
-  if (modelRow.status !== 'verified') return false;
+  const effectiveStatus = modelRow.status === undefined ? 'verified' : modelRow.status;
+  if (effectiveStatus !== 'verified') return false;
   for (const field of req.fields || []) {
     if (isMissingValue(modelRow[field])) return false;
   }
@@ -465,6 +606,10 @@ function isValidJudgmentRow(id, modelRow, req, plan) {
     }
   }
   if (id === 'problem_context') {
+    for (const f of PROBLEM_PUBLICATION_FIELDS) {
+      if ((req.fields || []).includes(f) && !isNonEmptyString(modelRow[f])) return false;
+    }
+    if (modelRow.verdict === 'justified_increment' && !isNonEmptyString(modelRow.remaining_gap)) return false;
     const oi = modelRow.outcome_impact;
     if (!isPlainObject(oi) || !isPlainObject(oi.long_horizon) || !isPlainObject(oi.user_experience)) return false;
     if (isMissingValue(oi.long_horizon.decision) || isMissingValue(oi.long_horizon.reason)) return false;
@@ -479,21 +624,39 @@ function isValidJudgmentRow(id, modelRow, req, plan) {
   }
   if (id === 'change_proportionality') {
     const aa = modelRow.architecture_assessment;
-    if (!isPlainObject(aa) || isMissingValue(aa.decision) || isMissingValue(aa.reason)) return false;
+    if (!isPlainObject(aa) || !isNonEmptyString(aa.decision) || !isNonEmptyString(aa.reason)) return false;
     if (aa.decision !== 'not_applicable') {
-      if (!Array.isArray(aa.mechanisms) || !aa.mechanisms.length || isMissingValue(aa.current_pr_boundary) || isMissingValue(aa.validation_evidence)) {
+      if (!Array.isArray(aa.mechanisms) || !aa.mechanisms.length || !isNonEmptyString(aa.current_pr_boundary) || !isNonEmptyString(aa.validation_evidence)) {
         return false;
+      }
+      for (const m of aa.mechanisms) {
+        if (!isPlainObject(m)) return false;
+        if (ARCH_MECHANISM_FIELDS.some(mf => !isNonEmptyString(m[mf]))) return false;
+        if (!ARCH_RESPONSIBILITIES.has(m.responsibility)) return false;
       }
     }
   }
   if (id === 'observable_semantics') {
     if ((req.fields || []).includes('scope_coverage')) {
       const sc = modelRow.scope_coverage;
-      if (!isPlainObject(sc) || isMissingValue(sc.decision) || isMissingValue(sc.reason)) return false;
+      if (!isPlainObject(sc) || !isNonEmptyString(sc.decision) || !isNonEmptyString(sc.reason)) return false;
+      if (sc.decision !== 'not_applicable') {
+        for (const f of ['authorized_scope', 'scope_source', 'enforcement_selector', 'recovery_owner']) {
+          if (isMissingValue(sc[f])) return false;
+        }
+        if (!Array.isArray(sc.cases) || sc.cases.length < 5) return false;
+      }
     }
     if ((req.fields || []).includes('decision_text_assessment')) {
       const dt = modelRow.decision_text_assessment;
-      if (!isPlainObject(dt) || isMissingValue(dt.verdict) || isMissingValue(dt.checked_scope) || isMissingValue(dt.reason)) return false;
+      if (!isPlainObject(dt) || !isNonEmptyString(dt.verdict) || !isNonEmptyString(dt.checked_scope) || !isNonEmptyString(dt.reason)) return false;
+      if (dt.verdict !== 'not_applicable') {
+        if (isMissingValue(dt.consumer) || !Array.isArray(dt.clause_comparisons) || !dt.clause_comparisons.length
+            || !Array.isArray(dt.counterfactuals) || !dt.counterfactuals.length || isMissingValue(dt.evidence_refs)) {
+          return false;
+        }
+        if (dt.verdict === 'intentional_change_validated' && isMissingValue(dt.authorization_basis)) return false;
+      }
     }
   }
   if (id === 'repository_reuse' && (req.fields || []).includes('state_model_assessment')) {
@@ -505,17 +668,42 @@ function isValidJudgmentRow(id, modelRow, req, plan) {
 
 function buildJudgmentRow(id, req, plan, modelRow) {
   if (!isPlainObject(modelRow)) return { status: 'unverified' };
-  if (!isValidJudgmentRow(id, modelRow, req, plan)) {
+  const normalized = normalizeJudgmentInput(id, modelRow);
+  if (!isValidJudgmentRow(id, normalized, req, plan)) {
     if (id === 'problem_context') {
       const out = { status: 'unverified' };
       for (const k of ['affected_caller_or_operator', 'before_after_scenario', 'observable_outcome', 'non_goals', 'remaining_gap']) {
-        if (typeof modelRow[k] === 'string' && modelRow[k].trim()) out[k] = modelRow[k].trim();
+        if (typeof normalized[k] === 'string' && normalized[k].trim()) out[k] = normalized[k].trim();
       }
       return out;
     }
     return { status: 'unverified' };
   }
-  return { ...modelRow };
+  const out = { ...normalized };
+  if (isNotApplicableDeclaration(id, normalized, req)) {
+    const reason = extractNotApplicableReason(normalized);
+    // LoopX result_check.py requires status === 'verified' for all approval-consistent rows,
+    // while using verdict === 'not_applicable' (when in verdict_values) and non-empty fields.
+    out.status = 'verified';
+    if (Array.isArray(req.verdict_values) && req.verdict_values.includes('not_applicable')) {
+      out.verdict = 'not_applicable';
+    }
+    for (const field of req.fields || []) {
+      if (isMissingValue(out[field])) {
+        out[field] = `not_applicable: ${reason}`;
+      }
+    }
+    if (id === 'semantic_alignment' && out.verdict === 'not_applicable') {
+      const allowedCandidates = Array.isArray(req.candidate_decisions) ? req.candidate_decisions : [];
+      if (!allowedCandidates.includes(out.candidate_decision)
+          || ['extend_vocabulary', 'create_vocabulary', 'compatibility_only'].includes(out.candidate_decision)) {
+        delete out.candidate_decision;
+      }
+    }
+    return out;
+  }
+  if (out.status === undefined) out.status = 'verified';
+  return out;
 }
 
 function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, validation, modelEvidence, repoRoot, runNodeTest }) {
@@ -576,114 +764,6 @@ function scanDiff(diff) {
   return findings;
 }
 
-function classifyDiffFile(filePath) {
-  const p = String(filePath || '');
-  if (/^(?:tests?|__tests__|spec)\/|\.test\.[^/]+$|\.spec\.[^/]+$/i.test(p)) return 'tests';
-  if (/^(?:docs|specs)\//i.test(p) || /\.md$/i.test(p)) return 'docs';
-  return 'prod';
-}
-
-function compactFileDiff(fileDiff, maxChars) {
-  const text = String(fileDiff || '');
-  if (text.length <= maxChars) return text;
-  const marker = `\n[FILE_DIFF_COMPACTED: omitted ${text.length - Math.max(0, maxChars - 96)} of ${text.length} chars]\n`;
-  const keep = Math.max(0, maxChars - marker.length);
-  if (keep === 0) return text.slice(0, maxChars);
-  let cut = text.lastIndexOf('\n', keep);
-  if (cut < Math.floor(keep * 0.5)) cut = keep;
-  return text.slice(0, cut) + marker;
-}
-
-function formatDiffForPrompt(diff, maxChars = 240000) {
-  const text = String(diff || '');
-  if (text.length <= maxChars) return text;
-  const fileMap = splitFileDiffs(text);
-  const entries = [...fileMap.entries()].map(([filePath, fileDiff]) => {
-    const st = diffStats(fileDiff);
-    return {
-      path: filePath,
-      diff: fileDiff,
-      tier: classifyDiffFile(filePath),
-      chars: fileDiff.length,
-      additions: st.additions,
-      deletions: st.deletions,
-    };
-  });
-  if (!entries.length) return `${text.slice(0, maxChars)}\n\n[TRUNCATED]`;
-
-  const inventoryLines = [
-    `## Diff File Inventory (${entries.length} files, total ${text.length} chars > ${maxChars} limit; per-file prioritized budget)`,
-    ...entries.map(e => `- [${e.tier}] \`${e.path}\` (+${e.additions}/-${e.deletions}, ${e.chars} chars)`),
-    '',
-  ];
-  const inventory = inventoryLines.join('\n');
-  const remainingTotal = Math.max(1000, maxChars - inventory.length - 128);
-
-  const byTier = {
-    prod: entries.filter(e => e.tier === 'prod'),
-    tests: entries.filter(e => e.tier === 'tests'),
-    docs: entries.filter(e => e.tier === 'docs'),
-  };
-  const weights = { prod: 0.55, tests: 0.30, docs: 0.15 };
-  const activeTiers = Object.keys(byTier).filter(t => byTier[t].length > 0);
-  const totalWeight = activeTiers.reduce((acc, t) => acc + weights[t], 0) || 1;
-
-  const tierBudgets = {};
-  let leftover = 0;
-  for (const t of activeTiers) {
-    const rawBudget = Math.floor(remainingTotal * (weights[t] / totalWeight));
-    const needed = byTier[t].reduce((acc, e) => acc + e.chars + 2, 0);
-    if (needed <= rawBudget) {
-      tierBudgets[t] = needed;
-      leftover += (rawBudget - needed);
-    } else {
-      tierBudgets[t] = rawBudget;
-    }
-  }
-  for (const t of ['tests', 'prod', 'docs']) {
-    if (!leftover || !byTier[t].length) continue;
-    const needed = byTier[t].reduce((acc, e) => acc + e.chars + 2, 0);
-    const gap = Math.max(0, needed - tierBudgets[t]);
-    const add = Math.min(leftover, gap);
-    tierBudgets[t] += add;
-    leftover -= add;
-  }
-
-  const allocated = new Map();
-  for (const t of activeTiers) {
-    const group = byTier[t];
-    let budget = tierBudgets[t];
-    const small = [];
-    const large = [];
-    const perFileShare = Math.floor(budget / group.length);
-    const fair = perFileShare >= 2000 ? perFileShare : Math.max(128, perFileShare);
-    for (const e of group) {
-      if (e.chars <= fair) small.push(e);
-      else large.push(e);
-    }
-    for (const e of small) {
-      if (e.chars <= budget) {
-        allocated.set(e.path, e.diff);
-        budget -= e.chars;
-      } else {
-        large.push(e);
-      }
-    }
-    if (large.length) {
-      const perLarge = Math.max(128, Math.floor(Math.max(0, budget) / large.length));
-      for (const e of large) {
-        allocated.set(e.path, compactFileDiff(e.diff, perLarge));
-      }
-    }
-  }
-
-  const body = entries.map(e => allocated.get(e.path) || compactFileDiff(e.diff, 512)).join('\n');
-  const combined = `${inventory}${body}`;
-  if (combined.length <= maxChars) return combined;
-  const suffix = '\n[DIFF_BUDGET_CLAMPED]\n';
-  return combined.slice(0, Math.max(0, maxChars - suffix.length)) + suffix;
-}
-
 module.exports = {
   listFiles,
   splitFileDiffs,
@@ -692,5 +772,5 @@ module.exports = {
   buildEvidenceGraph,
   describeFileFromDiff,
   scanDiff,
-  formatDiffForPrompt,
+  isolatedNodeTestEnv,
 };

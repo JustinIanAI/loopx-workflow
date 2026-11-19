@@ -40,11 +40,28 @@ const { spawnSync } = require('node:child_process');
 const {
   buildEvidenceGraph,
   buildValidationMatrix,
+  listFiles,
   splitFileDiffs,
+  diffStats,
   describeFileFromDiff,
   scanDiff,
-  formatDiffForPrompt,
 } = require('./evidence-builder');
+const { resolveTmpDir } = require('./ingest-to-loopx-quality');
+
+function ensureSandboxTmpDir() {
+  const dir = resolveTmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function writePromptArtifact(pr, headOid, prompt, stage = 'stage1') {
+  const tmpDir = ensureSandboxTmpDir();
+  const head10 = String(headOid || 'unknown').slice(0, 10);
+  const suffix = stage === 'stage1' ? '' : `-${stage}`;
+  const file = path.join(tmpDir, `review-prompt-${pr}-${head10}${suffix}.md`);
+  fs.writeFileSync(file, String(prompt || ''), 'utf8');
+  return file;
+}
 
 const TIMEOUT_MS = 600000;
 // 评审结果私有落盘目录（不入 Git；供 loopx-flow respond 复用原生格式核销）
@@ -141,7 +158,7 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
   const trimmed = String(body).replace(/\s+$/g, '');
   const postedBody = trimmed.includes(marker) ? trimmed : `${trimmed}\n\n${marker}`;
   if (!useUpsert) {
-    const postedFile = path.join(os.tmpdir(), `authentic-review-report-${pr}.md`);
+    const postedFile = path.join(ensureSandboxTmpDir(), `authentic-review-report-${pr}.md`);
     fs.writeFileSync(postedFile, trimmed);
     const cm = sh('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body-file', postedFile]);
     if (cm.status !== 0) {
@@ -153,7 +170,7 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
     console.log(`[✓] 原生五段式第三方评审报告已发布至 PR #${pr}（head ${String(headOid).slice(0, 10)}）。`);
     return { mode: 'created', commentId };
   }
-  const postedFile = path.join(os.tmpdir(), `authentic-review-report-upsert-${pr}.md`);
+  const postedFile = path.join(ensureSandboxTmpDir(), `authentic-review-report-upsert-${pr}.md`);
   fs.writeFileSync(postedFile, postedBody);
   // 检索既有 comment（按 PR 评论列表过滤标记；GET 1 次，失败不阻塞发布）
   // 注意：gh api GET 默认 method 即 GET，无需显式传 "GET" 位置参数
@@ -170,7 +187,7 @@ function publishReviewCommentUpsert({ repo, pr, headOid, body, useUpsert }) {
     );
     if (existing && existing.id) {
       const patchRes = ghApiWithBackoff([
-        `-X PATCH`, `repos/${repo}/issues/comments/${existing.id}`,
+        '-X', 'PATCH', `repos/${repo}/issues/comments/${existing.id}`,
         `-F body=@${postedFile}`,
       ]);
       if (patchRes.ok) {
@@ -737,7 +754,7 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
     }
     if (r.architecture_assessment) {
       const aa = r.architecture_assessment;
-      lines.push(`  - architecture_assessment (object): {${(aa.fields || []).join(', ')}}; decision_values=${(aa.decision_values || []).join('|')}; when decision!="not_applicable" also require [${(aa.applicable_fields || []).join(', ')}] with mechanisms=[{${(aa.mechanism_fields || []).join(', ')}}] (responsibility=${(aa.responsibility_values || []).join('|')})`);
+      lines.push(`  - architecture_assessment (object): {${(aa.fields || []).join(', ')}}; decision_values=${(aa.decision_values || []).join('|')}; when decision!="not_applicable" also require [${(aa.applicable_fields || []).join(', ')}] (current_pr_boundary & validation_evidence MUST be non-empty strings, NOT arrays) with mechanisms=[{${(aa.mechanism_fields || []).join(', ')}}] (all strings; responsibility=${(aa.responsibility_values || []).join('|')})`);
     }
     if (r.scope_coverage) {
       const sc = r.scope_coverage;
@@ -749,6 +766,9 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
         ? Object.entries(dt.fields_by_verdict).map(([k, v]) => `${k}=[${(v || []).join(', ')}]`).join('; ')
         : '';
       lines.push(`  - decision_text_assessment (object): {${(dt.fields || []).join(', ')}}; verdict_values=${(dt.verdict_values || []).join('|')}${dtByVerdict ? `; fields_by_verdict: ${dtByVerdict}` : ''}; when verdict!="not_applicable" also require [${(dt.applicable_fields || []).join(', ')}] (clause_fields=[${(dt.clause_fields || []).join(', ')}], counterfactual_fields=[${(dt.counterfactual_fields || []).join(', ')}])`);
+    }
+    if (r.state_projection_counterfactuals && Array.isArray(r.state_projection_counterfactuals.cases)) {
+      lines.push(`  - state_projection_counterfactuals (non-empty array/string/object): cases=[${r.state_projection_counterfactuals.cases.join(', ')}] (or "not_applicable: <reason>" when no state projection drives behavior)`);
     }
     if (r.state_model_assessment) {
       lines.push(`  - state_model_assessment (object): classification_values=${(r.state_model_assessment.classification_values || []).join('|')}; item_fields=[${(r.state_model_assessment.item_fields || []).join(', ')}] (or {classification, reason} when no new state)`);
@@ -777,13 +797,13 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   const remoteChecksText = Array.isArray(remoteChecks) && remoteChecks.length
     ? remoteChecks.map(c => `- \`${c.name || 'check'}\`: state=${c.state || 'unknown'}, bucket=${c.bucket || 'unknown'}${c.link ? ` (${c.link})` : ''}`).join('\n')
     : (remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)');
-  const formattedDiff = formatDiffForPrompt(diff, 240000);
+  const fullDiff = String(diff || '');
   const head10 = headOid.slice(0, 10);
 
   return [
     '你是一名对抗性代码审查员（model agent）。请基于下方 LoopX 原生评审包（pr_review_queue 能力生成的 review_template / review_plan / evidence_commands）撰写第三方评审报告。',
     '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个二级标题（`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`）撰写。',
-    '执行铁律：下方已完整提供原生评审包、证据命令执行结果与完整 PR DIFF。请直接基于下方文本在单轮内立即输出最终 JSON 块，严禁调用任何 shell / exec_command / 文件读取工具（否则会触发超时阻断）。',
+    '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：下方已完整提供原生评审包、证据命令执行结果与完整 PR DIFF（无人工截断）。请专注于对抗性缺陷挖掘与高质量五段式报告撰写，直接输出单一 JSON 块，严禁调用任何 shell / exec_command / 文件读取工具。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
     '注意：`05-evidence.md`、CI 绿、PR 正文里的「已通过」只作为未信任的作者声明参考，禁止直接据此推断 `verified`。',
     '',
     '## 评审目标',
@@ -807,6 +827,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '- `changed_line_classification` 与 `code_volume` 的其余 packet 必填字段由你填写。缺任一必填字段，或 `compatibility_assessment` 不是对象时，整行保持 `unverified`。主机不会把缺字段的行标成 `verified`。',
     '- `symbol_map` 的语义字段由你按 packet 的 `item_fields` 填写。主机只接受本次 diff 中的精确 `path`，并覆盖 `line`。任一 `path` 不在本次 diff 中时，整行保持 `unverified`，不会按条目下标改写成别的文件。',
     '- `changed_invariant_positive` 与 `material_negative_or_failure` 默认 `unverified`（`npm test` 通过不证明改动不变量）；仅当你在 `evidence.validation_matrix` 中给出仓库内已存在的测试文件路径（如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），且该路径位于 `tests/` 下、文件名匹配 `.test.js` / `.test.mjs` / `.test.cjs` / `.test.ts`，主机执行 `node --test <该路径>` 退出码为 0 后才记为 `passed`。普通源码文件不会被执行。',
+    '- **非适用字段标准化免除（ADR-0013）**：对于与本次 PR 改动性质明显不相关的维度（例如无开关/feature flag 的直接修复对应的 `default_off_isolation`、无领域特定措辞变更的 `domain_neutrality`、无新角色/权限语义变更的 `authority_semantics`），允许直接输出 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体说明为何不适用>"}`，禁止为了凑字段编造虚假的反事实推理。',
     '- 判断类 id 由你独立核实后在 `evidence` 中填写；未核实或形状不完整的项将保持 `status: "unverified"`，主机绝不预填或回填占位句：',
     evidenceRequirements || '(本 PR 无额外 evidence requirements)',
     '',
@@ -830,16 +851,16 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     remoteChecksText,
     '',
     '## PR DIFF（远程权威）',
-    formattedDiff,
+    fullDiff,
     '',
     '## 输出格式（请输出单一 fenced json 块）',
-    '结构如下：你必须按上方「评审范围 evidence」逐项填写全部 required_evidence_ids（已独立核实且无缺口的项写 `"status": "verified"` 并填全全部必填字段与嵌套对象；确实存在未核实项时写 `"status": "unverified"` 且 verdict 只能为 `REQUEST_CHANGES`）。若代码确无阻塞缺陷且所有必填证据均已核实并完整填写（包括 `validation_matrix.changed_invariant_positive` 与 `material_negative_or_failure` 的真实 `tests/*.test.js` 路径，以及 `symbol_map` 的 2-5 个精确 diff 符号），请输出 `verdict: "APPROVE"`。其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals`、`outcome_impact`（含 `user_experience.visual_review`）和 `spec_basis` 并写入「动机」段；`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap` 并写入同一段：',
+    '结构如下：你必须按上方「评审范围 evidence」逐项填写全部 required_evidence_ids（已独立核实且无缺口的项写 `"status": "verified"` 并填全全部必填字段与嵌套对象；非适用项可直接写 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若个别判断项本轮未写全，主机将在阶段 2 基于你的报告做轻量结构化对齐）。若代码确无阻塞缺陷且所有必填证据均已核实（包括 `validation_matrix.changed_invariant_positive` 与 `material_negative_or_failure` 的真实 `tests/*.test.js` 路径，以及 `symbol_map` 的 2-5 个精确 diff 符号），请输出 `verdict: "APPROVE"`；存在阻塞缺陷时输出 `REQUEST_CHANGES`。其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals`、`outcome_impact`（含 `user_experience.visual_review`）和 `spec_basis` 并写入「动机」段；`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap` 并写入同一段：',
     '```json',
     JSON.stringify({
       review_body: 'Markdown 字符串：首行必须是 `Reviewer: model_agent · model=<model> · provider=<provider> · declaration=<declaration_source> · head=<headOid>`（declaration_source 默认 self_reported）；随后依次出现五个二级标题（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价），各章达到字数下限；「具体改动」下必须含 `### 关键代码讲解`；正文内须含精确 head oid；结尾须有一行 `English verdict: APPROVE` 或 `English verdict: REQUEST_CHANGES`。',
       verdict: 'APPROVE 或 REQUEST_CHANGES（大写，须与 review_body 中的 English verdict 完全一致）',
       findings: [{ file: '路径', line: '整数或 null', severity: 'P0|P1|P2|P3|blocker|major|minor|advisory', summary: '...', repro: '可选复现步骤' }],
-      reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-high', declared_provider: '如 openai' },
+      reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: '如 gemini-3.8-flash-tiered', declared_provider: '如 google' },
       evidence: {
         validation_matrix: {
           changed_invariant_positive: { test_path: 'tests/unit/相关测试.test.js（如存在）' },
@@ -872,20 +893,86 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ].join('\n');
 }
 
+function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, missingIds, missingValidationCases, evidenceContract, reviewPlan, evidenceText, validation }) {
+  const files = listFiles(diff || '');
+  const st = diffStats(diff || '');
+  const filteredPlan = {
+    ...(reviewPlan || {}),
+    required_evidence_ids: Array.isArray(missingIds) ? missingIds : [],
+  };
+  const reqText = formatEvidenceRequirementsForPrompt(evidenceContract, filteredPlan);
+  const head10 = String(headOid || '').slice(0, 10);
+  const effectiveBase = baseRef || (reviewPlan && reviewPlan.target && reviewPlan.target.base_ref) || 'main';
+  const validationSummary = Array.isArray(validation) && validation.length
+    ? validation.map(v => `- \`${v.case_id}\`: status=${v.status}; cmd=\`${v.command_or_check || ''}\`; result=${v.result || ''}`).join('\n')
+    : '(无)';
+  const evText = String(evidenceText || '').trim().slice(0, 8000);
+  const valCases = Array.isArray(missingValidationCases) ? missingValidationCases : [];
+
+  return [
+    '你是一名证据结构化对齐助手（ADR-0013 阶段 2）。请仅根据下方已经完成的阶段 1 五段式评审报告、文件改动清单和证据契约，补齐缺失的结构化判断类 `evidence` JSON。',
+    '约束：对已由阶段 1 报告和文件清单核实的项，必须输出 `"status": "verified"` 并填全契约列出的全部 `fields`、`verdict`（取自 `verdict_values`）与嵌套子对象；若某项不适用（如无特性开关的 `default_off_isolation`、无领域措辞变更的 `domain_neutrality`、无权限模型变更的 `authority_semantics`、无状态分类规则变更的 `typed_state_rule`、无默认行为变更的 `behavior_change_disclosure`、无建议/义务边界变更的 `guidance_vs_obligation`、无术语契约变更的 `semantic_alignment`），请直接输出 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若报告中缺乏足够依据，则保留 `"status": "unverified"`。',
+    '类型与非空硬性规范（LoopX result_check.py 校验规则）：',
+    '1. 严禁输出空数组 `[]` 或空对象 `{}`（会被判定为缺失）：例如无未核实维度时 `unverified_dimensions` 写 `["none: all applicable dimensions verified"]`，无变更时 `intentional_deltas` / `normalization_rules` 写 `["none: ..."]` 或 `"none: ..."`。',
+    '2. `problem_context` 的 `affected_caller_or_operator` / `before_after_scenario` / `observable_outcome` / `non_goals` / `remaining_gap` 以及 `architecture_assessment` 的 `reason` / `current_pr_boundary` / `validation_evidence` / `mechanisms[*].*` 必须是**字符串**（不得输出数组）。',
+    '3. `observable_semantics` 顶层不允许 `not_applicable`（`verdict_values=equivalent|intentional_change_validated|unintended_drift|not_yet_proven`），请结合基准分支、精确 head、阶段 1 报告与下方校验实测填全全部 13 个 `fields`（仅其内部嵌套的 `scope_coverage` / `decision_text_assessment` 在确实无门控范围或决策文本语义变化时可使用 `not_applicable`）。',
+    '执行铁律：直接输出单一 fenced json 块 `{"evidence": { ... }}`，严禁调用任何 shell / 文件读取工具。',
+    '',
+    `- PR: #${pr} · 基准 \`${effectiveBase}\` · 分支 \`${branch}\` · 精确 head \`${head10}\` (\`${headOid}\`)`,
+    `- 改动文件列表（共 ${files.length} 个文件，+${st.additions}/-${st.deletions}）：${files.join(', ') || '(无)'}`,
+    '',
+    '## 主机本地校验与门禁摘要',
+    validationSummary,
+    '',
+    ...(evText ? ['## 证据采集命令输出摘要', evText, ''] : []),
+    '## 待补齐的证据项契约',
+    reqText || '(无)',
+    '',
+    ...(valCases.length ? [
+      '## 待补齐的 validation_matrix 不变量测试路径',
+      `- 尚未指定仓库内测试文件的 case_id: ${valCases.join(', ')}`,
+      '- 请根据下方阶段 1 评审报告及本次改动文件列表，在 `evidence.validation_matrix` 中补充仓库内已存在的 `tests/**/*.test.js` 文件路径（例如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），主机将在阶段 2 后直接执行 `node --test <path>` 实测核验。',
+      '',
+    ] : []),
+    '## 阶段 1 已产出的评审报告正文',
+    String(reviewBody || ''),
+    '',
+    '## 输出格式',
+    '```json',
+    JSON.stringify({
+      evidence: {
+        '<evidence_id>': {
+          status: 'verified 或 not_applicable',
+          verdict: '若契约含 verdict_values 则必填；not_applicable 时写 not_applicable',
+          reason: '当 status 为 not_applicable 时必填具体事实依据；status 为 verified 时按契约填全所有 fields 与嵌套对象',
+        },
+      },
+    }, null, 2),
+    '```',
+  ].join('\n');
+}
+
 function runReviewAgent(agentBin, prompt, timeoutMs) {
   const which = sh('which', [agentBin]);
   if (which.status !== 0) return { unavailable: true };
-  const args = agentBin.includes('claude') ? ['-p', prompt] : ['exec', prompt];
+  // ADR-0013 / REQ-REVIEW-2: 通过 stdin 流式传输提示词，禁止用 CLI argv 传巨型字符串触碰 ARG_MAX。
+  const args = agentBin.includes('claude') ? ['-p'] : ['exec', '-'];
   let tmpMsg = null;
   if (!agentBin.includes('claude')) {
-    tmpMsg = path.join(os.tmpdir(), `codex-review-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+    tmpMsg = path.join(ensureSandboxTmpDir(), `codex-review-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
     args.splice(1, 0, '-o', tmpMsg);
   }
-  const r = spawnSync(agentBin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs || TIMEOUT_MS });
+  const r = spawnSync(agentBin, args, {
+    input: String(prompt || ''),
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: timeoutMs || TIMEOUT_MS,
+  });
   if (r.status !== 0) return { error: `exit ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}` };
   if (tmpMsg && fs.existsSync(tmpMsg)) {
     const out = fs.readFileSync(tmpMsg, 'utf8');
-    try { fs.unlinkSync(tmpMsg); } catch (_) {}
+    try { fs.rmSync(tmpMsg, { force: true }); } catch (_) {}
     return { stdout: out };
   }
   return { stdout: r.stdout };
@@ -1310,7 +1397,12 @@ function main() {
 
   // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
   const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || 'codex';
+  const stage1PromptFile = writePromptArtifact(o.pr, headOid, prompt, 'stage1');
+  console.log(`[i] 阶段 1 评审提示词已写入沙箱文件: ${stage1PromptFile} (通过 stdin 流式传入 ${primaryAgent})`);
   const agentRun = runReviewAgent(primaryAgent, prompt);
+  if (process.env.REVIEW_KEEP_PROMPT !== '1') {
+    try { fs.rmSync(stage1PromptFile, { force: true }); } catch (_) {}
+  }
   if (agentRun.unavailable) {
     console.error(`[NOT_VERIFIED] ${primaryAgent} CLI unavailable; refusing to publish an unreviewed report.`);
     process.exit(1);
@@ -1354,12 +1446,84 @@ function main() {
     console.error('[NOT_VERIFIED] 原生模型输出缺少 review_body；禁止自造降级正文发布。');
     process.exit(1);
   }
-  const autoEvidence = buildEvidenceGraph({
+  let mergedModelEvidence = modelOut.evidence && typeof modelOut.evidence === 'object'
+    ? { ...modelOut.evidence }
+    : null;
+  let autoEvidence = buildEvidenceGraph({
     contract: pkt.evidenceContract || {},
     plan: pkt.reviewPlan || {},
     diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
-    modelEvidence: modelOut.evidence && typeof modelOut.evidence === 'object' ? modelOut.evidence : null,
+    modelEvidence: mergedModelEvidence,
   });
+
+  // ADR-0013 阶段 2（两阶段解耦）：当模型阶段 1 主观 verdict=APPROVE 但仍有未对齐的判断类证据行时，
+  // 基于阶段 1 评审报告 + 文件清单做轻量定向结构化抽取（不传全量 diff），再由主机重跑 buildEvidenceGraph。
+  const unverifiedForStage2 = Object.entries(autoEvidence)
+    .filter(([k, v]) => k !== 'validation_matrix' && v && v.status === 'unverified')
+    .map(([k]) => k);
+  const unverifiedValidationCases = (autoEvidence.validation_matrix && Array.isArray(autoEvidence.validation_matrix.items))
+    ? autoEvidence.validation_matrix.items
+        .filter(it => it && (it.case_id === 'changed_invariant_positive' || it.case_id === 'material_negative_or_failure') && it.status === 'unverified')
+        .map(it => it.case_id)
+    : [];
+  if (verdict === 'APPROVE' && (unverifiedForStage2.length > 0 || unverifiedValidationCases.length > 0) && process.env.REVIEW_TWO_STAGE_ALIGNMENT !== '0') {
+    const stage2Prompt = buildStage2Prompt({
+      pr: o.pr,
+      headOid,
+      branch: head.headRefName,
+      baseRef: (pkt.reviewPlan && pkt.reviewPlan.target && pkt.reviewPlan.target.base_ref) || 'main',
+      reviewBody: modelOut.review_body,
+      diff,
+      missingIds: unverifiedForStage2,
+      missingValidationCases: unverifiedValidationCases,
+      evidenceContract: pkt.evidenceContract || {},
+      reviewPlan: pkt.reviewPlan || {},
+      evidenceText,
+      validation,
+    });
+    const stage2PromptFile = writePromptArtifact(o.pr, headOid, stage2Prompt, 'stage2');
+    console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length + unverifiedValidationCases.length} 项): ${stage2PromptFile}`);
+    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt);
+    if (process.env.REVIEW_KEEP_PROMPT !== '1') {
+      try { fs.rmSync(stage2PromptFile, { force: true }); } catch (_) {}
+    }
+    if (!stage2Run.unavailable && !stage2Run.error) {
+      const parsedStage2 = extractJson(stage2Run.stdout || '');
+      const stage2Evidence = parsedStage2 && parsedStage2.evidence && typeof parsedStage2.evidence === 'object'
+        ? parsedStage2.evidence
+        : null;
+      if (stage2Evidence) {
+        const nextInput = mergedModelEvidence ? { ...mergedModelEvidence } : {};
+        for (const id of unverifiedForStage2) {
+          if (stage2Evidence[id] && typeof stage2Evidence[id] === 'object') {
+            nextInput[id] = stage2Evidence[id];
+          }
+        }
+        if (unverifiedValidationCases.length && stage2Evidence.validation_matrix && typeof stage2Evidence.validation_matrix === 'object') {
+          const prevVm = nextInput.validation_matrix && typeof nextInput.validation_matrix === 'object'
+            ? { ...nextInput.validation_matrix }
+            : {};
+          for (const cid of unverifiedValidationCases) {
+            if (stage2Evidence.validation_matrix[cid] !== undefined) {
+              prevVm[cid] = stage2Evidence.validation_matrix[cid];
+            } else if (Array.isArray(stage2Evidence.validation_matrix.items)) {
+              const found = stage2Evidence.validation_matrix.items.find(it => it && it.case_id === cid);
+              if (found) prevVm[cid] = found;
+            }
+          }
+          nextInput.validation_matrix = prevVm;
+        }
+        mergedModelEvidence = nextInput;
+        autoEvidence = buildEvidenceGraph({
+          contract: pkt.evidenceContract || {},
+          plan: pkt.reviewPlan || {},
+          diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
+          modelEvidence: mergedModelEvidence,
+        });
+      }
+    }
+  }
+
   const problemContext = autoEvidence.problem_context || null;
   const carryoverSection = buildCarryoverSection(carryover, priorFindings);
   let reviewBody = finalizeReviewBody(modelOut.review_body, {
@@ -1372,7 +1536,7 @@ function main() {
     reviewBody = reviewBody.replace(/(##\s*改动思路[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 架构边界：${archAssessment.reason}`);
   }
   if (archAssessment && archAssessment.current_pr_boundary && !reviewBody.includes(archAssessment.current_pr_boundary)) {
-    reviewBody = reviewBody.replace(/(##\s*我的整体评价[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 当前 PR 边界：${archAssessment.current_pr_boundary}`);
+    reviewBody = reviewBody.replace(/(##\s*我的整体评价[\s\S]*?)(?=\n##\s|\nEnglish verdict:|$)/, (m) => `${m}\n\n> 当前 PR 边界：${archAssessment.current_pr_boundary}`);
   }
   const walkthrough = assertKeyCodeWalkthrough(reviewBody, pkt.behaviorBearing);
   if (!walkthrough.pass) {
@@ -1417,13 +1581,14 @@ function main() {
 
   // --- 7. 原生 check-result 硬门禁（ok=true 才允许发布）---
   {
+    const sandboxTmp = ensureSandboxTmpDir();
     const packetPath = o.packetFile && fs.existsSync(o.packetFile)
       ? o.packetFile
-      : path.join(os.tmpdir(), `loopx-pr-review-packet-${o.pr}.json`);
+      : path.join(sandboxTmp, `loopx-pr-review-packet-${o.pr}.json`);
     if (!o.packetFile) fs.writeFileSync(packetPath, JSON.stringify(packet, null, 2));
 
     const evidence = Object.keys(autoEvidence).length ? autoEvidence : { problem_context: { status: 'unverified' } };
-    const resultPath = path.join(os.tmpdir(), `authentic-review-result-${o.pr}.json`);
+    const resultPath = path.join(sandboxTmp, `authentic-review-result-${o.pr}.json`);
     const buildResultFile = () => ({
       schema_version: 'pull_request_review_result_v1',
       review_policy_revision: policy.revision,
@@ -1461,7 +1626,7 @@ function main() {
       runCheck();
     }
 
-    const reportOut = path.join(os.tmpdir(), `authentic-review-check-${o.pr}.json`);
+    const reportOut = path.join(sandboxTmp, `authentic-review-check-${o.pr}.json`);
     fs.writeFileSync(reportOut, check.raw || JSON.stringify(check, null, 2));
     if (check.parsed) {
       console.log(`[✓] loopx pr-review --check-result: ok=${check.parsed.ok} approval_consistent=${check.parsed.approval_consistent}`);
@@ -1489,7 +1654,7 @@ function main() {
   // --- 9. 可选：用胶囊重建 PR body ---
   if (o.rebuildBody) {
     const body = buildBody(feature, diff);
-    const bodyFile = path.join(os.tmpdir(), `authentic-body-${o.pr}.md`);
+    const bodyFile = path.join(ensureSandboxTmpDir(), `authentic-body-${o.pr}.md`);
     fs.writeFileSync(bodyFile, body);
     console.log(body);
     const ed = sh('gh', ['pr', 'edit', String(o.pr), '--repo', o.repo, '--body-file', bodyFile]);
@@ -1509,8 +1674,10 @@ if (require.main === module) main();
 module.exports = {
   finalizeReviewBody,
   buildNativePrompt,
+  buildStage2Prompt,
   formatEvidenceRequirementsForPrompt,
   capVerdictInBody,
+  runReviewAgent,
   parsePolicyRevision,
   resolveLoopxExecutable,
   resolveReviewPolicyRevision,
