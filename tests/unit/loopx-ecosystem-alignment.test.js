@@ -87,7 +87,7 @@ test("8. Response Safety & Native Format Reuse: cmd_respond delegates to respond
 
 test("9. Cross-Model CLI Adaptation: runReviewAgent supports claude -p vs codex exec and parseArgs handles --agent-bin", () => {
   const scriptContent = fs.readFileSync(AUTHENTIC_REVIEW_SCRIPT, "utf8");
-  assert.strictEqual(scriptContent.includes("agentBin.includes('claude') ? ['-p', prompt] : ['exec', prompt]"), true, "Must support claude -p vs codex exec");
+  assert.strictEqual(scriptContent.includes("agentBin.includes('claude') ? ['-p'] : ['exec', '-']"), true, "Must support claude -p vs codex exec - via stdin streaming");
   assert.strictEqual(scriptContent.includes("o.agentBin = argv[++i]"), true, "Must parse --agent-bin argument");
   const flowCode = fs.readFileSync(LOOPX_FLOW, "utf8");
   assert.match(flowCode, /--agent-bin/, "cmd_review must forward --agent-bin flag");

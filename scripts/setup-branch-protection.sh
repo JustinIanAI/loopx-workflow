@@ -324,8 +324,15 @@ run_check() {
     fi
 
     local out="" rules_out="[]" rules_ok=0 prot_ok=0
+    local prot_err_kind=""
     if out="$(gh api "repos/${REPO}/branches/${BRANCH}/protection" 2>&1)"; then
         prot_ok=1
+    else
+        prot_err_kind="$(classify_api_failure "$out")"
+        if [[ "$prot_err_kind" != "protection_missing" ]]; then
+            emit_check_json false "$prot_err_kind"
+            return 1
+        fi
     fi
     if rules_out="$(gh api "repos/${REPO}/rules/branches/${BRANCH}" 2>/dev/null)"; then
         if node -e 'const d = JSON.parse(process.argv[1]); process.exit(Array.isArray(d) && d.length > 0 ? 0 : 1);' "$rules_out" 2>/dev/null; then
@@ -342,7 +349,7 @@ run_check() {
         run_compare "null" "$rules_out"
         return $?
     else
-        emit_check_json false "$(classify_api_failure "$out")"
+        emit_check_json false "${prot_err_kind:-protection_missing}"
         return 1
     fi
 }

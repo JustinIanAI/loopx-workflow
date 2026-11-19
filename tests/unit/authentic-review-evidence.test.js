@@ -9,10 +9,11 @@ const {
   buildValidationMatrix,
   describeFileFromDiff,
   scanDiff,
-  formatDiffForPrompt,
+  isolatedNodeTestEnv,
 } = require('../../skills/code-review/scripts/evidence-builder.js');
 const {
   buildNativePrompt,
+  buildStage2Prompt,
   finalizeReviewBody,
   capVerdictInBody,
 } = require('../../skills/code-review/scripts/authentic-review.js');
@@ -428,7 +429,7 @@ test('scanDiff finds high-signal additions only', () => {
   assert.strictEqual(findings.filter(f => f.rule === 'tracked-todo').length, 1);
 });
 
-test('formatDiffForPrompt preserves tail test files and file inventory when diff exceeds maxChars (P0-A2)', () => {
+test('ADR-0013：buildNativePrompt 完整透传超 240KB Diff（无人工截断）并支持 not_applicable 与两阶段提示词', () => {
   const hugeProd = [
     'diff --git a/bin/huge-prod.js b/bin/huge-prod.js',
     '--- a/bin/huge-prod.js',
@@ -446,23 +447,72 @@ test('formatDiffForPrompt preserves tail test files and file inventory when diff
   ].join('\n');
   const full = `${hugeProd}\n${tailTest}`;
   assert.ok(full.length > 240000);
-  const formatted = formatDiffForPrompt(full, 240000);
-  assert.match(formatted, /Diff File Inventory/);
-  assert.match(formatted, /bin\/huge-prod\.js/);
-  assert.match(formatted, /tests\/unit\/tail-invariant\.test\.js/);
-  assert.match(formatted, /tail invariant preserved/);
-  assert.match(formatted, /FILE_DIFF_COMPACTED/);
-  assert.ok(formatted.length <= 240000);
+  const prompt = buildNativePrompt({
+    pr: 28,
+    headOid: 'a'.repeat(40),
+    branch: 'refactor/adr-0013',
+    motivation: 'ADR-0013',
+    reviewTemplate: { sections: [], output_hint: '' },
+    reviewPlan: { required_evidence_ids: ['problem_context'] },
+    evidenceCommands: [],
+    evidenceText: '',
+    diff: full,
+    priorFindings: [],
+    evidenceContract: CONTRACT,
+  });
+  assert.ok(prompt.includes('tail invariant preserved'), 'full diff including tail tests must not be truncated');
+  assert.doesNotMatch(prompt, /\[TRUNCATED\]|FILE_DIFF_COMPACTED/);
 
-  const manySmall = Array.from({ length: 50 }, (_, i) => [
-    `diff --git a/src/mod-${i}.js b/src/mod-${i}.js`,
-    `--- a/src/mod-${i}.js`,
-    `+++ b/src/mod-${i}.js`,
-    '@@ -1,1 +1,10 @@',
-    `+const x${i} = "${'a'.repeat(1800)}";`,
-  ].join('\n')).join('\n');
-  const bounded = formatDiffForPrompt(manySmall, 72000);
-  assert.ok(bounded.length <= 72000, `expected <= 72000, got ${bounded.length}`);
+  // not_applicable normalization for non-applicable dimensions
+  const naContract = {
+    evidence_requirements: [
+      { evidence_id: 'default_off_isolation', fields: ['opt_in_or_default_off_claim', 'verdict'], verdict_values: ['isolated', 'not_applicable'] },
+      { evidence_id: 'domain_neutrality', fields: ['obligation_or_error_text'] },
+    ],
+  };
+  const naGraph = buildEvidenceGraph({
+    contract: naContract,
+    plan: { required_evidence_ids: ['default_off_isolation', 'domain_neutrality'] },
+    diff: DIFF,
+    headOid: 'a'.repeat(40),
+    pr: 28,
+    motivation: 'm',
+    validation: [],
+    modelEvidence: {
+      default_off_isolation: { status: 'not_applicable', reason: 'No feature toggle changed.' },
+      domain_neutrality: { status: 'not_applicable', reason: 'No control-plane domain text touched.' },
+    },
+  });
+  assert.strictEqual(naGraph.default_off_isolation.status, 'verified');
+  assert.strictEqual(naGraph.default_off_isolation.verdict, 'not_applicable');
+  assert.strictEqual(naGraph.default_off_isolation.opt_in_or_default_off_claim, 'not_applicable: No feature toggle changed.');
+  assert.strictEqual(naGraph.domain_neutrality.status, 'verified');
+  assert.strictEqual(naGraph.domain_neutrality.obligation_or_error_text, 'not_applicable: No control-plane domain text touched.');
+
+  const cleanEnv = isolatedNodeTestEnv({
+    PATH: process.env.PATH,
+    REVIEW_SHORTCIRCUIT: '1',
+    REVIEW_DEBOUNCE_SECONDS: '60',
+    REVIEW_UPSERT_PUBLISH: '1',
+  });
+  assert.strictEqual(cleanEnv.REVIEW_SHORTCIRCUIT, undefined);
+  assert.strictEqual(cleanEnv.REVIEW_DEBOUNCE_SECONDS, undefined);
+  assert.strictEqual(cleanEnv.REVIEW_UPSERT_PUBLISH, undefined);
+
+  // Stage 2 prompt stays compact (omits raw diff hunks) and passes Stage 1 reviewBody + missingIds
+  const stage2 = buildStage2Prompt({
+    pr: 28,
+    headOid: 'a'.repeat(40),
+    branch: 'refactor/adr-0013',
+    reviewBody: '## 动机\n阶段 1 报告正文',
+    diff: full,
+    missingIds: ['semantic_alignment'],
+    evidenceContract: CONTRACT,
+    reviewPlan: PLAN,
+  });
+  assert.match(stage2, /阶段 1 报告正文/);
+  assert.match(stage2, /semantic_alignment/);
+  assert.doesNotMatch(stage2, /padding_payload_/);
 });
 
 test('buildValidationMatrix maps remoteChecks into repository_required_checks and diagnostic rows (P0-A2)', () => {
@@ -571,4 +621,157 @@ test('buildNativePrompt includes nested evidence specs, remote checks, and capVe
   assert.doesNotMatch(capped, /Approval conclusion \(author-owned PR/);
   assert.match(capped, /Request changes conclusion \(author-owned PR/);
   assert.match(capped, /^English verdict:\s*REQUEST_CHANGES\s*$/m);
+});
+
+test('ADR-0013 schema hardening: coerces string arrays on problem_context/architecture_assessment and rejects disallowed not_applicable', () => {
+  const naDisallowedContract = {
+    evidence_requirements: [
+      ...CONTRACT.evidence_requirements,
+      {
+        evidence_id: 'observable_semantics',
+        fields: ['baseline_revision', 'reviewed_head', 'caller_branch_inventory', 'comparison_rows', 'execution_receipts', 'normalization_rules', 'intentional_deltas', 'regression_sensitivity', 'state_projection_counterfactuals', 'scope_coverage', 'decision_text_assessment', 'unverified_dimensions', 'verdict'],
+        verdict_values: ['equivalent', 'intentional_change_validated', 'unintended_drift', 'not_yet_proven'],
+      },
+    ],
+  };
+  const ev = buildEvidenceGraph({
+    contract: naDisallowedContract,
+    plan: {
+      required_evidence_ids: ['problem_context', 'change_proportionality', 'observable_semantics'],
+    },
+    diff: DIFF,
+    headOid: 'a'.repeat(40),
+    pr: 36,
+    motivation: 'm',
+    validation: [],
+    modelEvidence: {
+      problem_context: {
+        status: 'verified',
+        verdict: 'goal_achieved',
+        goal_basis: 'gb',
+        author_claim: 'ac',
+        old_behavior: 'ob',
+        affected_caller_or_operator: ['reviewer', 'maintainer'],
+        compounding_cost: 'cc',
+        before_after_scenario: 'ba',
+        smaller_fix_analysis: 'sfa',
+        observable_outcome: 'oo',
+        non_goals: ['no python core change', 'no UI change'],
+        outcome_impact: {
+          long_horizon: { decision: 'improved', reason: 'r' },
+          user_experience: { decision: 'improved', reason: 'r', visual_review: { decision: 'not_applicable', reason: 'CLI only' } },
+        },
+        spec_basis: { decision: 'no_spec', spec_source: 'none', reason: 'r' },
+      },
+      change_proportionality: {
+        status: 'verified',
+        verdict: 'proportionate',
+        original_problem: 'op',
+        frequency_or_severity: 'fs',
+        affected_users_or_operators: 'auo',
+        failure_cost_and_recovery: 'fcr',
+        smallest_viable_fix: 'svf',
+        production_mechanism_cost: 'pmc',
+        new_state_contract_or_cli_surface: 'nsc',
+        maintenance_and_migration_cost: 'mmc',
+        alternatives_considered: 'alt',
+        scope_growth_since_initial_review: 'sg',
+        repository_architecture_constraints: 'rac',
+        strongest_case_against_shipping: 'scas',
+        why_smaller_or_existing_owner_is_insufficient: 'wse',
+        architecture_assessment: {
+          decision: 'retain',
+          reason: 'clean boundary',
+          current_pr_boundary: ['skills/code-review/', 'tests/unit/'],
+          validation_evidence: ['tests/unit/a.test.js', 'tests/unit/b.test.js'],
+          mechanisms: [
+            {
+              mechanism: 'stdin streaming',
+              responsibility: 'provider_io',
+              owning_boundary: 'authentic-review.js',
+              activation_and_default: 'always on',
+              failure_and_recovery: 'non-zero exit',
+              placement_basis: 'ADR-0013',
+            },
+          ],
+        },
+      },
+      observable_semantics: {
+        status: 'not_applicable',
+        reason: 'must not bypass verdict_values without not_applicable',
+      },
+    },
+  });
+  assert.strictEqual(ev.problem_context.status, 'verified');
+  assert.strictEqual(ev.problem_context.non_goals, 'no python core change；no UI change');
+  assert.strictEqual(ev.problem_context.affected_caller_or_operator, 'reviewer；maintainer');
+  assert.strictEqual(ev.change_proportionality.status, 'verified');
+  assert.strictEqual(ev.change_proportionality.architecture_assessment.current_pr_boundary, 'skills/code-review/；tests/unit/');
+  assert.strictEqual(ev.change_proportionality.architecture_assessment.validation_evidence, 'tests/unit/a.test.js；tests/unit/b.test.js');
+  assert.deepStrictEqual(ev.observable_semantics, { status: 'unverified' });
+
+  const stage2Prompt = buildStage2Prompt({
+    pr: 36,
+    headOid: 'a'.repeat(40),
+    branch: 'refactor/adr-0013',
+    baseRef: 'main',
+    reviewBody: '## 动机\n报告正文',
+    diff: DIFF,
+    missingIds: ['observable_semantics'],
+    evidenceContract: naDisallowedContract,
+    reviewPlan: { required_evidence_ids: ['observable_semantics'], target: { base_ref: 'main' } },
+    evidenceText: '### `echo evidence-ok`\n```\nevidence-ok\n```',
+    validation: [{ case_id: 'test', status: 'passed', command_or_check: 'npm run test', result: 'ok' }],
+  });
+  assert.match(stage2Prompt, /基准 `main`/);
+  assert.match(stage2Prompt, /npm run test/);
+  assert.match(stage2Prompt, /evidence-ok/);
+  assert.match(stage2Prompt, /严禁输出空数组/);
+  assert.doesNotMatch(stage2Prompt, /\+new evidence line/);
+
+  // Array test_path in validation_matrix is executed when all elements are valid repo test files
+  const arrRan = [];
+  const arrEv = build({
+    modelEvidence: {
+      validation_matrix: {
+        changed_invariant_positive: {
+          test_path: [
+            'tests/unit/authentic-review-evidence.test.js',
+            'tests/unit/authentic-review-pipeline.test.js',
+          ],
+        },
+      },
+    },
+    runNodeTest: (relPath) => {
+      arrRan.push(relPath);
+      return { status: 0, stdout: 'ok', stderr: '' };
+    },
+  });
+  assert.deepStrictEqual(arrRan, [
+    'tests/unit/authentic-review-evidence.test.js',
+    'tests/unit/authentic-review-pipeline.test.js',
+  ]);
+  const arrPos = arrEv.validation_matrix.items.find(i => i.case_id === 'changed_invariant_positive');
+  assert.strictEqual(arrPos.status, 'passed');
+
+  // Reject whole array if any path tries to escape repo
+  const badRan = [];
+  const badEv = build({
+    modelEvidence: {
+      validation_matrix: {
+        changed_invariant_positive: {
+          test_path: [
+            'tests/unit/authentic-review-evidence.test.js',
+            '../outside.test.js',
+          ],
+        },
+      },
+    },
+    runNodeTest: (relPath) => {
+      badRan.push(relPath);
+      return { status: 0, stdout: 'ok', stderr: '' };
+    },
+  });
+  assert.deepStrictEqual(badRan, []);
+  assert.strictEqual(badEv.validation_matrix.items.find(i => i.case_id === 'changed_invariant_positive').status, 'unverified');
 });

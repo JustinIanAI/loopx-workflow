@@ -108,10 +108,18 @@ case "$0" in
     if [[ "$args" == *"edit"* ]]; then exit 0; fi
     exit 0 ;;
   *codex)
+    if [[ ! -t 0 ]]; then
+      cat >> ${JSON.stringify(logs)}/calls.log
+      printf '\n' >> ${JSON.stringify(logs)}/calls.log
+    fi
     if [[ "${codexExit}" != "0" ]]; then exit ${codexExit}; fi
     cat "${codexStdoutFile}"
     exit 0 ;;
   *claude)
+    if [[ ! -t 0 ]]; then
+      cat >> ${JSON.stringify(logs)}/calls.log
+      printf '\n' >> ${JSON.stringify(logs)}/calls.log
+    fi
     if [[ -n "${claudeStdoutFile}" ]]; then cat "${claudeStdoutFile}"; else
       echo '{"schemaVersion":"authentic_review_result_v1","verdict":"approve","findings":[],"declaration":{"reviewer":"claude","model":"claude-default","declaration":"self_reported"}}'
     fi
@@ -191,7 +199,9 @@ exit 0
   fs.chmodSync(path.join(bin, 'loopx'), 0o755);
   fs.chmodSync(path.join(bin, 'npm'), 0o755);
   fs.chmodSync(path.join(bin, 'claude'), 0o755);
-  return { dir, bin, logs: path.join(logs, 'calls.log') };
+  const tmpDir = path.join(dir, 'tmp');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  return { dir, bin, logs: path.join(logs, 'calls.log'), tmpDir };
 }
 
 function run(sbx, args, envExtra) {
@@ -200,7 +210,13 @@ function run(sbx, args, envExtra) {
     PATH: `${sbx.bin}:${process.env.PATH}`,
     AUTHENTIC_REVIEW_HEAD_OID: HEAD,
     REVIEW_MODEL: 'codex',
+    LOOPX_TMP_DIR: sbx.tmpDir,
   };
+  delete env.REVIEW_SHORTCIRCUIT;
+  delete env.REVIEW_DEBOUNCE_SECONDS;
+  delete env.REVIEW_UPSERT_PUBLISH;
+  delete env.REVIEW_KEEP_PROMPT;
+  delete env.REVIEW_TWO_STAGE_ALIGNMENT;
   if (envExtra) Object.assign(env, envExtra);
   try {
     const out = execFileSync('node', [SCRIPT, ...args], { env, encoding: 'utf8', cwd: PROJECT_ROOT, timeout: 120000 });
@@ -219,6 +235,7 @@ describe('S1 invocation: codex exec with default model', () => {
     assert.strictEqual(r.code, 0, r.out);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
     assert.match(calls, /codex exec/);
+    assert.match(calls, /codex exec -o .* -$/m);
     assert.doesNotMatch(calls, /codex exec .*-m |codex exec .*--model /);
   });
 });
@@ -530,7 +547,7 @@ describe('R3 carryover adjudication', () => {
     fs.writeFileSync(carry, JSON.stringify({ findings: [{ file: 'src/a.js', severity: 'P1', summary: 'still here' }] }));
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--carryover-file', carry]);
     assert.strictEqual(r.code, 0, r.out);
-    const result = JSON.parse(fs.readFileSync(path.join(os.tmpdir(), 'authentic-review-result-7.json'), 'utf8'));
+    const result = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
     assert.ok(result.review_body.includes('上轮 findings 裁决'));
     assert.ok(result.review_body.indexOf('上轮 findings 裁决') < result.review_body.indexOf('English verdict'));
   });
@@ -652,5 +669,130 @@ describe('P0-A1 gates env isolation', () => {
       else process.env.AUTHENTIC_REVIEW_GATES_BIN = prevBin;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('ADR-0013 stdin streaming, sandbox prompt artifact, two-stage alignment & PATCH arg fix', () => {
+  test('two-stage alignment resolves missing evidence on APPROVE and stores prompt in LOOPX_TMP_DIR', () => {
+    const sbx = makeSandbox({ verdict: 'approve' });
+    const stage1File = path.join(sbx.dir, 'stage1.json');
+    const stage2File = path.join(sbx.dir, 'stage2.json');
+    fs.writeFileSync(stage1File, nativeModelOut({ verdict: 'approve', findings: [] }));
+    fs.writeFileSync(stage2File, '```json\n{"evidence":{"e1":{"status":"verified","summary":"aligned in stage 2"}}}\n```');
+    // Override mock codex to emit stage1 on first call and stage2 on second call
+    const counterFile = path.join(sbx.dir, 'codex-count');
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/usr/bin/env bash
+echo "$0 $*" >> ${JSON.stringify(sbx.logs)}
+if [[ ! -t 0 ]]; then cat >> ${JSON.stringify(sbx.logs)}; printf '\\n' >> ${JSON.stringify(sbx.logs)}; fi
+n=0
+if [[ -f ${JSON.stringify(counterFile)} ]]; then n=$(cat ${JSON.stringify(counterFile)}); fi
+n=$((n+1))
+echo "$n" > ${JSON.stringify(counterFile)}
+if [[ "$n" == "1" ]]; then cat ${JSON.stringify(stage1File)}; else cat ${JSON.stringify(stage2File)}; fi
+exit 0
+`, { mode: 0o755 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { REVIEW_KEEP_PROMPT: '1' });
+    assert.strictEqual(r.code, 0, r.out);
+    assert.match(r.out, /阶段 2 证据对齐/);
+    assert.strictEqual(fs.existsSync(path.join(sbx.tmpDir, `review-prompt-7-${HEAD.slice(0, 10)}.md`)), true);
+    assert.strictEqual(fs.existsSync(path.join(sbx.tmpDir, `review-prompt-7-${HEAD.slice(0, 10)}-stage2.md`)), true);
+    const resultJson = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
+    assert.strictEqual(resultJson.evidence.e1.status, 'verified');
+  });
+
+  test('ghApiWithBackoff PATCH passes separate -X and PATCH tokens (no leading space method)', () => {
+    const src = fs.readFileSync(SCRIPT, 'utf8');
+    assert.strictEqual(src.includes("'-X', 'PATCH'"), true, 'must pass -X and PATCH as separate args');
+    assert.strictEqual(src.includes('`-X PATCH`'), false, 'must not embed space in -X PATCH single arg');
+  });
+
+  test('architecture_assessment boundary note is inserted before English verdict line', () => {
+    const sbx = makeSandbox({ verdict: 'approve' });
+    const packetFile = path.join(sbx.dir, 'packet.json');
+    fs.writeFileSync(packetFile, JSON.stringify({
+      schema_version: 'pull_request_review_packet_v0',
+      repository: 'o/r',
+      reviewer_execution: { status: 'unavailable', reason: 'session_not_bound' },
+      agent_response_contract: {
+        review_execution_contract: {
+          policy_revision: 26,
+          evidence_requirements: [
+            {
+              evidence_id: 'change_proportionality',
+              fields: ['architecture_assessment', 'verdict'],
+              verdict_values: ['proportionate'],
+            },
+          ],
+        },
+      },
+      pull_requests: [{
+        number: 7,
+        head_oid: HEAD,
+        headRefOid: HEAD,
+        headRefName: 'feature/x',
+        title: 't',
+        review_action_kind: 'review',
+        review_template: {
+          schema: 'pr_review_five_block_template_v0',
+          sections: [
+            { label: '动机', minimum_prose_characters: 5, agent_instruction: 'm' },
+            { label: '改动思路', minimum_prose_characters: 5, agent_instruction: 'a' },
+            { label: '具体改动', minimum_prose_characters: 5, agent_instruction: 'c' },
+            { label: '对主干的风险', minimum_prose_characters: 5, agent_instruction: 'r' },
+            { label: '我的整体评价', minimum_prose_characters: 5, agent_instruction: 'v' },
+          ],
+          output_hint: 'ok',
+        },
+        review_plan: { required_evidence_ids: ['change_proportionality'], applicability: { behavior_bearing_change: true } },
+        evidence_commands: [],
+        motivation: '',
+      }],
+    }));
+    const stage1File = path.join(sbx.dir, 'stage1-arch.json');
+    const stage2File = path.join(sbx.dir, 'stage2-arch.json');
+    fs.writeFileSync(stage1File, nativeModelOut({ verdict: 'approve', findings: [] }));
+    fs.writeFileSync(stage2File, '```json\n' + JSON.stringify({
+      evidence: {
+        change_proportionality: {
+          status: 'verified',
+          verdict: 'proportionate',
+          architecture_assessment: {
+            decision: 'retain',
+            reason: 'arch boundary reason xyz',
+            current_pr_boundary: 'skills/code-review/ only',
+            validation_evidence: ['tests/unit/a.test.js', 'tests/unit/b.test.js'],
+            mechanisms: [{
+              mechanism: 'stdin',
+              responsibility: 'provider_io',
+              owning_boundary: 'authentic-review.js',
+              activation_and_default: 'always',
+              failure_and_recovery: 'exit 1',
+              placement_basis: 'ADR-0013',
+            }],
+          },
+        },
+      },
+    }) + '\n```');
+    const counterFile = path.join(sbx.dir, 'codex-count-arch');
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/usr/bin/env bash
+if [[ ! -t 0 ]]; then cat >/dev/null; fi
+n=0
+if [[ -f ${JSON.stringify(counterFile)} ]]; then n=$(cat ${JSON.stringify(counterFile)}); fi
+n=$((n+1))
+echo "$n" > ${JSON.stringify(counterFile)}
+if [[ "$n" == "1" ]]; then cat ${JSON.stringify(stage1File)}; else cat ${JSON.stringify(stage2File)}; fi
+exit 0
+`, { mode: 0o755 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--packet-file', packetFile]);
+    assert.strictEqual(r.code, 0, r.out);
+    const resultJson = JSON.parse(fs.readFileSync(path.join(sbx.tmpDir, 'authentic-review-result-7.json'), 'utf8'));
+    assert.strictEqual(resultJson.evidence.change_proportionality.status, 'verified');
+    assert.strictEqual(
+      resultJson.evidence.change_proportionality.architecture_assessment.validation_evidence,
+      'tests/unit/a.test.js；tests/unit/b.test.js',
+    );
+    const boundaryIdx = resultJson.review_body.indexOf('> 当前 PR 边界：skills/code-review/ only');
+    const verdictIdx = resultJson.review_body.indexOf('English verdict:');
+    assert.ok(boundaryIdx > 0 && verdictIdx > boundaryIdx, 'boundary note must appear before English verdict');
   });
 });

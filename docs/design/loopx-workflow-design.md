@@ -61,7 +61,7 @@ flowchart LR
 | `issue <id>` | `cmd_issue` | `REQ-NATIVE-1`、`REQ-ISSUE-PIPELINE-1`、`REQ-FAILCLOSED-1` | 读取 `decision.route`；`fix_pr` 走同一 Goal/Evidence/Gate2；不得直推 main |
 | `integrate [--execute\|--status]` | `cmd_integrate` | `REQ-NATIVE-1` | 默认 preview，不落盘。`--execute` 才 sync 落盘 |
 | `pr create\|preview\|update\|ready` | `cmd_pr` | `REQ-PR-BODY-1`、`REQ-PR-LIFECYCLE-1` | 调用 `authentic-review.js --generate-pr-body`；draft→ready 不代表合并授权 |
-| `review <pr>` | `cmd_review` | `REQ-REVIEW-1`、`REQ-GATE2-MODE-1` | 发布 formal review（Agent 只发 COMMENT）；模板/审查不可用 `NOT_VERIFIED`，不发评论 |
+| `review <pr>` | `cmd_review` | `REQ-REVIEW-1`、`REQ-REVIEW-2`、`REQ-GATE2-MODE-1` | 发布 formal review（Agent 只发 COMMENT）；基于文件流契约与两阶段解耦；模板/审查不可用 `NOT_VERIFIED`，不发评论 |
 | `respond <pr>` | `cmd_respond` | `REQ-RESPOND-1` | 只接受精确 head artifact；四门禁或既有产物失败不发评论；无 `loopx` 时 status 记为跳过 |
 | `merge <pr> [feature]` | `cmd_merge` | `REQ-CHECKPOINT-2`、`REQ-CHECKPOINT-3`、`REQ-GATE2-MODE-1`、`REQ-CI-PROTECTION-1`、`REQ-GOAL-1`、`REQ-CAPSULE-1` | 见第 6 节；按 Mode A/B 校验审批与 readiness；已 MERGED 可重跑补步骤，任何未完成步骤非 0 |
 | `context <feature>` | `cmd_context` | 审阅入口 | 打印 `00-INDEX.md` |
@@ -202,6 +202,11 @@ AGENTS 管线 B 的规程必须在 `REQ-ISSUE-PIPELINE-1` 内执行，不能把 
 - 仅当原生 `check-result` 的 `ok === true` 才发布。
 - 复审：上轮 findings 必须逐条判定 `fixed` / `reproducible` / `obsolete`，并在 `check-result` **之前**进入 `review_body`；`reproducible` 未清时 verdict 上限 `REQUEST_CHANGES`。
 - 审查者 CLI 缺失时不得隐式改用另一个 CLI；只有显式 `--agent-bin` / `--cross-validate` 才换审查者。Reviewer 行与证据必须记录实际使用的模型。
+- **输入契约与两阶段解耦 (ADR-0013 / REQ-REVIEW-2)**：
+  - **输入通道**：严禁通过 CLI argv 命令行参数传递全量内存 Prompt 字符串（防止触碰 macOS/Linux 的 1MB `ARG_MAX` 崩溃）；彻底删除 240,000 字符硬编码截断。审查上下文与提示词统一写入项目沙箱 `.loopx/tmp/review-prompt-<pr>-<head>.md`，通过 stdin 管道输送给审查 CLI（`codex exec -` / `claude -p`）。
+  - **两阶段解耦**：阶段 1 由模型产出对抗性缺陷与五段式报告正文；阶段 2 由主机静态装配四门禁、代码行分类、代码体量与符号行号等事实性证据，禁止在单轮 Prompt 中强迫模型手写庞大深层嵌套 JSON。
+  - **非适用字段标准化免除**：`default_off_isolation` 等不适用字段提供标准化的 `not_applicable` 声明规范，本地校验与 LoopX 结果检查视同合规放行，杜绝伪造数据与封顶死锁。
+  - **临时文件治理**：审查产生的全部中间 Prompt、Packet 与 Result 统一存放于 `.loopx/tmp/`，严禁写入系统根 `/tmp/`。
 
 `respond` 不调用 `authentic-review.js`。它要求 `.loopx/reviews/` 里已有对应该 PR HEAD 的审查产物，并在发布前跑完四门禁。没有 `loopx` 时不把 `loopx status` 当作失败。
 
@@ -321,7 +326,7 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | `REQ-CHECKPOINT-3` | `delivery-review-merge-lock` | `cmd_merge` 的 readiness 与二次 HEAD |
 | `REQ-GATE-1` | `core-gates-hardening` | `cmd_check` 的四个 `npm run` |
 | `REQ-QUALITY-1` | `change-quality-failclosed` | `ingest-to-loopx-quality.js`、`change-quality verify` |
-| `REQ-REVIEW-1` `REQ-PR-BODY-1` `REQ-RESPOND-1` | `authentic-review-pipeline`、`loopx-ecosystem-alignment` | `authentic-review.js`、`respond-report.js`、`cmd_pr`、`cmd_respond` |
+| `REQ-REVIEW-1` `REQ-REVIEW-2` `REQ-PR-BODY-1` `REQ-RESPOND-1` | `authentic-review-pipeline`、`loopx-ecosystem-alignment` | `authentic-review.js`、`respond-report.js`、`cmd_pr`、`cmd_respond` |
 | `REQ-NATIVE-1` | `native-dispatch-deep-integration` | `cmd_todo`、`cmd_issue`、`cmd_integrate` |
 | `REQ-LEASE-1` | 本次修复 GitHub #12，无新胶囊 | `resolve_claim_owner`、`claim_idempotency_key`、`cmd_todo_lease` 的 claim |
 | `REQ-SKILL-READY-1` | 本次修复 GitHub #11，无新胶囊 | `scripts/preflight-check.sh`、`scripts/loopx-skill-readiness.js`、`scripts/workflow-init.sh` |
