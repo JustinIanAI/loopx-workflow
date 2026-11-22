@@ -92,10 +92,12 @@ test('2. approve without loopx exits 1 and leaves contract unchanged', () => {
   const onlyNode = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-node-'));
   try {
     fs.symlinkSync(process.execPath, path.join(onlyNode, 'node'));
+    const tmpRegistry = path.join(onlyNode, 'registry.json');
+    fs.writeFileSync(tmpRegistry, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
     const r = spawnSync(LOOPX_FLOW, ['approve', 'contract', feature], {
       cwd: PROJECT_ROOT,
       encoding: 'utf8',
-      env: { ...process.env, PATH: `${onlyNode}:/usr/bin:/bin:/usr/sbin:/sbin` },
+      env: { ...process.env, PATH: `${onlyNode}:/usr/bin:/bin:/usr/sbin:/sbin`, LOOPX_REGISTRY: tmpRegistry },
     });
     assert.strictEqual(r.status, 1, r.stdout + r.stderr);
     assert.match(r.stderr + r.stdout, /未检测到 loopx/);
@@ -168,14 +170,7 @@ exit 0`);
   } finally { h.cleanup(dir); }
 });
 
-const PROJECT_REGISTRY = path.join(PROJECT_ROOT, '.loopx/registry.json');
-// 隔离 worktree / fresh clone 尚未 bootstrap 出控制面 registry 时，REGISTRY_FLAG 为空；
-// 该用例依赖真实 registry 存在，显式前置跳过而不是在环境缺失下假失败（issue #8 可移植性）。
-const REGISTRY_PRECONDITION = fs.existsSync(PROJECT_REGISTRY)
-  ? false
-  : '项目未 bootstrap 出 .loopx/registry.json（隔离 worktree / fresh clone）';
-
-test('7. approve passes --registry to configure-goal', { skip: REGISTRY_PRECONDITION }, () => {
+test('7. approve passes --registry to configure-goal', () => {
   const feature = 'fc-approve-registry';
   const dir = h.makeSandbox('fc-approve-registry-');
   try {

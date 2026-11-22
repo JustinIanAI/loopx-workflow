@@ -11,12 +11,14 @@ const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const TEST_TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-native-dispatch-'));
 const MOCK_BIN_DIR = path.join(TEST_TMP_DIR, 'mock-bin');
 const CALLS_LOG = path.join(TEST_TMP_DIR, 'native-dispatch-mock-calls.log');
+const TEST_REGISTRY = path.join(TEST_TMP_DIR, 'registry.json');
 after(() => fs.rmSync(TEST_TMP_DIR, { recursive: true, force: true }));
 
 function setupMocks() {
   if (!fs.existsSync(MOCK_BIN_DIR)) {
     fs.mkdirSync(MOCK_BIN_DIR, { recursive: true });
   }
+  fs.writeFileSync(TEST_REGISTRY, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
 
   fs.writeFileSync(path.join(MOCK_BIN_DIR, 'loopx'), `#!/usr/bin/env bash
 echo "$*" >> ${CALLS_LOG}
@@ -94,6 +96,9 @@ function cleanupMocks() {
   if (fs.existsSync(CALLS_LOG)) {
     fs.unlinkSync(CALLS_LOG);
   }
+  if (fs.existsSync(TEST_REGISTRY)) {
+    fs.unlinkSync(TEST_REGISTRY);
+  }
 }
 
 function runFlow(args, extraEnv = {}) {
@@ -104,6 +109,7 @@ function runFlow(args, extraEnv = {}) {
       ...process.env,
       PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
       LOOPX_AGENT_ID: '',
+      LOOPX_REGISTRY: TEST_REGISTRY,
       ...extraEnv
     }
   });
