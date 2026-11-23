@@ -2,7 +2,7 @@
 
 - **产品需求**：[docs/prd/loopx-workflow.md](../prd/loopx-workflow.md)
 - **增量决策**：[docs/adr/README.md](../adr/README.md)
-- **状态**：目标设计（ADR-0008~ADR-0014 已 Accepted；[ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md) 处于 Proposed 待人类签批；现有实现差异由 M0~M5 跟踪）
+- **状态**：目标设计（ADR-0008~[ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md) 已 Accepted；现有实现差异由 M0~M5 跟踪）
 
 本文是命令、阶段、资产和失败条件的唯一设计正文。`docs/guides/loopx-workflow-architecture.html` 是展示页，不参与需求或设计裁决。原 `docs/design/coding-workflow-tools-spec.md` 已删除，管线内容在这里。
 
