@@ -2,7 +2,7 @@
 
 - **产品需求**：[docs/prd/loopx-workflow.md](../prd/loopx-workflow.md)
 - **增量决策**：[docs/adr/README.md](../adr/README.md)
-- **状态**：目标设计（ADR-0008~ADR-0012 已 Accepted；现有实现差异由 M0~M5 跟踪）
+- **状态**：目标设计（ADR-0008~ADR-0014 已 Accepted；[ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md) 处于 Proposed 待人类签批；现有实现差异由 M0~M5 跟踪）
 
 本文是命令、阶段、资产和失败条件的唯一设计正文。`docs/guides/loopx-workflow-architecture.html` 是展示页，不参与需求或设计裁决。原 `docs/design/coding-workflow-tools-spec.md` 已删除，管线内容在这里。
 
@@ -51,13 +51,13 @@ flowchart LR
 
 | 命令 | 实现函数 | 满足的需求 | 失败即停的要点 |
 |---|---|---|---|
-| `doctor` | `cmd_doctor`、`cmd_doctor_control_plane` | 环境哨兵、`REQ-ENV-1`、`REQ-ENV-2`、`REQ-CAPABILITY-1`、`REQ-SKILL-READY-1` | preflight 失败（含本机已有 `loopx` 时 required skills/routes/新鲜度未通过）、`loopx doctor` 失败、或本机没有 `loopx` 均非 0。诊断卡含原因/影响/修复命令。控制面路由/registry 一致性、`~/.loopx` 半迁移残留、运行时工件被跟踪、GitHub API 50% 预算基线为 WARN 级检查（见 ADR-0007） |
+| `doctor` | `cmd_doctor`、`cmd_doctor_control_plane` | 环境哨兵、`REQ-ENV-1`、`REQ-ENV-2`、`REQ-CAPABILITY-1`、`REQ-SKILL-READY-1` | preflight 失败（含本机已有 `loopx` 时 required skills/routes/新鲜度未通过）、`loopx doctor` 失败、本机没有 `loopx`、或集中式三层能力/`schema_version` 探针命中 BLOCK 缺口均非 0，并输出「能力→探测信号→PASS/WARN/BLOCK」矩阵与诊断卡（含原因/影响/修复命令）。控制面路由/registry 一致性、`~/.loopx` 半迁移残留、运行时工件被跟踪、GitHub API 50% 预算基线为 WARN 级检查（见 ADR-0007、ADR-0015） |
 | `init` | `cmd_init` | `REQ-MAIN-1`、`REQ-AUTH-MODE-1`、`REQ-SKILL-READY-1` | 安装 pre-commit；确认 `authorization_mode` 与风险接受；preflight 在已有 `loopx` 时阻断缺失或过期的 required skills；有 `loopx` 时 `bootstrap` 失败则退出 |
 | `feature <name>` | `cmd_feature` | `REQ-FAILCLOSED-2`、`REQ-CAPSULE-1` | 分支创建或切换失败则退出，不写胶囊 |
 | `approve contract <feature>` | `cmd_approve` | `REQ-CHECKPOINT-1`、`REQ-GATE1-AUTH-1`、`REQ-AUTH-MODE-1` | 缺配置/规格不完整/未授权/`configure-goal`/`user_gate` 写入失败均非 0；先锁最终内容 SHA256，成功后才原子写入批准标记 |
 | `gate verify decisions\|contract` | `cmd_gate` | `REQ-GATE-DECISIONS-1`、`REQ-CONTRACT-LOCK-1`、`REQ-GATE1-AUTH-1` | 见第 5 节：SHA + user_gate 授权记录 + evidence 串；没有 `pr` 这个 stage |
 | `check [feature] [--goal-id] [--with-ocr]` | `cmd_check` | `REQ-GATE-1`、`REQ-QUALITY-1`、`REQ-QUALITY-3`、`REQ-EVIDENCE-1`、`REQ-CHECK-IDENTITY-1`、`REQ-FAILCLOSED-1` | 无 feature 且无 `--goal-id` 则非 0；有胶囊时先 `gate verify contract`；前置解析真实远程基线并诊断 Goal 资格；四门禁后必须收据 `ok=true` 才打印成功 |
-| `todo list\|claim\|done` | `cmd_todo` | `REQ-NATIVE-1`、`REQ-LEASE-1` | 没有 `loopx` 则退出。`claim` 先按 `next_cursor` 读完 `agent-directory`，再解析已注册 owner，并 `task-lease inspect` 后 `task-lease acquire --owner --idempotency-key`。身份缺失、歧义、目录未读全或 `LOOPX_AGENT_ID` 未注册时非 0，且不申领。无租约时幂等键为 `loopx-flow:claim:` 加 SHA256(goal、todo、owner)。活动且同一 owner 复用当前键；过期或释放后换入 `lease_epoch` 与 `version` 的下一把键。显式 `--idempotency-key` 原样透传。`done` 走完成回写与 release，冲突由 LoopX 拒绝 |
+| `todo list\|claim\|done` | `cmd_todo` | `REQ-NATIVE-1`、`REQ-LEASE-1`、`REQ-CAPABILITY-1` | 没有 `loopx` 或三层能力/`schema_version` 探针不通过则退出。`claim` 先按 `next_cursor` 完整分页读完 `agent-directory` 解析已注册 owner（缺失、歧义、游标异常或 `LOOPX_AGENT_ID` 未注册时非 0 且不申领），随后直接委托受管 `loopx --format json todo claim --goal-id --todo-id --agent-id --claimed-by`，将 `claim_operation_id` 与五元组（`goal_id`/`todo_id`/`agent_id`/`registry_path`/`handoff_mode`）缓存至 `$LOOPX_TMP_DIR/claims/<gid>--<tid>.json`（透明适配 `hard_lease`/`soft_claim`）。`done` 委托 `loopx --format json todo complete` 原子完成并释放租约，执行 Q1 双分流停机恢复：缓存缺失或五元组不匹配时仅在租约有效且同 Owner 自动补领 receipt；已过期（`lease_state=expired`）/已释放/已转让/`deferred` 一律 Fail-Closed 非 0 停机并原样透出 LoopX `recovery` 指引，严禁静默重 `claim`（见 ADR-0015） |
 | `issue <id>` | `cmd_issue` | `REQ-NATIVE-1`、`REQ-ISSUE-PIPELINE-1`、`REQ-FAILCLOSED-1` | 读取 `decision.route`；`fix_pr` 走同一 Goal/Evidence/Gate2；不得直推 main |
 | `integrate [--execute\|--status]` | `cmd_integrate` | `REQ-NATIVE-1` | 默认 preview，不落盘。`--execute` 才 sync 落盘 |
 | `pr create\|preview\|update\|ready` | `cmd_pr` | `REQ-PR-BODY-1`、`REQ-PR-LIFECYCLE-1` | 调用 `authentic-review.js --generate-pr-body`；draft→ready 不代表合并授权 |
@@ -71,35 +71,105 @@ flowchart LR
 | `archive <feature>` | `cmd_archive` | 手动归档 | 有目录则移动；合入由 `merge` 移动；重复移动前判重 |
 ### 3.1 L0 命令契约与能力矩阵
 
-L0 命令不是 LoopX 转发器，而是场景操作契约。每条命令必须可回答：原生能力映射、Workflow 增强约束、前置/后置、失败与恢复、证据契约。
+L0 命令不是 LoopX 转发器，而是场景操作契约（遵循 [ADR-0010](../adr/0010-command-contracts-and-execution-protocol.md) `REQ-CMD-CONTRACT-1` 与 [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md)）。下表完整覆盖全部 13 条 L0 命令的 5 项必填契约维度（**原生能力映射 / Workflow 增强约束 / 前置与后置条件 / 失败与恢复策略 / 证据契约**，正式关闭 ADR-0010 项 1）：
 
-| 命令 | 原生能力映射（LoopX/GitHub） | Workflow 增强约束 | 失败/恢复 |
+| 命令 | 原生能力映射（LoopX/GitHub） | Workflow 增强约束 | 前置与后置条件 | 失败与恢复策略 | 证据契约 |
+|---|---|---|---|---|---|
+| `feature` | `loopx bootstrap --goal-id <feature>-goal --state-file` + `sync-global` | 强制 `1 Feature : 1 Goal`；创建/切换 `feature/<name>` 分支、初始化胶囊骨架；运行态 `ACTIVE_STATE.md` 归 LoopX runtime 不入 Git | **前置**：工作区允许建/切分支；若含 LoopX 则 `goal.bootstrap` 能力可用。<br>**后置**：位于 `feature/<name>` 分支，胶囊文件存在，Goal 已注册且 `sync-global` 完成 | 分支创建/切换失败立即非 0 且不创建胶囊；重入先读回 Goal 是否已存在，不重复建 Goal；`sync-global` 重试后仍失败返回 `PARTIAL`（非 0） | 胶囊目录 `specs/features/<feature>/`（`00-INDEX.md`～`05-evidence.md`）与 LoopX registry Goal 条目（均不含运行态 `ACTIVE_STATE.md` 入 Git） |
+| `approve contract` | `loopx configure-goal --progress-review-contract-revision <sha>` + `loopx todo add/complete`（`user_gate`）+ `gh api`（Mode A 核验） | 规格包完整性核验（`01-decisions` APPROVED、`04-contract` 含 AC/Scope/Verification Plan/依赖顺序、Story 与 AC 对齐、引用 ≥1 条 REQ/ADR）；按 `authorization_mode`（`single_owner` TTY + 风险接受 / `independent` 第二账号 Draft PR `gate=1` 评论）核验审批主体 | **前置**：`loopx` 与 `todo.user_gate` 可用；`loopx-workflow.config.json` 合法；规格包完整且审批主体通过。<br>**后置**：最终带 `Contract-Status: FROZEN & APPROVED` 的 SHA256 已写入 Goal `contract_revision`、`user_gate` 审计记录落盘、契约批准标记原子写入且 `sync-global` 完成 | 任一步失败非 0 且不得在 `04-contract.md` 留下批准标记；重跑以新 SHA 与新 `user_gate` 记录取代旧授权 | LoopX `progress_review.contract_revision` + `user_gate` 记录（`decision-scope=other:goal:<sha>`、`decision-outcome=approve`、固定 `evidence` 串）+ `04-contract.md` 批准标记 |
+| `todo` | `loopx agent-directory` + 受管 `loopx --format json todo claim` / `loopx --format json todo complete` / `loopx todo list`（ADR-0015） | 完整分页解析已注册 Agent 身份；直接委托受管执行（`manage_execution=True`，透明适配 `hard_lease` / `soft_claim`）；在 `$LOOPX_TMP_DIR/claims/<gid>--<tid>.json` 缓存 `claim_operation_id` 与五元组（`goal_id`/`todo_id`/`agent_id`/`registry_path`/`handoff_mode`）；禁止编排层手工调用 `task-lease acquire/release/renew` | **前置**：`loopx` 可用、三层能力/`schema_version` 探针通过、当前 Goal 存在且已解析唯一合法已注册 `agent_id`；`done` 需有效 `claim_operation_id`。<br>**后置**：`claim` 成功写入五元组缓存并返回 `claim_operation_id`；`done` 原子置 Todo 为 `done` 并释放租约（`released`）且清理缓存 | 身份缺失/歧义/游标异常非 0 且不申领；`done` 走 Q1 双分流：缓存缺失或五元组失配时仅租约有效且同 Owner 自动补领 receipt；租约已过期（`lease_state=expired`）/已释放/已转让/`deferred` 一律 Fail-Closed 非 0 停机并原样透出 LoopX `recovery`，严禁静默重 `claim`；`todo update` CAS 冲突先 `todo list` 对账 `provider_revision` | LoopX Todo/Lease 权威状态（`loopx_coordination_todo_*_v0` 返回体）+ 临时跨进程凭证缓存 `$LOOPX_TMP_DIR/claims/<gid>--<tid>.json`（非第二权威状态源） |
+| `integrate` | `loopx integration-branch status` / `sync` | 严格分离默认 preview（只读预演）与显式 `--execute`（落盘同步），不改写 LoopX 结论 | **前置**：`loopx` 与 `integration-branch` 能力探测通过（缺失/UNKNOWN 仅阻断本命令）；有效仓库与目标上下文。<br>**后置**：preview 零落盘副作用；`--execute` 完成目标分支同步且返回 LoopX 状态 | 缺能力/探针失败立即 `BLOCKED`（非 0）；同步冲突按 LoopX 输出停机，先读回真实状态不重复落盘 | LoopX `integration-branch` JSON/状态输出及同步后的 Git 分支状态 |
+| `check` | 本地四大门禁（`npm run typecheck/lint/build/test`）+ `loopx change-quality prepare/record/verify`（via `ingest-to-loopx-quality.js`） | 无 feature 且无 `--goal-id` 直接阻断；有胶囊先跑 `gate verify contract`；前置解析真实远程基线（`origin/HEAD→origin/main→origin/master`）与 Goal 资格；Adapter 只翻译不造假；四门禁禁标 `not_applicable`；可选 `--with-ocr` | **前置**：契约锁定有效（有胶囊时）；远程基线可解析；Goal 已启用 `change-quality` 资格；`change-quality.strict-receipt` 能力与 `change_quality_*_v2` Schema 探针通过。<br>**后置**：四门禁全部退出码 0，`05-evidence.md` 按六状态更新，LoopX `change-quality verify` 收据 `ok=true` | 任一前置/门禁/收据校验失败非 0（`BLOCKED`/`FAILED`/`NOT_VERIFIED`），不写入 `passed` 也不打印成功；缺资格打印带 `--execute` 的 `configure-goal` 修复指令 | `specs/features/<feature>/05-evidence.md`（六状态与 `Real-vs-Mock` 验证矩阵）+ LoopX `change_quality_receipt_v2` / `change_quality_receipt_verification_v2` 权威收据 |
+| `issue` | `gh issue view` + `gh repo view` + `loopx issue-fix feasibility --format json` | 严格读取 `decision.route`（仅接受 `fix_pr` / `comment_only` / `triage_only`）；`fix_pr` 复用管线 A 的 Goal/Todo/Evidence/Gate2，Fast Path 不得绕过 Gate2 且禁止直推 `main` | **前置**：`loopx`、`gh` 与 `issue-fix.feasibility` 能力探针通过；目标 Issue 可读。<br>**后置**：输出合法路由；进入 `fix_pr` 后落入同标准 Goal/Branch/Evidence/Gate2 轨迹 | 缺 `loopx`/`gh`/`issue-fix.feasibility` 或路由为空/非法值立即 `BLOCKED`/`NOT_VERIFIED`（非 0），不进入直推分支 | LoopX `issue-fix feasibility` JSON（`decision.route`）与后续 `fix_pr` 对应的 Goal/PR/证据链 |
+| `gate verify` | 只读核验 `${LOOPX_REGISTRY:-.loopx/registry.json}` + LoopX `user_gate` 记录 | 校验 `decisions` APPROVED 标记或 `contract` 双重锁定（文件 SHA256 == Goal `contract_revision` + 最新未 supersede `user_gate` 记录 + `evidence` 固定串与 `authorization_mode` 一致） | **前置**：目标胶囊存在（活跃或归档）；`contract` 校验需可读有效 registry（附属 worktree 缺 registry Fail-Closed）。<br>**后置**：纯只读核验通过返回 0，零写入副作用 | 缺文件/缺 `FROZEN & APPROVED`/SHA 不匹配/缺授权记录/模式不一致/缺键均返回 `BLOCKED`（非 0）并打印差异诊断 | 只读核验输出（对比 `04-contract.md` SHA256、`registry.json` 与 `user_gate` 审计记录），不产出第二份授权文件 |
+| `pr` | `gh pr create` / `edit` / `ready`（正文经 stdin 传入）+ `authentic-review.js --generate-pr-body` | 固定四段正文（动机/改动思路/具体改动/对主干的风险）+ 含 `Real-vs-Mock` 列的验证矩阵 + 六问；支持阶段 4 `create --draft` 与阶段 7 `ready`；正文经 stdin 零落盘临时文件；缺信息写 `NOT_PROVIDED` | **前置**：`gh` 可用且已认证；当前为非主干特性分支；胶囊与真实 Git diff 可读。<br>**后置**：PR 创建/更新/就绪完成，远端 PR 正文与当前 diff / 胶囊一致；`draft→ready` 不代表合并授权 | 缺 `gh` 或正文生成/远端 API 失败非 0；重入 `create` 先读回当前分支是否已有 PR 禁止重复建 PR；`create --draft` 失败降级提示 `presentation=pending` | GitHub PR 元数据与四段正文 + 验证矩阵 + 六问（来源于胶囊与真实 `git diff`） |
+| `review` | `loopx pr-review` 原生评审包 + `loopx pr-review --check-result` + 审查者 CLI（stdin 管道）+ `gh api` formal review | 遵循 ADR-0013 文件/流输入契约与两阶段解耦；仅发布 Agent `COMMENT`/`REQUEST_CHANGES` formal review（严禁自动生成 author-owned 批准标题）；评审缓存落入 `$REPO_ROOT/.loopx/cache/reviews/`（`v1`）且命中仍须重跑 `--check-result` | **前置**：`loopx`、`gh`、`pr-review.check-result` 能力与 `pull_request_review_*` Schema 探针通过；PR 非 Draft；原生 `review_template` 章节非空且审查者 CLI 可用。<br>**后置**：`check-result` 返回 `ok=true` 且 formal review 已发布至当前 `headRefOid` | 模板缺失/审查者不可用/输出不可解析/`check-result` 未通过均返回 `NOT_VERIFIED`（非 0）且不发布自造报告；复审存在未清 `reproducible` 时 verdict 上限 `REQUEST_CHANGES` | GitHub formal review（绑定精确 `headRefOid`、五段报告、verdict 与模型声明）+ LoopX `pull_request_review_result_v1` 校验通过 + 可丢弃缓存 `loopx_flow_review_cache_v1` |
+| `respond` | 本地四门禁 + `loopx status`（若本机有 `loopx`）+ `gh api` 评论（via `respond-report.js`，stdin 传输） | 复用五段结构回复审阅意见；**只接受与当前 PR `headRefOid` 精确匹配的既有审查产物**，严禁回退旧 head 缓存 | **前置**：`gh` 可用；当前 PR `headRefOid` 存在精确对应的既有审查产物；四门禁全绿（本机有 `loopx` 时 `loopx status` 亦须成功）。<br>**后置**：回复评论已发布至目标 PR | 精确 head 审查产物缺失、四门禁任一失败或 `loopx status` 失败均 Fail-Closed 非 0 且不发评论（无 `loopx` 时 `loopx status` 记为跳过） | GitHub PR 审阅回复评论（绑定精确 `headRefOid` 与实测四门禁结果） |
+| `merge` | `gh pr view` + `loopx pr-review --check-merge-readiness <pr>@<oid>` + `gh pr merge --squash --delete-branch` + `loopx goal-lifecycle stop` / `retire-global-goal` / `sync-global` + Git archive push | 按 `authorization_mode`（Mode A 非作者 `APPROVED` / Mode B Agent COMMENT + `release-approve` 评论 + `blocking_reasons` 三档判定）校验 Gate2；二次核对 `headRefOid` 防换头；已 `MERGED` 时跳过合并进入幂等前向补偿；可选接入 `goal-acceptance` | **前置**：`loopx`、`gh`、`pr-review.merge-readiness`、`goal.lifecycle` 能力与 Schema 探针通过；PR 非 Draft 且满足 Mode A/B Gate2 授权与 CI/分支保护；二次读取 `headRefOid` 一致。<br>**后置**：PR 已 Squash 合入，Goal 已 stop + retire + sync-global，胶囊归档至 `specs/archive/<feature>/` 并推送远端 | 授权/readiness/HEAD 校验失败非 0 且不调用 `gh pr merge`；合并后 stop/retire/sync/archive 任一步失败返回 `PARTIAL`（非 0）并打印「已合入、未闭环」与重跑命令，重跑先读回真实状态补齐剩余步骤、不重复合并 | GitHub `MERGED` 状态 + Gate2 授权记录 + LoopX 已退役 Goal 状态 + `specs/archive/<feature>/`（可选独立命名 `ACTIVE_STATE.snapshot.md`，`historical_snapshot: true`） |
+| `archive` | 本地 `git mv` + Git commit / push | 将已完成特性胶囊从 `specs/features/<feature>/` 移至 `specs/archive/<feature>/`；归档快照仅允许独立命名 `ACTIVE_STATE.snapshot.md`（`historical_snapshot: true`） | **前置**：目标特性目录存在（或已归档用于幂等判重）；工作区可安全提交推送。<br>**后置**：胶囊位于 `specs/archive/<feature>/` 且已提交推送至远端 | 移动前判重（已存在于 `specs/archive/<feature>/` 时跳过不嵌套）；commit 或 push 失败返回 `PARTIAL`/`FAILED`（非 0） | Git 归档提交与 `specs/archive/<feature>/` 不可变目录快照 |
+| `release-approve` | `gh api user` + `gh api` 发布结构化 PR 评论（stdin 传输） | Mode B（`single_owner`）专用 Gate2 人工发布授权；强制 TTY 确认（拒绝非 TTY / `--yes`）；校验 `principal == single_owner_risk_acceptance.accepted_by`；不宣称 `separation_of_duties` | **前置**：`gh` 可用；配置 `authorization_mode == single_owner` 且风险接受有效；交互式 TTY 确认通过；当前 PR 非 Draft 且存在合法 `headRefOid` 与 `contract_sha`。<br>**后置**：PR 上写入绑定当前 `head` 与 `contract_sha` 的结构化 `gate=2` 评论 | 非 TTY、传入 `--yes`、配置模式非 `single_owner` 或 `principal != accepted_by` 均返回 `BLOCKED`/`NEEDS_HUMAN`（非 0），不写授权评论 | GitHub PR 结构化评论（标记 `<!-- loopx-flow:release-authorization:<pr>@<head> -->` 与固定键值串 `gate=2;mode=single_owner;head=...;contract_sha=...;principal=...;approved_at=...;risk_acceptance=...`） |
+
+**上游契约锚点与三层能力探针矩阵（`REQ-CAPABILITY-1` / [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md)）**：
+
+- **上游锚点**：`loopx-project/loopx@f4c5d6d7`（本机实测 `loopx 2.3.0`）。不 Pin 精确版本号，通过集中式 `probe_loopx_capabilities` 执行三层校验：
+  1. **第 1 层（`--help` 子命令与必填 Flag 签名探针 · Fail-Closed）**：按子命令实际帮助入口探测，不依赖顶层 `--help` 粗匹配；
+  2. **第 2 层（JSON `schema_version` 白名单探针 · Fail-Closed）**：校验 Todo（`loopx_coordination_todo_claim_result_v0` / `loopx_coordination_todo_update_result_v0` / `loopx_coordination_todo_terminal_lifecycle_result_v0`）、状态任务图（`task_graph_projection_v0` / `agent_lane_next_action_projection_v0`）、质量与审查（`change_quality_prepare_packet_v2` / `change_quality_receipt_v2` / `change_quality_receipt_verification_v2` / `pull_request_review_execution_contract_v2` / `pull_request_review_result_v1`）及启用时的可选 `goal-acceptance` 白名单；遇到白名单外或缺失 `schema_version` 立即 Fail-Closed 非 0 并输出《LoopX 升级契约差异诊断卡》；
+  3. **第 3 层（版本号软提示 · 非阻断）**：`loopx --version` 偏离已验证锚点但第 1、2 层全通过时，仅输出 `WARN` 软提示而不阻断。
+- **隔离 Registry Real-CLI Canary 边界**：本地 `loopx` 主路径与边界验证须在 `$LOOPX_TMP_DIR` / 测试临时目录创建的独立 `--registry` 与 `--runtime-root` 中运行真实 `loopx` 二进制并在结束时清理，主仓 `.loopx/registry.json` 与宿主机 `~/.loopx` 保持 **0 残留**；Contract Fake CLI 仅用于隔离 `gh` 外部网络与负向能力/Schema 故障注入（ADR-0010 T2/T3）。
+
+`doctor` 输出「能力 → 探测信号 → PASS / WARN / BLOCK」矩阵：
+
+| 档位 | 能力标识 | 探测信号（`--help` 子命令入口与 `schema_version` 白名单） | 缺失 / `UNKNOWN` 处置 |
 |---|---|---|---|
-| `feature` | `bootstrap --goal-id --state-file` | 分支、胶囊、Goal 绑定；运行态状态文件不入 Git | 分支失败不建胶囊；重入先读 Goal |
-| `approve contract` | `configure-goal --progress-review-contract-revision` + `todo add/complete user_gate` | 规格完整性、TTY/第二账号、固定 evidence、授权记录 | 任一步失败不写 marker；重跑以新记录取代 |
-| `todo` | `register-agent` + `task-lease acquire/release` + `todo` | owner/idempotency、依赖/弱链 | 租约冲突非 0；重试先读回 |
-| `integrate` | `integration-branch status/sync` | preview/execute 分离 | 缺能力即非 0；不重复落盘 |
-| `check` | 四门禁 + `change-quality record/verify` | validation 实测、六状态映射、Adapter 只翻译 | 缺结果拒绝写 passed；失败非 0 |
-| `issue` | `issue-fix feasibility` | `decision.route`；fix_pr 复用 Goal/Evidence/Gate2 | 路由非法/缺能力非 0 |
-| `gate verify` | 读 registry + `user_gate` 记录 | contract SHA + evidence 串 + 模式一致 | 缺记录/SHA/模式不一致非 0 |
-| `pr` | `gh pr create/edit/ready` | draft→ready、六问、真实 diff | 缺 gh/正文失败非 0 |
-| `review` | `pr-review` 原生包 + `check-result` + `gh api` formal review | Agent 只发 COMMENT，不发 author-owned 批准标题 | 模板/审查不可用 `NOT_VERIFIED` |
-| `respond` | `gh api` 评论 + 四门禁 | 精确 head artifact | head 缺失 fail-closed |
-| `merge` | `pr-review --check-merge-readiness` + `gh pr merge` + `goal-lifecycle stop/retire/sync` | Mode A/B、二次 HEAD、前向补偿 | 补偿失败打印未闭环；不重复合并 |
-| `archive` | 本地移动 + Git 提交推送 | 判重、归档快照命名 | 已存在不嵌套；push 失败非 0 |
-| `release-approve` | `gh api user` + PR 评论 | Mode B 授权；TTY/`--yes`、principal 比对 | 非 TTY/principal 不一致非 0 |
-
-**能力矩阵**（`doctor` 输出 能力→探测信号→PASS/WARN/BLOCK）：
-
-| 档位 | 能力 |
-|---|---|
-| BLOCK（缺失/UNKNOWN → 相关命令非 0） | `goal.bootstrap`、`todo.lease`、`todo.user_gate`、`change-quality.strict-receipt`、`pr-review.merge-readiness`、`pr-review.check-result`、`goal.lifecycle`、`issue-fix.feasibility`（仅 `issue`）、`integration-branch`（仅 `integrate`）、`gh`（`pr/review/merge/issue/release-approve`） |
-| WARN（缺失 → 披露降级） | `goal.acceptance`、`change-quality.safe-fix`、OCR/open-code-review、Lark/goal-channel |
-
+| **BLOCK**（关键） | `goal.bootstrap` | `loopx bootstrap --help`（`--goal-id` / `--state-file`） | 阻断 `feature` / `init`（非 0 + 诊断卡） |
+| **BLOCK**（关键） | `todo.lease`（受管 Todo 执行） | `loopx todo claim --help`（`--goal-id` / `--todo-id` / `--agent-id` / `--claimed-by` / `--claim-operation-id`）、`loopx todo complete --help` + `loopx_coordination_todo_*_v0` | 阻断 `todo claim/done`（非 0 + 诊断卡） |
+| **BLOCK**（关键） | `todo.user_gate` | `loopx todo add --help`（`--task-class` / `--decision-scope` / `--decision-outcome` / `--global-gate`） | 阻断 `approve contract` / `gate verify`（非 0 + 诊断卡） |
+| **BLOCK**（关键） | `change-quality.strict-receipt` | `loopx change-quality prepare\|record\|verify --help`（`--goal-id` / `--result-json` / `--execute` / `--base-ref`）+ `change_quality_*_v2` | 阻断 `check`（非 0 + 诊断卡） |
+| **BLOCK**（关键） | `pr-review.merge-readiness` | `loopx pr-review --help`（`--check-merge-readiness`）+ `pull_request_review_*` | 阻断 `merge`（非 0 + 诊断卡） |
+| **BLOCK**（关键） | `pr-review.check-result` | `loopx pr-review --help`（`--check-result`）+ `pull_request_review_execution_contract_v2` / `pull_request_review_result_v1` | 阻断 `review`（非 0 + 诊断卡） |
+| **BLOCK**（关键） | `goal.lifecycle` | `loopx goal-lifecycle --help`（`stop`）+ `sync-global` | 阻断 `merge` / `approve` 收尾（非 0 + 诊断卡） |
+| **BLOCK**（命令专属） | `issue-fix.feasibility` | `loopx issue-fix --help`（`feasibility`） | 仅阻断 `issue`（非 0）；`doctor` 查其他命令时 WARN |
+| **BLOCK**（命令专属） | `integration-branch` | `loopx integration-branch --help`（`configure\|status\|sync`） | 仅阻断 `integrate`（非 0）；`doctor` 查其他命令时 WARN |
+| **BLOCK**（外部 CLI） | `gh` | `command -v gh` 与认证状态 | 阻断 `pr` / `review` / `merge` / `issue` / `release-approve`（非 0） |
+| **WARN**（非关键） | `goal.acceptance`、`change-quality.safe-fix`、OCR/open-code-review、Lark/goal-channel | 对应子命令 `--help` 或可选二进制/配置探针（`goal.acceptance` 显式启用时切入 `schema_version` 白名单校验） | 输出 WARN 并披露降级，不阻断主流程 |
 
 `feature` 在分支成功后创建尚不存在的胶囊文件，并注册 Goal。它不代替阶段 1–4 的正文；契约审批与 `gate verify contract` 会按 `REQ-TRACE-2` 检查契约是否引用至少一条 REQ/ADR。
 
-### 3.2 环境治理与 API 预算前置检查 (ADR-0007)
+### 3.2 L0 7 步执行协议及六结果语义 (ADR-0010 / REQ-L0-PROTOCOL-1)
+
+所有 L0 命令必须遵循统一的 7 步执行协议，并将操作结果映射到统一的六结果语义视图，供 Conductor/Agent 决定继续、停机等待人类、或读回状态后前向补偿。
+
+#### 3.2.1 统一 7 步执行协议
+
+```text
+1. Resolve Context
+   ↓
+2. Validate Preconditions
+   ↓
+3. Execute
+   ↓
+4. Validate Postconditions
+   ↓
+5. Persist Evidence
+   ↓
+6. Commit Checkpoint
+   ↓
+7. Return Result
+```
+
+| 步骤 | 职责与边界 | 失败时的处置要求 |
+|---|---|---|
+| **1. Resolve Context** | 通过 `lib/paths.sh` / `lib/paths.js` 锚定 `REPO_ROOT` 与 `WORKFLOW_ROOT`；解析 `--registry` / `LOOPX_REGISTRY`（附属 worktree 缺 registry 直接 Fail-Closed）；加载 `loopx-workflow.config.json` 与目标 `feature` / `goal_id` / `pr` / `headRefOid` | 上下文不可解析或配置 JSON 非法 → `BLOCKED` / `FAILED`（非 0），不触发任何写入 |
+| **2. Validate Preconditions** | 执行集中式三层能力与 `schema_version` 探针（[ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md)）；校验分支/工作区、契约双重锁定、审批主体、Goal 资格、已注册 Agent 身份或租约状态 | 任一前置不满足 → `BLOCKED` / `NEEDS_HUMAN` / `NOT_VERIFIED`（非 0），零业务副作用 |
+| **3. Execute** | 委托 LoopX 原生高层事务入口（如 `todo claim/complete`、`change-quality`、`pr-review`、`goal-lifecycle`）或 Git / `gh` 命令；严禁自造第二控制面或改写 LoopX 结论 | 执行失败且未产生不可逆远端副作用 → `FAILED`；若跨系统副作用已部分发生 → 进入 `PARTIAL` 诊断路径 |
+| **4. Validate Postconditions** | 校验 LoopX JSON 载荷的 `schema_version` 白名单与权威结论（如收据 `ok=true`、`check-result` 通过、`merge` 二次读取 `headRefOid` 一致） | 后置不成立或上游载荷不可解析 → `NOT_VERIFIED` / `FAILED`（非 0），不得宣称成功 |
+| **5. Persist Evidence** | 写入或刷新该命令对应的证据工件（`05-evidence.md`、评审缓存 `loopx_flow_review_cache_v1`、PR 评论/结构化授权记录、或 `$LOOPX_TMP_DIR/claims/<gid>--<tid>.json` 凭证缓存） | 证据持久化失败 → 阻断完成上报（`FAILED` / `PARTIAL`，非 0） |
+| **6. Commit Checkpoint** | **Checkpoint = 本次操作的持久化产物**（LoopX Receipt、`user_gate` 记录、Git Commit、GitHub PR、归档胶囊目录），**严禁新建独立 checkpoint 日志文件或第二状态账本** | 检查点写入/推送未闭环 → 返回 `PARTIAL`（非 0）并给出可重跑补偿命令 |
+| **7. Return Result** | 按六结果语义输出结构化结论、诊断卡或原样透出的 LoopX `recovery` 指引，并以对应退出码退出 | 仅 `SUCCESS` 返回退出码 `0`；其余 5 种语义一律返回非 `0` |
+
+#### 3.2.2 六结果语义与退出码映射
+
+六结果语义是面向 Conductor 与 Agent 的统一控制语义视图，**不是 6 个新的 Shell 退出码**；底层进程退出码契约维持二元规则——**只有 `SUCCESS` 对应退出码 `0`，其余 5 种语义一律返回非 `0`**。
+
+| 结果语义 | 退出码 | 精确含义 | 典型触发场景 | Conductor / 调用方规定动作 |
+|---|---|---|---|---|
+| **`SUCCESS`** | `0` | 7 步全部完成，后置校验与检查点产物已落盘 | 四门禁与收据均绿、`todo claim/done` 完成、`merge` 全链路收尾完毕 | 按编排流转继续下一非 Gate 步骤 |
+| **`FAILED`** | 非 `0` | 执行期确定性失败或校验未通过，未进入半完成态（或未写入批准/完成标记） | 任一 `npm run` 门禁红灯、质量扫描含 blocker、`configure-goal` 失败且未写批准标记 | 修复根因后重跑当前命令，不得跳过或伪造通过 |
+| **`BLOCKED`** | 非 `0` | 前置条件、契约锁、关键能力探针或 `schema_version` 白名单阻断 | 缺 BLOCK 能力或探测 `UNKNOWN`、`schema_version` 失配、契约 SHA 漂移、租约异主持有/`deferred` | 按诊断卡或 LoopX `recovery` 指引解除阻塞后重跑 |
+| **`PARTIAL`** | 非 `0` | 跨系统副作用已部分发生但闭环未完成；**绝不能当成已完成** | PR 已 `MERGED` 但 `goal-lifecycle stop` / `retire` / `sync-global` / `archive` 某步失败；`feature` 建分支后 `sync-global` 失败 | **先读回真实状态再执行前向幂等补偿**（禁止重复建 PR、重复合并、伪造完成） |
+| **`NEEDS_HUMAN`** | 非 `0` | 命中必须由人类显式介入的断点或授权裁决 | Gate1 `approve contract`、Gate2 Mode A GitHub Approve / Mode B `release-approve`、过期租约（`lease_state=expired`）待人类/显式确认后重新 `todo claim` | 停机并输出精确人工动作指引，严禁自动化越权代签或静默重 `claim` |
+| **`NOT_VERIFIED`** | 非 `0` | 权威验证信号缺失、模板或审查者 CLI 不可用、上游输出无法解析 | `review` 缺 `review_template` 或审查者 CLI 失败、`respond` 缺精确 head 产物、`status --next` 缺失权威来源、JSON 无法解析 | 保持未验证态并停机，严禁将缺失/异常当成“通过”或“状态为空” |
+
+#### 3.2.3 跨系统副作用恢复不变式
+
+- **先读回、再决策**：任何发生 `PARTIAL` 或中断的 L0 命令重入时，必须先读回 Git / LoopX / GitHub 真实状态，再决定重试或前向补偿：
+  - `merge`：已 `MERGED` 则跳过合并与 readiness，仅补齐未完成的 stop/retire/sync/archive；
+  - `feature`：重入先检查 Goal 与胶囊是否已存在，避免重复注册；
+  - `archive`：移动前判重，已归档则不嵌套；
+  - `approve contract`：重跑以新 SHA 与新 `user_gate` 记录取代旧授权；
+  - `todo done`：按 [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md) Q1 双分流契约处理（有效同 Owner 补领 receipt；过期/释放/转让/`deferred` 一律 Fail-Closed 停机并原样透出 `recovery`）。
+
+### 3.3 环境治理与 API 预算前置检查 (ADR-0007)
 
 `doctor` 在原生 `loopx doctor` 之后追加 3 段检查，输出统一为“状态 + 原因 + 影响 + 修复指令”，
 非阻断但必须可见：
@@ -264,54 +334,61 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 
 ## 10. 失败矩阵
 
-| 条件 | 命令 | 结果 |
-|---|---|---|
-| 工作区阻止分支切换 | `feature` | 非 0，不创建胶囊 |
-| 契约 SHA256 与锁定值不同 | `gate verify contract` | 非 0 |
-| 注册表或锁定指纹缺失 | `gate verify contract` | 非 0 |
-| 任一 npm 门禁失败 | `check` | 非 0，不进入后续门禁 |
-| 有 feature 但无 `loopx` 或收据 `ok !== true` | `check` | 非 0 |
-| 无 feature 且无 `--goal-id` | `check` | 非 0，不执行收据核验 |
-| 无 `loopx` | `todo` / `issue` / `integrate` / `merge` | 非 0 |
-| Goal 无已注册 Agent，或 `LOOPX_AGENT_ID` 未注册 | `todo claim` | 非 0，打印带 `--execute` 的 `register-agent`（占位符不被 `%q` 转义），不调用 `task-lease acquire` |
-| 多个已注册 Agent 且未设置 `LOOPX_AGENT_ID` | `todo claim` | 非 0，列出读完分页后的身份并要求设置 `LOOPX_AGENT_ID`，不申领 |
-| `agent-directory` 游标重复，或翻页后仍少于 `registered_agent_count` | `todo claim` | 非 0，不把残页报成缺失或歧义，不申领 |
-| 活动租约且 owner 相同 | `todo claim` | 复用 inspect 读到的当前代际幂等键 |
-| 租约已过期或已释放 | `todo claim` | 使用纳入 `lease_epoch` 与 `version` 的下一把幂等键 |
-| `task-lease acquire` 被 LoopX 拒绝 | `todo claim` | 非 0，保留 LoopX 的拒绝结果；`idempotency_key_reuse` 原样输出，不用“其他 Agent 持有”概括 |
-| 无 `loopx` | `doctor` | 非 0，输出诊断卡 |
-| 本机有 `loopx`，required skills 缺失、路由过期或冲突，新鲜度为 `stale` / `repair_recommended` / `missing`，或 `skill_delivery` 为 `repair_recommended` | `preflight` / `init` / `doctor` | 非 0，打印修复指令。`loopx doctor` 退出码 0 也不放行 |
-| 本机有 `loopx`，但 `loopx doctor` 非 0 或 stdout 不是 JSON | `preflight` / `init` / `doctor` | 非 0，不把环境标为就绪 |
-| 技能检查 `applicable: false` | `preflight` / `init` | 不因宿主自管技能阻断 |
-| 本机没有 `loopx` | `preflight` / `init` | 只告警；退出码仍由其余阻断项决定（ADR-0003） |
-| Mode A `reviewDecision != APPROVED` 或 review `commit_id != headRefOid` | `merge` | 非 0，不调用 `gh pr merge` |
-| 合入锁失败或 HEAD 在锁后变化 | `merge` | 非 0 |
-| 无 `loopx` | `approve` | 非 0，且不写批准标记 |
-| `configure-goal` 失败 | `approve` | 非 0，契约保持未批准 |
-| `sync-global` 重试后仍失败 | `feature` / `approve` | 非 0 |
-| 质量扫描存在 blocker | `ingest` / `check` | record 前非 0 |
-| 远程默认基线为 `origin/master`（无 `origin/main`） | `check` / `ingest` | 按 `origin/HEAD` → `origin/main` → `origin/master` 解析真实基线并透传 `--base-ref`，正常生成收据 |
-| 三种远程默认基线均不存在 | `check` / `ingest` | 前置非 0，提示 `git fetch origin && git remote set-head origin -a` |
-| Goal 未启用 change-quality 资格 | `check` / `doctor` | `check` 前置非 0（先于四大门禁）并输出诊断卡与 `loopx configure-goal --goal-id <goal> --change-quality-enabled --execute`；`doctor` 输出同类诊断卡并告警 |
-| PR 已 MERGED 且仍有未完成步骤 | `merge` | 不重复合并，补步骤；全部完成才成功 |
-| `goal-lifecycle stop` 失败 | `merge` | 非 0；GitHub squash 可能已完成 |
-| 全局退役、`sync-global` 或 archive 失败 | `merge` | 非 0；打印已合入未闭环与重跑命令 |
-| 审查模板或审查者不可用 | `review` | `NOT_VERIFIED`，非 0，不发评论 |
-| 四门禁失败或没有既有审查产物 | `respond` | 非 0，不发评论 |
-| 无 `loopx` | `respond` | `loopx status` 记为跳过，其余条件仍生效 |
-| 当前分支是 `main` 或 `master` | 已安装的 pre-commit | 拒绝 `git commit` |
-| 未跑过 `init` | `git commit` on `main` | 钩子不存在，本仓库命令不会拦截 |
-| 缺 `loopx-workflow.config.json` 或 Gate1 配置无效 | `approve contract` | 非 0，不写批准标记 |
-| 规格包缺 AC/Scope/Verification Plan、Story 无 AC，或 story id 在 AC 矩阵无行 | `approve contract` | 非 0，不写批准标记 |
-| 配置文件存在但 JSON 非法或 `authorization_mode` 非法 | `merge` | 非 0，不退回 `reviewDecision`，不调用 `gh pr merge` |
-| `single_owner` 缺风险接受 | `approve contract` | 非 0 |
-| `independent` 缺有效第二账号 `gate=1` 评论 | `approve contract` | 非 0 |
-| 授权记录缺失/被取代/evidence 缺键/模式不一致 | `gate verify contract` | 非 0 |
-| Mode A formal review `commit_id != headRefOid` | `merge` | 非 0 |
-| Mode B 缺 Agent COMMENT 或 `release-approve` head/contract 不匹配 | `merge` | 非 0 |
-| Mode B `blocking_reasons` 缺失/解析失败/命中允许列表 | `merge` | 非 0 |
-| 四门禁结果缺失或 receipt 失效 | `check` | 非 0，不写 passed |
-| 四门禁被标 `not_applicable` | `check` | 非 0 |
+> 下表按 §3.2 六结果语义（`SUCCESS / FAILED / BLOCKED / PARTIAL / NEEDS_HUMAN / NOT_VERIFIED`）标注每项条件的语义归类与退出处置；除 `SUCCESS` 返回退出码 `0` 外，其余 5 种语义一律返回非 `0`（详见 [ADR-0010](../adr/0010-command-contracts-and-execution-protocol.md) 与 [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md)）。
+
+| 条件 | 命令 | 结果语义 | 结果与处置 |
+|---|---|---|---|
+| 工作区阻止分支切换 | `feature` | `BLOCKED` | 非 0，不创建胶囊 |
+| 契约 SHA256 与锁定值不同 | `gate verify contract` | `BLOCKED` | 非 0，打印期望与当前指纹 |
+| 注册表或锁定指纹缺失（含附属 worktree 缺 registry） | `gate verify contract` | `BLOCKED` | 非 0，Fail-Closed 停机 |
+| 任一 npm 门禁失败 | `check` | `FAILED` | 非 0，不进入后续门禁 |
+| 有 feature 但无 `loopx` 或收据 `ok !== true` | `check` | `FAILED` / `NOT_VERIFIED` | 非 0，不打印成功 |
+| 无 feature 且无 `--goal-id` | `check` | `BLOCKED` | 非 0，不执行收据核验 |
+| 无 `loopx` | `todo` / `issue` / `integrate` / `merge` | `BLOCKED` | 非 0 |
+| Goal 无已注册 Agent，或 `LOOPX_AGENT_ID` 未注册 | `todo claim` / `todo done` | `BLOCKED` | 非 0，打印带 `--execute` 的 `loopx register-agent`（占位符 `<registered-agent-id>` 原样输出），不调用 `loopx todo claim` |
+| 多个已注册 Agent 且未设置 `LOOPX_AGENT_ID` | `todo claim` / `todo done` | `BLOCKED` | 非 0，列出完整分页读取后的已注册身份并要求设置 `LOOPX_AGENT_ID`，不申领 |
+| `agent-directory` 游标重复/停滞，或翻页后仍少于 `registered_agent_count` | `todo claim` / `todo done` | `NOT_VERIFIED` | 非 0，不把残页报成缺失或歧义，不申领 |
+| 受管 `loopx todo claim` 被 LoopX 拒绝（写范围冲突 / 前置未解封 / `idempotency_key_reuse` 等） | `todo claim` | `BLOCKED` | 非 0，原样保留 LoopX 拒绝与 `recovery` 输出；`idempotency_key_reuse` 严禁改写为“已被其他 Agent 持有” |
+| 凭证缓存 `$LOOPX_TMP_DIR/claims/<gid>--<tid>.json` 缺失、JSON 损坏或五元组（`goal_id`/`todo_id`/`agent_id`/`registry_path`/`handoff_mode`）不匹配，但目标租约仍**有效且同 Owner** | `todo done` | `SUCCESS`（补领后） | 按 ADR-0015 Q1 分流 A：拒绝直接复用失效缓存，自动调用受管 `loopx todo claim` 补领 receipt、刷新五元组缓存后再执行 `loopx todo complete` 并清理缓存 |
+| 租约已过期（`lease_state=expired`）、已释放（`released`）、已转让/异主持有（`owner_conflicts_with_claim`）、Todo 处于 `deferred` 挂起态（`todo_not_open`）或 `execution_authority_granted=false` | `todo done` | `BLOCKED` / `NEEDS_HUMAN` | 按 ADR-0015 Q1 分流 B：**一律 Fail-Closed 非 0 停机并原样透出 LoopX `recovery` 指引**（过期态提示核对现状后显式重跑 `loopx-flow todo claim`；`deferred` 提示先 `loopx todo update --status open --clear-resume-when` 再认领），**严禁静默重新 `claim`** |
+| `todo update` 携带 `--update-expected-provider-revision` 触发 CAS 冲突 | `todo`（恢复路径） | `BLOCKED` | 非 0，先调用 `loopx todo list --todo-id` 对账最新 `authority_read.provider_revision` 后再重试，禁止静默 rebase |
+| BLOCK 档必需能力缺失或 `--help` 子命令签名探测为 `UNKNOWN`（含 `issue` 缺 `issue-fix.feasibility`、`integrate` 缺 `integration-branch`） | 相关 L0 命令 / `doctor` | `BLOCKED` | 非 0，输出《LoopX 升级契约差异诊断卡》（`issue-fix.feasibility`/`integration-branch` 在 `doctor` 查其他命令时仅 WARN） |
+| LoopX JSON 载荷缺失 `schema_version`、返回白名单外 `schema_version` 或非预期 JSON 结构 | 消费 LoopX JSON 的 L0 命令 / `doctor` | `NOT_VERIFIED` / `BLOCKED` | 非 0 Fail-Closed，输出《LoopX 升级契约差异诊断卡》，严禁静默降级或 fail-open |
+| WARN 档非关键能力缺失或 `UNKNOWN`（`goal.acceptance` 未启用时、`change-quality.safe-fix`、OCR、Lark） | `doctor` / 相关命令 | `SUCCESS`（带 WARN） | 输出 WARN 并披露降级，不阻断主流程 |
+| `loopx --version` 偏离已验证锚点（`2.3.0` / `loopx-project/loopx@f4c5d6d7`），但 `--help` 签名与 `schema_version` 白名单全部通过 | `doctor` / L0 命令 | `SUCCESS`（带 WARN） | 输出版本号软提示（建议运行隔离 Registry Real-CLI Canary），不阻断执行 |
+| 无 `loopx` | `doctor` | `BLOCKED` | 非 0，输出诊断卡 |
+| 本机有 `loopx`，required skills 缺失、路由过期或冲突，新鲜度为 `stale` / `repair_recommended` / `missing`，或 `skill_delivery` 为 `repair_recommended` | `preflight` / `init` / `doctor` | `BLOCKED` | 非 0，打印修复指令。`loopx doctor` 退出码 0 也不放行 |
+| 本机有 `loopx`，但 `loopx doctor` 非 0 或 stdout 不是 JSON | `preflight` / `init` / `doctor` | `NOT_VERIFIED` | 非 0，不把环境标为就绪 |
+| 技能检查 `applicable: false` | `preflight` / `init` | `SUCCESS` | 不因宿主自管技能阻断 |
+| 本机没有 `loopx` | `preflight` / `init` | `SUCCESS`（带 WARN） | 只告警；退出码仍由其余阻断项决定（ADR-0003） |
+| Mode A `reviewDecision != APPROVED` 或 review `commit_id != headRefOid` | `merge` | `NEEDS_HUMAN` / `BLOCKED` | 非 0，不调用 `gh pr merge` |
+| 合入锁失败或 HEAD 在锁后变化 | `merge` | `BLOCKED` | 非 0，不调用 `gh pr merge` |
+| 无 `loopx` | `approve` | `BLOCKED` | 非 0，且不写批准标记 |
+| `configure-goal` 失败 | `approve` | `FAILED` | 非 0，契约保持未批准 |
+| `sync-global` 重试后仍失败 | `feature` / `approve` | `PARTIAL` | 非 0，先读回真实状态后重跑补偿 |
+| 质量扫描存在 blocker | `ingest` / `check` | `FAILED` | record 前非 0 |
+| 远程默认基线为 `origin/master`（无 `origin/main`） | `check` / `ingest` | `SUCCESS` | 按 `origin/HEAD` → `origin/main` → `origin/master` 解析真实基线并透传 `--base-ref`，正常生成收据 |
+| 三种远程默认基线均不存在 | `check` / `ingest` | `BLOCKED` | 前置非 0，提示 `git fetch origin && git remote set-head origin -a` |
+| Goal 未启用 change-quality 资格 | `check` / `doctor` | `BLOCKED` | `check` 前置非 0（先于四大门禁）并输出诊断卡与 `loopx configure-goal --goal-id <goal> --change-quality-enabled --execute`；`doctor` 输出同类诊断卡并告警 |
+| PR 已 MERGED 且仍有未完成步骤 | `merge` | `PARTIAL` → 补偿至 `SUCCESS` | 不重复合并，补步骤；全部完成才成功 |
+| `goal-lifecycle stop` 失败 | `merge` | `PARTIAL` | 非 0；GitHub squash 可能已完成，打印重跑补偿指令 |
+| 全局退役、`sync-global` 或 archive 失败 | `merge` | `PARTIAL` | 非 0；打印「已合入、未闭环」与重跑命令 |
+| 审查模板或审查者不可用 | `review` | `NOT_VERIFIED` | 非 0，不发评论 |
+| 四门禁失败或没有既有精确 head 审查产物 | `respond` | `FAILED` / `NOT_VERIFIED` | 非 0，不发评论 |
+| 无 `loopx` | `respond` | `SUCCESS`（按其余条件） | `loopx status` 记为跳过，其余条件仍生效 |
+| 当前分支是 `main` 或 `master` | 已安装的 pre-commit | `BLOCKED` | 拒绝 `git commit` |
+| 未跑过 `init` | `git commit` on `main` | —（未安装钩子） | 钩子不存在，本仓库命令不会拦截 |
+| 缺 `loopx-workflow.config.json` 或 Gate1 配置无效 | `approve contract` | `BLOCKED` | 非 0，不写批准标记 |
+| 规格包缺 AC/Scope/Verification Plan、Story 无 AC，或 story id 在 AC 矩阵无行 | `approve contract` | `BLOCKED` | 非 0，不写批准标记 |
+| 配置文件存在但 JSON 非法或 `authorization_mode` 非法 | `merge` | `BLOCKED` | 非 0，不退回 `reviewDecision`，不调用 `gh pr merge` |
+| `single_owner` 缺风险接受 | `approve contract` | `NEEDS_HUMAN` / `BLOCKED` | 非 0 |
+| `independent` 缺有效第二账号 `gate=1` 评论 | `approve contract` | `NEEDS_HUMAN` | 非 0 |
+| 授权记录缺失/被取代/evidence 缺键/模式不一致 | `gate verify contract` | `BLOCKED` | 非 0 |
+| Mode A formal review `commit_id != headRefOid` | `merge` | `BLOCKED` | 非 0 |
+| Mode B 缺 Agent COMMENT 或 `release-approve` head/contract 不匹配 | `merge` | `NEEDS_HUMAN` / `BLOCKED` | 非 0 |
+| Mode B `blocking_reasons` 缺失/解析失败/命中允许列表 | `merge` | `BLOCKED` / `NOT_VERIFIED` | 非 0 |
+| 四门禁结果缺失或 receipt 失效 | `check` | `NOT_VERIFIED` / `FAILED` | 非 0，不写 passed |
+| 四门禁被标 `not_applicable` | `check` | `FAILED` | 非 0 |
 
 
 ## 11. 需求到现有胶囊
@@ -328,7 +405,7 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | `REQ-QUALITY-1` | `change-quality-failclosed` | `ingest-to-loopx-quality.js`、`change-quality verify` |
 | `REQ-REVIEW-1` `REQ-REVIEW-2` `REQ-PR-BODY-1` `REQ-RESPOND-1` | `authentic-review-pipeline`、`loopx-ecosystem-alignment` | `authentic-review.js`、`respond-report.js`、`cmd_pr`、`cmd_respond` |
 | `REQ-NATIVE-1` | `native-dispatch-deep-integration` | `cmd_todo`、`cmd_issue`、`cmd_integrate` |
-| `REQ-LEASE-1` | 本次修复 GitHub #12，无新胶囊 | `resolve_claim_owner`、`claim_idempotency_key`、`cmd_todo_lease` 的 claim |
+| `REQ-LEASE-1` | 历史修复 GitHub #12（手工 `task-lease` 已由 [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md) 取代，待 W3 `#41` 实施受管委托） | `resolve_claim_owner`、`cmd_todo`（受管 `todo claim/complete` 与五元组缓存迁移目标见 ADR-0015） |
 | `REQ-SKILL-READY-1` | 本次修复 GitHub #11，无新胶囊 | `scripts/preflight-check.sh`、`scripts/loopx-skill-readiness.js`、`scripts/workflow-init.sh` |
 | `REQ-GOAL-1` | `loopx-ecosystem-alignment`、`fail-closed-hardening` | `cmd_merge` 的 goal stop/retire/sync/archive 补偿 |
 | `REQ-CHECK-IDENTITY-1` | `fail-closed-hardening` | `cmd_check`、`ingest-to-loopx-quality.js` |
