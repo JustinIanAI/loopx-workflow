@@ -63,6 +63,8 @@ function makeSandbox(opts = {}) {
   const logs = path.join(dir, 'logs');
   fs.mkdirSync(logs, { recursive: true });
 
+  const diffFile = path.join(dir, 'fixture.diff');
+  fs.writeFileSync(diffFile, opts.diffText || 'diff --git a/src/app.js b/src/app.js\n--- a/src/app.js\n+++ b/src/app.js\n+const token = "placeholder";\n');
   const legits = { gh: 1, codex: 1, loopx: 1, npm: 1, claude: 1 };
   if (opts.omitCodex) delete legits.codex;
   let {
@@ -98,10 +100,7 @@ case "$0" in
       exit 0
     fi
     if [[ "$args" == *"diff"* ]]; then
-      echo 'diff --git a/src/app.js b/src/app.js'
-      echo '--- a/src/app.js'
-      echo '+++ b/src/app.js'
-      echo '+const token = "placeholder";'
+      cat ${JSON.stringify(diffFile)}
       exit 0
     fi
     if [[ "$args" == *"comment"* ]]; then exit 0; fi
@@ -825,13 +824,26 @@ describe('host truncation fail-closed guard', () => {
     const file = path.join(pre, 'out.json');
     fs.writeFileSync(file, nativeModelOut({ extra: '[... 44229 bytes omitted ...]' }));
     const sbx = makeSandbox({ codexStdoutFile: file });
-    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { REVIEW_KEEP_PROMPT: '1' });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
     assert.notStrictEqual(r.code, 0);
     assert.match(r.out, /\[NOT_VERIFIED\]/);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
     assert.doesNotMatch(calls, /pr comment/);
     const runDirs = fs.readdirSync(sbx.tmpDir).filter((d) => d.startsWith('review-pr7-'));
     assert.strictEqual(runDirs.length, 1, 'failed run must keep the sandbox');
+    fs.rmSync(pre, { recursive: true, force: true });
+  });
+
+  test('quoting a pr.diff truncation literal is not a host truncation', () => {
+    const marker = '[... 44229 bytes omitted ...]';
+    const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-literal-'));
+    const file = path.join(pre, 'out.json');
+    fs.writeFileSync(file, nativeModelOut({ extra: `fixture quotes ${marker}` }));
+    const sbx = makeSandbox({ codexStdoutFile: file, diffText: `+const fixture = "${marker}";\n` });
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/bin/sh\nout=""; p=""\nfor a in "$@"; do [ "\$p" = "-o" ] && out="\$a"; p="\$a"; done\ncat >/dev/null\ncat ${JSON.stringify(file)} > "\$out"\necho ${JSON.stringify(marker)} >&2\nexit 0\n`, { mode: 0o755 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    assert.match(fs.readFileSync(sbx.logs, 'utf8'), /pr comment/);
     fs.rmSync(pre, { recursive: true, force: true });
   });
 

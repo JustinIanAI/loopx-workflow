@@ -745,7 +745,7 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
 // 宿主截断特征（如 `[... 44229 bytes omitted ...]`）。只匹配带字节数的方括号标记，
 // 避免误杀正文里讨论 “bytes omitted” 机制的正常审查。
 const HOST_TRUNCATION_RE = /\[\s*\.{3}\s*\d+\s*bytes\s+omitted\s*\.{3}\s*\]/i;
-const DEFAULT_STDIN_BYTE_LIMIT = 32 * 1024;
+const DEFAULT_STDIN_BYTE_LIMIT = 64 * 1024;
 
 function stdinByteLimit() {
   const raw = process.env.REVIEW_STDIN_BYTE_LIMIT;
@@ -761,8 +761,25 @@ function assertCompactStdin(prompt) {
   return { ok: bytes <= limit, bytes, limit };
 }
 
-function hostOutputTruncated(...parts) {
-  return parts.some((part) => HOST_TRUNCATION_RE.test(String(part || '')));
+function truncationMarkers(text) {
+  return String(text || '').match(new RegExp(HOST_TRUNCATION_RE.source, 'gi')) || [];
+}
+function novelHostTruncation(diffText, ...parts) {
+  const diff = diffText == null ? null : String(diffText);
+  return parts.some((part) => truncationMarkers(part).some((marker) => diff == null || !diff.includes(marker)));
+}
+function hostOutputTruncated(...parts) { return novelHostTruncation(null, ...parts); }
+function formatPriorForStdin(priorFindings, hasManifest) {
+  const list = priorFindings || [];
+  if (!hasManifest) return list.map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
+  if (!list.length) return '(无上轮 findings)';
+  return `${list.length} 条，只读沙箱 \`prior-findings.md\`。` + list.map(f => `#${f.index}[${f.severity}]`).join(' ');
+}
+function formatRemoteChecksForStdin(remoteChecks, remoteChecksError, hasManifest) {
+  if (!hasManifest) return formatRemoteChecksText(remoteChecks, remoteChecksError);
+  const rows = Array.isArray(remoteChecks) ? remoteChecks : [];
+  const pass = rows.filter(c => c && (c.bucket === 'pass' || c.state === 'SUCCESS')).length;
+  return `${rows.length} 项（通过 ${pass}）${remoteChecksError ? '；获取失败见文件' : ''}。只读沙箱 \`remote-checks.txt\`。`;
 }
 
 function materializeReviewSandbox(runDir, files) {
@@ -813,7 +830,8 @@ function reviewAgentArgs(agentBin, runDir, tmpMsg) {
 // 注意：这是"透传原生提示词约束"，不是手写版式。模型被要求严格按五段式产出。
 // diff / evidence 正文落在沙箱文件，stdin 只带清单（artifactManifest）。
 function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract, remoteChecks, remoteChecksError, artifactManifest }) {
-  const prior = (priorFindings || []).map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
+  const hasManifest = Boolean(artifactManifest);
+  const prior = formatPriorForStdin(priorFindings, hasManifest);
   const sectionsMd = (reviewTemplate.sections || []).map(s =>
     `### ${s.label}（最少 ${s.minimum_prose_characters} 正文字符）\n约束提示词：${s.agent_instruction || ''}`,
   ).join('\n\n');
@@ -821,7 +839,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   const evdCmds = (evidenceCommands || []).map(c => `- \`${c}\``).join('\n');
   const requiredIds = (reviewPlan.required_evidence_ids || []).join(', ');
   const evidenceRequirements = formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan);
-  const remoteChecksText = formatRemoteChecksText(remoteChecks, remoteChecksError);
+  const remoteChecksText = formatRemoteChecksForStdin(remoteChecks, remoteChecksError, hasManifest);
   const head10 = headOid.slice(0, 10);
   const manifest = artifactManifest || '(调用方未提供沙箱清单；diff 与证据正文不内联进 stdin)';
   void evidenceText;
@@ -858,7 +876,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '- 判断类 id 由你独立核实后在 `evidence` 中填写；未核实或形状不完整的项将保持 `status: "unverified"`，主机绝不预填或回填占位句：',
     evidenceRequirements || '(本 PR 无额外 evidence requirements)',
     '',
-    '## 证据采集命令（下方已附运行结果）',
+    hasManifest ? '## 证据采集命令（运行结果见沙箱文件 evidence-output.md）' : '## 证据采集命令（下方已附运行结果）',
     evdCmds,
     '',
     '## 上轮 findings 裁决（有上轮 findings 时必须逐条）',
@@ -978,7 +996,7 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
   ].join('\n');
 }
 
-function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
+function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText) {
   const resolvedBin = findOnPath(agentBin, process.env.PATH);
   if (!resolvedBin) return { unavailable: true };
   const compact = assertCompactStdin(prompt);
@@ -1009,13 +1027,23 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
       maxBuffer: 64 * 1024 * 1024,
       timeout: timeoutMs || TIMEOUT_MS,
     });
-    const stdout = (tmpMsg && fs.existsSync(tmpMsg)) ? fs.readFileSync(tmpMsg, 'utf8') : (r.stdout || '');
+    const rawStdout = r.stdout || '';
+    const msgOut = (tmpMsg && fs.existsSync(tmpMsg)) ? fs.readFileSync(tmpMsg, 'utf8') : '';
     const stderr = r.stderr || '';
-    if (hostOutputTruncated(stdout, stderr)) {
-      return { truncated: true, stdout, stderr, error: 'host truncation marker in model output' };
+    const modelChannel = String(msgOut).trim() ? msgOut : rawStdout;
+    const codex = !String(agentBin).includes('claude');
+    const modelReady = r.status === 0 && String(modelChannel).trim().length > 0;
+    const truncParts = [modelChannel];
+    if (rawStdout && rawStdout !== modelChannel) truncParts.push(rawStdout);
+    if (!(codex && modelReady)) truncParts.push(stderr);
+    if (novelHostTruncation(diffText, ...truncParts)) {
+      return { truncated: true, stdout: modelChannel, stderr, rawStdout, error: 'host truncation marker in model output' };
     }
-    if (r.status !== 0) return { error: `exit ${r.status}: ${(stderr || stdout).slice(0, 300)}`, stdout, stderr };
-    return { stdout, stderr };
+    if (r.status !== 0) {
+      const diag = String(stderr || rawStdout || msgOut || '');
+      return { error: `exit ${r.status}: ${diag.slice(0, 300)}`, stdout: modelChannel, stderr, rawStdout };
+    }
+    return { stdout: modelChannel, stderr, rawStdout };
   } finally {
     if (tmpMsg && !runDir) {
       try { fs.rmSync(tmpMsg, { force: true }); } catch (_) {}
@@ -1470,7 +1498,6 @@ function main() {
     'evidence-output.md': String(evidenceText || ''),
     'remote-checks.txt': remoteChecksText,
   });
-  const artifactManifest = formatArtifactManifest(sandboxEntries);
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
     try { validation = buildValidationMatrix(gates(), { headOid, remoteChecks }); } catch (e) { validation = []; }
@@ -1483,6 +1510,10 @@ function main() {
     console.error('[NOT_VERIFIED] carryover 文件在本 PR 被修改，历史 findings 完整性不可信；请从私有 review artifact 提供。');
     process.exit(1);
   }
+  const priorEntries = priorFindings.length ? materializeReviewSandbox(runDir, {
+    'prior-findings.md': priorFindings.map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n'),
+  }) : [];
+  const artifactManifest = formatArtifactManifest([...sandboxEntries, ...priorEntries]);
   const prompt = buildNativePrompt({
     pr: o.pr, headOid, branch: head.headRefName, motivation: pkt.motivation,
     reviewTemplate: pkt.reviewTemplate, reviewPlan: pkt.reviewPlan,
@@ -1497,7 +1528,7 @@ function main() {
   const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || 'codex';
   const stage1PromptFile = writePromptArtifact(runDir, o.pr, headOid, prompt, 'stage1');
   console.log(`[i] 阶段 1 评审提示词已写入沙箱文件: ${stage1PromptFile} (通过 stdin 流式传入 ${primaryAgent})`);
-  const agentRun = runReviewAgent(primaryAgent, prompt, undefined, runDir);
+  const agentRun = runReviewAgent(primaryAgent, prompt, undefined, runDir, diff);
   if (agentRun.unavailable) {
     console.error(`[NOT_VERIFIED] ${primaryAgent} CLI unavailable; refusing to publish an unreviewed report.`);
     process.exit(1);
@@ -1512,7 +1543,7 @@ function main() {
     console.error('[NOT_VERIFIED] model output missing review_body/verdict/declaration; refusing to publish.');
     process.exit(1);
   }
-  if (hostOutputTruncated(modelOut.review_body, JSON.stringify(modelOut.findings || []), agentRun.stdout, agentRun.stderr)) {
+  if (novelHostTruncation(diff, modelOut.review_body, JSON.stringify(modelOut.findings || []), agentRun.stdout)) {
     console.error('[NOT_VERIFIED] 模型输出命中宿主截断特征，拒绝发布。');
     process.exit(1);
   }
@@ -1587,7 +1618,7 @@ function main() {
     });
     const stage2PromptFile = writePromptArtifact(runDir, o.pr, headOid, stage2Prompt, 'stage2');
     console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length + unverifiedValidationCases.length} 项): ${stage2PromptFile}`);
-    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt, undefined, runDir);
+    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt, undefined, runDir, diff);
     if (stage2Run.truncated || stage2Run.stdinRejected) {
       console.error(`[NOT_VERIFIED] 阶段 2 拒绝发布：${stage2Run.error}`);
       process.exit(1);
@@ -1661,7 +1692,7 @@ function main() {
   if (o.crossValidate) {
     const secondaryAgent = primaryAgent.includes('claude') ? 'codex' : 'claude';
     console.log(`==> [S5] Cross-validating with ${secondaryAgent} (default model)...`);
-    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir);
+    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir, diff);
     if (cv.truncated || cv.stdinRejected) {
       console.error(`[NOT_VERIFIED] 交叉核验命中截断或 stdin 超限，拒绝发布：${cv.error}`);
       process.exit(1);

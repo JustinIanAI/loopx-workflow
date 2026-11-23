@@ -72,7 +72,7 @@
 
 ## 2026-11-23 修订（沙箱文件路径只读传参与截断 Fail-Closed 守卫）
 
-- 大上下文工件（`packet.json`、`pr.diff`、`evidence-output.md`、`remote-checks.txt`，阶段 2 另加 `stage1-review.md`）落在 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/`。`stdin` 只带紧凑引导、原生 `review_template` / `evidenceContract` 与路径及字节/行数清单。完整 diff 与证据正文不再内联，也不再做静默截断。
+- 大上下文工件（`packet.json`、`pr.diff`、`evidence-output.md`、`remote-checks.txt`、`prior-findings.md`，阶段 2 另加 `stage1-review.md`）落在 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/`。`stdin` 只带紧凑引导、原生 `review_template` / `evidenceContract` 与路径及字节/行数清单。有清单时远端检查与上轮 findings 只留 1 行计数或 id 摘要。完整 diff 与证据正文不再内联，也不再做静默截断。
 - 原「禁止读文件」改为：审查 Agent 只可只读读取本次清单中的工件，禁止改工作区、禁止写工具与破坏性命令。本机 `codex exec --help` 中 `--add-dir` 是可写附加目录，因此 codex 使用 `--sandbox read-only`、`--skip-git-repo-check`、`--ephemeral` 与 `-C <runDir>`。`claude -p` 使用 `--tools Read`、`--permission-mode dontAsk` 与 `--add-dir <runDir>`。
-- 内联 stdin 有字节上限（`REVIEW_STDIN_BYTE_LIMIT`，默认 32768）：超限直接拒绝调用，而不是把 diff 截短后继续。输出命中宿主标记 `[... N bytes omitted ...]` 时打印 `[NOT_VERIFIED]`、非 0 退出、保留 `runDir`，并且不调用 `gh` 发布。未带该方括号字节标记的审查正文不拦截。
+- 内联 stdin 有字节上限（`REVIEW_STDIN_BYTE_LIMIT`，默认 65536）：超限直接拒绝调用，而不是把 diff 截短后继续。输出命中宿主标记 `[... N bytes omitted ...]` 且该标记未原样出现在本次 `pr.diff` 时打印 `[NOT_VERIFIED]`、非 0 退出、保留 `runDir`，并且不调用 `gh` 发布。`codex` 在退出码为 0 且模型输出非空时不把 stderr 工具回显当作截断。未带该方括号字节标记的审查正文不拦截。
 - PR 评论发布、comment upsert（`PATCH` 拆分为 `['-X', 'PATCH', endpoint, '-F', 'body=@-']`）与 `gh pr edit` 全链路改用 stdin 传递，不再产生临时正文文件。
