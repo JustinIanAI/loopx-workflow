@@ -1,8 +1,8 @@
 # ADR-0015：受管 Todo 执行委托与三层能力探针
 
-- **状态**：Proposed
+- **状态**：Accepted
 - **日期**：2026-11-23
-- **审批**：待人类 Maintainer 签核后由 `Proposed` 置为 `Accepted`（依据 [ADR-0006](0006-document-code-change-governance.md) 与 [ADR-0008](0008-application-orchestration-layer.md) 决策 6，签批前不得冻结下游 `W3` / `W4` 契约或启动编码）
+- **审批**：已于 2026-11-23 经人类 Maintainer（JustinIan）在 Multica TRE-88（评论 `01a206ee-882e-71e4-a936-91e0836b31a0`）签批由 `Proposed` 置为 `Accepted`（依据 [ADR-0006](0006-document-code-change-governance.md) 与 [ADR-0008](0008-application-orchestration-layer.md) 决策 6），正式解冻下游 `W3`（`#41`）与 `W4`（`#42`）契约
 - **关联**：[ADR-0006](0006-document-code-change-governance.md)、[ADR-0008](0008-application-orchestration-layer.md)、[ADR-0010](0010-command-contracts-and-execution-protocol.md)、[ADR-0014](0014-temp-artifact-path-remediation-and-history-sanitization.md)、[2026-11-19 Pstack / Magpie / LoopX 整合调研报告](../research/2026-11-19-pstack-magpie-loopx-integration-validation.md)、[ADR 收口实施计划](../plans/2026-11-20-pstack-loopx-adr-closure-implementation-plan.md)
 - **上游锚点**：`loopx-project/loopx@f4c5d6d7`（完整 SHA `f4c5d6d70c4c88ee4dae705c0ea7b5a8ea87e5ff`，与本机实测 `loopx 2.3.0` 全部 1,824 个源文件字节一致）
 - **取代**：[ADR-0010](0010-command-contracts-and-execution-protocol.md) 末尾增补节中的旧 `REQ-LEASE-1`（手工 `task-lease inspect/acquire/release` 与 SHA-256 幂等键拼接方案）
@@ -149,7 +149,7 @@
 
 ## 不做什么
 
-- 不在本 ADR（`W2` 纯文档批次）修改任何代码、脚本、测试或 `.loopx/` 运行态文件；`W3`（`#41`）与 `W4`（`#42`）须待人类 Maintainer 将本 ADR 签批置为 `Accepted` 后方可启动。
+- 不在本 ADR（`W2` 纯文档批次）修改任何代码、脚本、测试或 `.loopx/` 运行态文件；代码实现交由下游 `W3`（`#41`）与 `W4`（`#42`）实施。
 - 不在本 ADR 定义独立命令 `loopx-flow todo sync <feature>`、`04-contract.md` Story 执行表及双层写范围越界核验（归独立 `ADR-0016` / `W9` `#47` 与 `W10` `#48`）。
 - 不在本 ADR 实现 `status --next` 只读投影（归 `W8` `#46`）或 `cmd_merge` 可选 `goal-acceptance` 校验开关（归 `W11b` `#51`，其将复用本 ADR 的三层探针与 `schema_version` 白名单）。
 - 不修改 LoopX 上游控制面源码，也不在 LoopX 状态模型中假设或新增自定义字段。
