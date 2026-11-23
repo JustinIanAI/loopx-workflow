@@ -113,6 +113,10 @@ function cleanupMock() {
   if (fs.existsSync(MOCK_COMMENT_LOG)) {
     fs.unlinkSync(MOCK_COMMENT_LOG);
   }
+  const reviewCache = path.join(PROJECT_ROOT, '.loopx/cache/reviews/123@abcd1234ef567890.json');
+  if (fs.existsSync(reviewCache)) {
+    fs.unlinkSync(reviewCache);
+  }
 }
 
 test('1. Native Five-Section Review: loopx-flow review must render loopx pr-review review_template format with dynamic metadata', () => {

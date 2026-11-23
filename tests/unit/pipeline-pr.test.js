@@ -12,7 +12,7 @@ const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const MOCK_BIN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-mock-bin-pr-'));
 process.on('exit', () => { try { fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true }); } catch (_) {} });
-const REG_PATH = path.join(PROJECT_ROOT, '.loopx/registry.json');
+const REG_PATH = path.join(MOCK_BIN_DIR, 'registry.json');
 
 function registerE2eGoal(featureDir) {
   const contract = path.join(featureDir, '04-contract.md');
@@ -92,6 +92,7 @@ function setupMockLoopx() {
   if (!fs.existsSync(MOCK_BIN_DIR)) {
     fs.mkdirSync(MOCK_BIN_DIR, { recursive: true });
   }
+  fs.writeFileSync(REG_PATH, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
 
   const mockLoopxPath = path.join(MOCK_BIN_DIR, 'loopx');
   const mockLoopxScript = `#!/usr/bin/env bash
@@ -168,8 +169,6 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
   const featureDir = path.join(PROJECT_ROOT, 'specs/features', featureName);
   const archiveDir = path.join(PROJECT_ROOT, 'specs/archive', featureName);
   const originalBranch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf8' }).trim();
-  const hadReg = fs.existsSync(REG_PATH);
-  const originalReg = hadReg ? fs.readFileSync(REG_PATH, 'utf8') : null;
 
   // Clean before test
   if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
@@ -177,12 +176,15 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
   try { execSync("git branch -D feature/" + featureName, { stdio: "ignore" }); } catch (_) {}
 
   const currentHeadSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+  const reviewCacheFile = path.join(PROJECT_ROOT, '.loopx/cache/reviews', `101@${currentHeadSha}.json`);
+  const hadReviewCache = fs.existsSync(reviewCacheFile);
   setupMockGh(currentHeadSha);
   setupMockLoopx();
 
   const testEnv = {
     ...process.env,
     PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
+    LOOPX_REGISTRY: REG_PATH,
     LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1'
   };
 
@@ -266,8 +268,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
     console.log('[Test E2E] 6. End-to-end PR Review & Merge pipeline simulation completed successfully!');
   } finally {
     cleanupMockGh();
-    if (hadReg && originalReg !== null) fs.writeFileSync(REG_PATH, originalReg);
-    else if (!hadReg && fs.existsSync(REG_PATH)) fs.unlinkSync(REG_PATH);
+    if (!hadReviewCache && fs.existsSync(reviewCacheFile)) fs.unlinkSync(reviewCacheFile);
     if (fs.existsSync(featureDir)) fs.rmSync(featureDir, { recursive: true, force: true });
     if (fs.existsSync(archiveDir)) fs.rmSync(archiveDir, { recursive: true, force: true });
     // Restore the developer's original branch: `loopx-flow feature` switches branches as a side effect
@@ -290,6 +291,7 @@ test('Merge Readiness Fail-Closed: loopx-flow merge must block when LoopX readin
   const testEnv = {
     ...process.env,
     PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
+    LOOPX_REGISTRY: REG_PATH,
     MOCK_LOOPX_READINESS_FAIL: '1'
   };
 

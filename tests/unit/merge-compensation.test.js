@@ -12,10 +12,12 @@ const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const MOCK_BIN = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-mock-bin-merge-comp-'));
 process.on('exit', () => { try { fs.rmSync(MOCK_BIN, { recursive: true, force: true }); } catch (_) {} });
 const CALLS = path.join(MOCK_BIN, 'calls.log');
+const TEST_REGISTRY = path.join(MOCK_BIN, 'registry.json');
 
 function setupMocks() {
   fs.rmSync(MOCK_BIN, { recursive: true, force: true });
   fs.mkdirSync(MOCK_BIN, { recursive: true });
+  fs.writeFileSync(TEST_REGISTRY, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
   fs.writeFileSync(path.join(MOCK_BIN, 'gh'), `#!/usr/bin/env bash
 echo "gh $*" >> "\${CALLS}"
 if [[ "$1" == "pr" && "$2" == "view" ]]; then
@@ -60,6 +62,7 @@ function runMerge(pr, feature, envExtra = {}) {
     ...process.env,
     PATH: `${MOCK_BIN}:${process.env.PATH}`,
     CALLS,
+    LOOPX_REGISTRY: TEST_REGISTRY,
     LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1',
     ...envExtra,
   };
