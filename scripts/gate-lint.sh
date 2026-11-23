@@ -79,7 +79,10 @@ fi
 
 # 4. 静态路径与临时工件卫生守卫（ADR-0007 / Issue #8 / §4.1）
 echo -n "    [4/5] 核验临时工件与跨平台静态卫生守卫... "
-HYGIENE_OUT="$(node - "$PROJECT_ROOT" <<'NODE'
+GATE_TMP_DIR="${LOOPX_TMP_DIR:-$PROJECT_ROOT/.loopx/tmp}"
+mkdir -p "$GATE_TMP_DIR"
+HYGIENE_OUT_FILE="$GATE_TMP_DIR/gate-lint-hygiene.$$.out"
+if node - "$PROJECT_ROOT" >"$HYGIENE_OUT_FILE" 2>&1 <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
 const root = process.argv[2];
@@ -114,30 +117,31 @@ function checkFile(abs) {
     if (isJs && (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*'))) return;
     if (!isJs && trimmed.startsWith('#')) return;
 
+    const where = rel + ':' + (idx + 1);
     if (/\bos\.tmpdir\s*\(|\btmpdir\s*\(/.test(line)) {
-      violations.push(`${rel}:${idx + 1} 禁止直接调用 os.tmpdir()/tmpdir()`);
+      violations.push(where + ' 禁止直接调用 os.tmpdir()/tmpdir()');
     }
     if (!isJs && /\bmktemp\b/.test(line)) {
       // 允许带模板且落在 LOOPX_TMP_DIR 的 mktemp；禁止裸 mktemp
       if (!/mktemp\s+(-d\s+)?"?\$\{?LOOPX_TMP_DIR\}?\//.test(line)) {
-        violations.push(`${rel}:${idx + 1} 禁止裸 mktemp（须用 wf_run_dir 或模板指向 LOOPX_TMP_DIR）`);
+        violations.push(where + ' 禁止裸 mktemp（须用 wf_run_dir 或模板指向 LOOPX_TMP_DIR）');
       }
     }
-    if (/(?:^|[\s;|&`(])which\s+[A-Za-z0-9_$-]|spawnSync\(\s*['"]which['"]|execFileSync\(\s*['"]which['"]|sh\(\s*['"]which['"]/.test(line)) {
-      violations.push(`${rel}:${idx + 1} 禁止外部 which（Shell 用 command -v，Node 用 lib/paths.js findOnPath）`);
+    if (/(?:^|[\s;|&\x60(])which\s+[A-Za-z0-9_$-]|spawnSync\(\s*['"]which['"]|execFileSync\(\s*['"]which['"]|sh\(\s*['"]which['"]/.test(line)) {
+      violations.push(where + ' 禁止外部 which（Shell 用 command -v，Node 用 lib/paths.js findOnPath）');
     }
     if (/\bpython3\b/.test(line)) {
-      violations.push(`${rel}:${idx + 1} 禁止隐式 python3 依赖`);
+      violations.push(where + ' 禁止隐式 python3 依赖');
     }
     if (/spawnSync\(\s*['"]sleep['"]/.test(line)) {
-      violations.push(`${rel}:${idx + 1} 禁止外部 spawnSync('sleep')，请用 sleepSync`);
+      violations.push(where + " 禁止外部 spawnSync('sleep')，请用 sleepSync");
     }
     if (isJs && /['"]\.loopx\/(?!tmp|cache)/.test(line)) {
-      violations.push(`${rel}:${idx + 1} 禁止 CWD 相对 .loopx/ 路径，请用 lib/paths.js 锚定 REPO_ROOT`);
+      violations.push(where + ' 禁止 CWD 相对 .loopx/ 路径，请用 lib/paths.js 锚定 REPO_ROOT');
     }
     if (/\/Users\/[A-Za-z0-9_.-]+\/|\/home\/[A-Za-z0-9_.-]+\/|C:\\\\[A-Za-z0-9_.-]+/.test(line)
       && rel !== 'scripts/git-hooks/pre-commit' && rel !== 'scripts/gate-lint.sh') {
-      violations.push(`${rel}:${idx + 1} 禁止宿主机绝对路径字面量`);
+      violations.push(where + ' 禁止宿主机绝对路径字面量');
     }
   });
 }
@@ -148,7 +152,13 @@ if (violations.length) {
   process.exit(1);
 }
 NODE
-)" || HYGIENE_RC=$?
+then
+    HYGIENE_RC=0
+else
+    HYGIENE_RC=$?
+fi
+HYGIENE_OUT="$(cat "$HYGIENE_OUT_FILE" 2>/dev/null || true)"
+rm -f "$HYGIENE_OUT_FILE"
 if [[ "${HYGIENE_RC:-0}" -eq 0 ]]; then
     echo -e "${GREEN}PASS${NC} (无 /tmp、裸 mktemp、which、python3 或本机路径违规)"
 else
@@ -159,7 +169,8 @@ fi
 
 # 5. Git 跟踪面边界与凭据/绝对路径泄露守卫（§4.3 / R3 / R9 / R20）
 echo -n "    [5/5] 核验 Git 跟踪面边界与敏感凭据防泄露... "
-BOUNDARY_OUT="$(node - "$PROJECT_ROOT" <<'NODE'
+BOUNDARY_OUT_FILE="$GATE_TMP_DIR/gate-lint-boundary.$$.out"
+if node - "$PROJECT_ROOT" >"$BOUNDARY_OUT_FILE" 2>&1 <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
@@ -170,13 +181,14 @@ let tracked = [];
 try {
   tracked = execFileSync('git', ['-C', root, 'ls-files'], { encoding: 'utf8' })
     .split('\n').map((s) => s.trim()).filter(Boolean);
-} catch (_) {
-  process.exit(0);
+} catch (err) {
+  process.stderr.write('git ls-files 失败，无法核验 Git 跟踪面（Fail-Closed）: ' + err.message + '\n');
+  process.exit(1);
 }
 
 for (const rel of tracked) {
   if (/^(\.loopx\/|\.codex\/|qa-acceptance\/)/.test(rel)) {
-    issues.push(`禁止跟踪运行时/私有目录文件: ${rel}`);
+    issues.push('禁止跟踪运行时/私有目录文件: ' + rel);
     continue;
   }
   if (rel === 'scripts/git-hooks/pre-commit' || rel === 'scripts/gate-lint.sh') continue;
@@ -187,15 +199,16 @@ for (const rel of tracked) {
   const lines = text.split('\n');
   lines.forEach((line, idx) => {
     if (/loopx-allow:\s*\S+/.test(line)) return;
+    const where = rel + ':' + (idx + 1);
     if (/\b(?:oc|ou)_[0-9a-f]{32}\b|\bcli_[0-9a-f]{16}\b/.test(line)) {
-      issues.push(`${rel}:${idx + 1} 检测到疑似飞书真实标识 (oc_/ou_/cli_)`);
+      issues.push(where + ' 检测到疑似飞书真实标识 (oc_/ou_/cli_)');
     }
     if (/"(?:base_token|app_secret)"\s*:\s*"(?![*<])[A-Za-z0-9_-]{12,}"/.test(line)) {
-      issues.push(`${rel}:${idx + 1} 检测到疑似真实 base_token/app_secret 凭据`);
+      issues.push(where + ' 检测到疑似真实 base_token/app_secret 凭据');
     }
     if (!rel.startsWith('tests/') && !rel.startsWith('skills/systematic-debugging/')
       && /\/(?:Users|home)\/[A-Za-z0-9_.-]+\//.test(line)) {
-      issues.push(`${rel}:${idx + 1} 检测到宿主机本机绝对路径`);
+      issues.push(where + ' 检测到宿主机本机绝对路径');
     }
   });
 }
@@ -205,7 +218,13 @@ if (issues.length) {
   process.exit(1);
 }
 NODE
-)" || BOUNDARY_RC=$?
+then
+    BOUNDARY_RC=0
+else
+    BOUNDARY_RC=$?
+fi
+BOUNDARY_OUT="$(cat "$BOUNDARY_OUT_FILE" 2>/dev/null || true)"
+rm -f "$BOUNDARY_OUT_FILE"
 if [[ "${BOUNDARY_RC:-0}" -eq 0 ]]; then
     echo -e "${GREEN}PASS${NC} (无受跟踪运行态目录或凭据/路径泄露)"
 else
