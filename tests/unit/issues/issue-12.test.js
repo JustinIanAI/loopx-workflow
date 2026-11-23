@@ -11,6 +11,7 @@ const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
 const MOCK_BIN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-mock-bin-issue-12-'));
 process.on('exit', () => { try { fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true }); } catch (_) {} });
 const CALLS_LOG = path.join(MOCK_BIN_DIR, 'calls.log');
+const REGISTRY_FILE = path.join(MOCK_BIN_DIR, 'registry.json');
 
 function expectedKey(goalId, todoId, owner) {
   const hex = crypto.createHash('sha256').update(`${goalId}\n${todoId}\n${owner}`, 'utf8').digest('hex');
@@ -26,6 +27,7 @@ function generationKey(goalId, todoId, owner, epoch, version) {
 
 function setupMocks() {
   fs.mkdirSync(MOCK_BIN_DIR, { recursive: true });
+  fs.writeFileSync(REGISTRY_FILE, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
   fs.writeFileSync(path.join(MOCK_BIN_DIR, 'loopx'), `#!/usr/bin/env bash
 echo "$*" >> ${CALLS_LOG}
 args="$*"
@@ -139,6 +141,7 @@ function runFlow(args, extraEnv = {}) {
       ...process.env,
       PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
       LOOPX_AGENT_ID: '',
+      LOOPX_REGISTRY: REGISTRY_FILE,
       ...extraEnv
     }
   });

@@ -311,7 +311,7 @@ doctor_authorization_config() {
     f="$(auth_config_path)"
     echo -e "\n${BLUE}==> [3/3] Gate 授权配置与交付基础设施检查 (ADR-0009 / ADR-0012)...${NC}"
     if [[ ! -f "$f" ]]; then
-        echo -e "${YELLOW}[WARN] 未找到 $f：authorization_mode 尚未确认，Gate1/Gate2 授权路径不可用。${NC}"
+        echo -e "${YELLOW}[WARN] 未找到 ${f}：authorization_mode 尚未确认，Gate1/Gate2 授权路径不可用。${NC}"
         echo -e "       🛠️ 修复指令: loopx-flow init（需 TTY 确认 authorization_mode）"
         return 0
     fi
@@ -1531,7 +1531,7 @@ ${marker}"
             if [[ -n "$existing_comment_id" ]]; then
                 echo -e "${YELLOW}[THROTTLE-UPSERT] 复用既有 respond comment id=${existing_comment_id}（PATCH 更新，不再新增）${NC}"
                 if printf '%s' "$posted_body" | gh api -X PATCH "repos/${repo}/issues/comments/${existing_comment_id}" -F body=@- >/dev/null 2>&1; then
-                    echo -e "${GREEN}[✓] 已更新既有 respond 汇报（comment ${existing_comment_id}，head $short_sha）！${NC}"
+                    echo -e "${GREEN}[✓] 已更新既有 respond 汇报（comment ${existing_comment_id}，head ${short_sha}）！${NC}"
                     exit 0
                 fi
                 echo -e "${YELLOW}[i] PATCH 失败，回退 POST 新建${NC}"
@@ -1542,7 +1542,7 @@ ${marker}"
         echo -e "${RED}[-] [FAIL-CLOSED] gh pr comment 失败，回复未发布。${NC}" >&2
         exit 1
     fi
-    echo -e "${GREEN}[✓] 已发布 LoopX 原生五段式更新汇报至 PR #${pr_id}（head $short_sha）！${NC}"
+    echo -e "${GREEN}[✓] 已发布 LoopX 原生五段式更新汇报至 PR #${pr_id}（head ${short_sha}）！${NC}"
 }
 
 cmd_pr() {
@@ -1710,7 +1710,7 @@ HELPTXT
             echo -e "${GREEN}[✓] PR #$pr_id 已转为 Ready（不代表合并授权；Gate2 仍须 Mode A/B 授权）。${NC}"
             ;;
         *)
-            echo -e "${RED}[-] 未知操作: $sub。可用操作: create, preview, update, ready${NC}" >&2
+            echo -e "${RED}[-] 未知操作: ${sub}。可用操作: create, preview, update, ready${NC}" >&2
             exit 1
             ;;
     esac
@@ -2424,7 +2424,7 @@ process.stdout.write(String(decision.rationale ?? ""));
             echo -e "  - 裁决为 ${BOLD}仅分诊处理${NC}: 记录分诊结论并更新 Issue 标签，等待更多信息后再评估。"
             ;;
         *)
-            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 输出未知路由: $route，请人工核查。${NC}" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 输出未知路由: ${route}，请人工核查。${NC}" >&2
             exit 1
             ;;
     esac
@@ -3054,11 +3054,11 @@ NODE
 )" || exit 1
         echo -e "${BLUE}==> [租约流转] 正在完成 Todo 并释放租约: $todo_id @ $goal_id (owner=$agent_id)...${NC}"
         if ! run_loopx todo --goal-id "$goal_id" --todo-id "$todo_id" --status done; then
-            echo -e "${RED}[-] [FAIL-CLOSED] Todo 完成回写失败: $todo_id，租约保留以便重试。${NC}" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] Todo 完成回写失败: ${todo_id}，租约保留以便重试。${NC}" >&2
             exit 1
         fi
         if ! run_loopx task-lease release --goal-id "$goal_id" --todo-id "$todo_id" --owner "$agent_id" --idempotency-key "$identity_key" --expected-version "$lease_version"; then
-            echo -e "${RED}[-] [FAIL-CLOSED] 租约释放失败: $todo_id，请通过 task-lease inspect 人工核查。${NC}" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] 租约释放失败: ${todo_id}，请通过 task-lease inspect 人工核查。${NC}" >&2
             exit 1
         fi
         echo -e "${GREEN}[✓] Todo 已完成且排他租约已释放 (RELEASED): $todo_id${NC}"
