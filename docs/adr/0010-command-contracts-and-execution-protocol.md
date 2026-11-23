@@ -80,6 +80,8 @@ DB6 已决议：保留场景命令门面，但每条命令必须是「研发最�
 
 ## 增补决策：`REQ-LEASE-1` Todo 租约身份解析、代际幂等键与 `todo done` 释放契约（原 Issue #12 / P0-B 收敛）
 
+> **状态：`Superseded by ADR-0015`** — 本增补节中的手工 `task-lease inspect/acquire/release` 与 SHA-256 幂等键拼接方案已被 [ADR-0015（受管 Todo 执行委托与三层能力探针）](0015-todo-managed-execution-and-capability-probe.md) 取代（当前状态：`Proposed`，待人类 Maintainer 审批签核置为 `Accepted` 后由下游 `W3` `#41` 实施退役）。下文保留作为原 Issue #12 / P0-B 历史决策上下文；已注册 Agent 身份分页解析规则在 [ADR-0015](0015-todo-managed-execution-and-capability-probe.md) 中延续保留。
+
 1. **`todo claim` 已注册身份解析（`resolve_claim_owner`）**：
    - 申领前必须完整分页读取 `loopx agent-directory --format json`（跟随 `next_cursor` 直到无下一页；检测重复/停滞游标与 `registered_agent_count` 不一致并立即 fail-closed）。
    - 仅将 `registered: true` 的 `agent_id` 视为合法 owner；设置 `LOOPX_AGENT_ID` 时必须折叠匹配到已注册身份并按注册表拼写传递，未设置时仅当恰好存在 1 个已注册身份才自动选用；缺失或歧义时直接阻断并打印可执行 `loopx register-agent ... --execute` 修复指令。
