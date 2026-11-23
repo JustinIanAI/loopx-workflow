@@ -11,6 +11,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 
@@ -147,5 +148,78 @@ describe('真实项目 registry 完整性（INV-ENV-6：测试不得污染控制
     assert.deepStrictEqual(bad, [],
       `registry 存在缺 state_file 的 orphan goal（会阻塞 loopx migrate-local-state；` +
       `测试必须用 LOOPX_REGISTRY 隔离）：${bad.join(', ')}`);
+  });
+});
+
+describe('.gitignore 凭据 / AI 工具目录 / 测试产出收口（Issue #21）', () => {
+  const ignore = fs.readFileSync(path.join(PROJECT_ROOT, '.gitignore'), 'utf8');
+
+  test('凭据忽略规则完整，且示例模板保留白名单', () => {
+    assert.match(ignore, /^\.env$/m, '必须忽略 .env');
+    assert.match(ignore, /^\.env\.\*$/m, '必须忽略 .env.*');
+    assert.match(ignore, /^!\.env\.example$/m, '必须白名单 .env.example');
+    assert.match(ignore, /^!\.env\.template$/m, '必须白名单 .env.template');
+    for (const probe of ['.env', '.env.local', '.env.production']) {
+      assert.strictEqual(spawnSync('git', ['check-ignore', '-q', probe], { cwd: PROJECT_ROOT }).status, 0, `${probe} 应被忽略`);
+    }
+    for (const probe of ['.env.example', '.env.template']) {
+      assert.notStrictEqual(spawnSync('git', ['check-ignore', '-q', probe], { cwd: PROJECT_ROOT }).status, 0, `${probe} 必须可入库`);
+    }
+  });
+
+  test('AI 工具目录与测试产出目录全部忽略', () => {
+    for (const [rule, probe] of [
+      ['.claude/', '.claude/settings.json'],
+      ['.cursor/', '.cursor/rules.md'],
+      ['orbital/', 'orbital/skills/x.md'],
+      ['test-results/', 'test-results/result.xml'],
+      ['playwright-report/', 'playwright-report/index.html'],
+    ]) {
+      assert.ok(ignore.split('\n').includes(rule), `缺少忽略规则 ${rule}`);
+      assert.strictEqual(spawnSync('git', ['check-ignore', '-q', probe], { cwd: PROJECT_ROOT }).status, 0, `${probe} 应被忽略`);
+    }
+  });
+
+  test('根目录审计临时工件不新增忽略项（ADR-0014 统一收敛于 .loopx/tmp）', () => {
+    for (const probe of ['l1-review-evidence.md', 'ocr-audit-report.json']) {
+      assert.notStrictEqual(spawnSync('git', ['check-ignore', '-q', probe], { cwd: PROJECT_ROOT }).status, 0, `${probe} 不应被根目录规则忽略`);
+    }
+  });
+
+  test('动态实验：新增敏感/工具/测试产物后 git status 无未跟踪泄漏（隔离沙箱）', () => {
+    // 严禁在 PROJECT_ROOT 增删文件：开发者/Agent 本地可能存在真实 .claude/、.cursor/
+    // 与凭据，清理时递归删除会直接销毁宿主配置。改为隔离临时 Git 仓库复刻规则。
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'env-governance-test-'));
+    const run = (args) => spawnSync('git', args, { cwd: sandbox, encoding: 'utf8' });
+    try {
+      fs.copyFileSync(path.join(PROJECT_ROOT, '.gitignore'), path.join(sandbox, '.gitignore'));
+      assert.strictEqual(run(['init', '-q']).status, 0, '沙箱 git init 失败');
+      assert.strictEqual(run(['add', '.gitignore']).status, 0, '沙箱内 .gitignore 应可暂存');
+
+      for (const [rel, body] of [
+        ['.env', 'TOKEN=redacted\n'],
+        ['.env.local', 'TOKEN=redacted\n'],
+        ['.claude/settings.json', '{}\n'],
+        ['.cursor/rules.md', '# rules\n'],
+        ['test-results/probe.xml', '<testsuite/>\n'],
+        ['playwright-report/index.html', '<html></html>\n'],
+      ]) {
+        const abs = path.join(sandbox, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, body);
+      }
+
+      const res = run(['status', '--porcelain', '--untracked-files=all']);
+      assert.strictEqual(res.status, 0, res.stderr);
+      const leaked = res.stdout.split('\n').filter((line) => line.startsWith('??'));
+      assert.deepStrictEqual(leaked, [], `忽略规则泄漏未跟踪文件:\n${leaked.join('\n')}`);
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test('存量 ACTIVE_STATE.md 已移出 Git 跟踪面（ADR-0008 项 1）', () => {
+    const tracked = git(['ls-files']).split('\n').filter((f) => /(^|\/)ACTIVE_STATE\.md$/.test(f));
+    assert.deepStrictEqual(tracked, [], `运行态 ACTIVE_STATE.md 不得被跟踪: ${tracked.join(', ')}`);
   });
 });

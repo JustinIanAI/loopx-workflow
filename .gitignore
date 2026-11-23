@@ -42,3 +42,18 @@ specs/features/cq-isolated-*/
 # Multica runtime-injected agent instructions (not product source)
 CODEBUDDY.md
 .codebuddy/
+
+# Credentials (Issue #21)：真实凭据不入库，仅保留示例模板白名单
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Local AI assistant project dirs (Issue #21)
+.claude/
+.cursor/
+orbital/
+
+# Test artifacts prevention (Issue #21)
+test-results/
+playwright-report/
