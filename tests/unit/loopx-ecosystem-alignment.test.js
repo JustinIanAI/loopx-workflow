@@ -87,7 +87,10 @@ test("8. Response Safety & Native Format Reuse: cmd_respond delegates to respond
 
 test("9. Cross-Model CLI Adaptation: runReviewAgent supports claude -p vs codex exec and parseArgs handles --agent-bin", () => {
   const scriptContent = fs.readFileSync(AUTHENTIC_REVIEW_SCRIPT, "utf8");
-  assert.strictEqual(scriptContent.includes("agentBin.includes('claude') ? ['-p'] : ['exec', '-']"), true, "Must support claude -p vs codex exec - via stdin streaming");
+  assert.match(scriptContent, /--sandbox',\s*'read-only'/, 'codex must use the documented read-only sandbox');
+  assert.match(scriptContent, /--tools',\s*'Read'/, 'claude must be limited to the Read tool');
+  assert.match(scriptContent, /--add-dir/, 'claude must receive the sandbox via --add-dir');
+  assert.match(scriptContent, /--permission-mode',\s*'dontAsk'/);
   assert.strictEqual(scriptContent.includes("o.agentBin = argv[++i]"), true, "Must parse --agent-bin argument");
   const flowCode = fs.readFileSync(LOOPX_FLOW, "utf8");
   assert.match(flowCode, /--agent-bin/, "cmd_review must forward --agent-bin flag");

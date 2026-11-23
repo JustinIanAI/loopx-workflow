@@ -69,4 +69,10 @@
 
 - 阶段 1/2 提示词、packet、`result.json` 与 `check-result.json` 统一落盘在 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 独立运行目录中，不再使用按 PR 号固定的裸文件名（消除多进程覆写）。
 - 遵循“成功即清理、失败即留证”原则：正常退出（exit 0）自动清理本次运行目录；失败退出或显式设置 `REVIEW_KEEP_PROMPT=1` / `LOOPX_KEEP_TMP=1` 时保留运行目录并打印目录路径。
+
+## 2026-11-23 修订（沙箱文件路径只读传参与截断 Fail-Closed 守卫）
+
+- 大上下文工件（`packet.json`、`pr.diff`、`evidence-output.md`、`remote-checks.txt`，阶段 2 另加 `stage1-review.md`）落在 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/`。`stdin` 只带紧凑引导、原生 `review_template` / `evidenceContract` 与路径及字节/行数清单。完整 diff 与证据正文不再内联，也不再做静默截断。
+- 原「禁止读文件」改为：审查 Agent 只可只读读取本次清单中的工件，禁止改工作区、禁止写工具与破坏性命令。本机 `codex exec --help` 中 `--add-dir` 是可写附加目录，因此 codex 使用 `--sandbox read-only`、`--skip-git-repo-check`、`--ephemeral` 与 `-C <runDir>`。`claude -p` 使用 `--tools Read`、`--permission-mode dontAsk` 与 `--add-dir <runDir>`。
+- 内联 stdin 有字节上限（`REVIEW_STDIN_BYTE_LIMIT`，默认 32768）：超限直接拒绝调用，而不是把 diff 截短后继续。输出命中宿主标记 `[... N bytes omitted ...]` 时打印 `[NOT_VERIFIED]`、非 0 退出、保留 `runDir`，并且不调用 `gh` 发布。未带该方括号字节标记的审查正文不拦截。
 - PR 评论发布、comment upsert（`PATCH` 拆分为 `['-X', 'PATCH', endpoint, '-F', 'body=@-']`）与 `gh pr edit` 全链路改用 stdin 传递，不再产生临时正文文件。

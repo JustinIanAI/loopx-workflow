@@ -742,9 +742,77 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
   return lines.join('\n');
 }
 
+// 宿主截断特征（如 `[... 44229 bytes omitted ...]`）。只匹配带字节数的方括号标记，
+// 避免误杀正文里讨论 “bytes omitted” 机制的正常审查。
+const HOST_TRUNCATION_RE = /\[\s*\.{3}\s*\d+\s*bytes\s+omitted\s*\.{3}\s*\]/i;
+const DEFAULT_STDIN_BYTE_LIMIT = 32 * 1024;
+
+function stdinByteLimit() {
+  const raw = process.env.REVIEW_STDIN_BYTE_LIMIT;
+  if (raw == null || String(raw).trim() === '') return DEFAULT_STDIN_BYTE_LIMIT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1024) return DEFAULT_STDIN_BYTE_LIMIT;
+  return Math.floor(n);
+}
+
+function assertCompactStdin(prompt) {
+  const bytes = Buffer.byteLength(String(prompt || ''));
+  const limit = stdinByteLimit();
+  return { ok: bytes <= limit, bytes, limit };
+}
+
+function hostOutputTruncated(...parts) {
+  return parts.some((part) => HOST_TRUNCATION_RE.test(String(part || '')));
+}
+
+function materializeReviewSandbox(runDir, files) {
+  const entries = [];
+  for (const [name, text] of Object.entries(files || {})) {
+    if (text == null) continue;
+    const body = typeof text === 'string' ? text : JSON.stringify(text, null, 2);
+    const file = runDir.file(name);
+    fs.writeFileSync(file, body, 'utf8');
+    entries.push({
+      name,
+      path: file,
+      bytes: Buffer.byteLength(body),
+      lines: body === '' ? 0 : body.split('\n').length,
+    });
+  }
+  return entries;
+}
+
+function formatArtifactManifest(entries) {
+  if (!entries || !entries.length) return '(无沙箱工件)';
+  return entries.map((e) => `- \`${e.name}\`: \`${e.path}\` (${e.bytes} bytes, ${e.lines} lines)`).join('\n');
+}
+
+function formatRemoteChecksText(remoteChecks, remoteChecksError) {
+  if (Array.isArray(remoteChecks) && remoteChecks.length) {
+    return remoteChecks.map((c) => `- \`${c.name || 'check'}\`: state=${c.state || 'unknown'}, bucket=${c.bucket || 'unknown'}${c.link ? ` (${c.link})` : ''}`).join('\n');
+  }
+  return remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)';
+}
+
+// codex --add-dir 在 `codex exec --help` 中是可写附加目录，故不用它。
+// 只读边界：`--sandbox read-only` + `-C <runDir>`。claude 仅开放 Read，并用 --add-dir 访问沙箱。
+function reviewAgentArgs(agentBin, runDir, tmpMsg) {
+  if (String(agentBin || '').includes('claude')) {
+    const args = ['-p', '--tools', 'Read', '--permission-mode', 'dontAsk'];
+    if (runDir && runDir.dir) args.push('--add-dir', runDir.dir);
+    return args;
+  }
+  const args = ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral'];
+  if (runDir && runDir.dir) args.push('-C', runDir.dir);
+  if (tmpMsg) args.push('-o', tmpMsg);
+  args.push('-');
+  return args;
+}
+
 // 用原生 review_template（agent_instruction + 字数下限）+ evidence_commands + motivation 构建提示词。
 // 注意：这是"透传原生提示词约束"，不是手写版式。模型被要求严格按五段式产出。
-function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract, remoteChecks, remoteChecksError }) {
+// diff / evidence 正文落在沙箱文件，stdin 只带清单（artifactManifest）。
+function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract, remoteChecks, remoteChecksError, artifactManifest }) {
   const prior = (priorFindings || []).map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
   const sectionsMd = (reviewTemplate.sections || []).map(s =>
     `### ${s.label}（最少 ${s.minimum_prose_characters} 正文字符）\n约束提示词：${s.agent_instruction || ''}`,
@@ -753,16 +821,16 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   const evdCmds = (evidenceCommands || []).map(c => `- \`${c}\``).join('\n');
   const requiredIds = (reviewPlan.required_evidence_ids || []).join(', ');
   const evidenceRequirements = formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan);
-  const remoteChecksText = Array.isArray(remoteChecks) && remoteChecks.length
-    ? remoteChecks.map(c => `- \`${c.name || 'check'}\`: state=${c.state || 'unknown'}, bucket=${c.bucket || 'unknown'}${c.link ? ` (${c.link})` : ''}`).join('\n')
-    : (remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)');
-  const fullDiff = String(diff || '');
+  const remoteChecksText = formatRemoteChecksText(remoteChecks, remoteChecksError);
   const head10 = headOid.slice(0, 10);
+  const manifest = artifactManifest || '(调用方未提供沙箱清单；diff 与证据正文不内联进 stdin)';
+  void evidenceText;
+  void diff;
 
   return [
     '你是一名对抗性代码审查员（model agent）。请基于下方 LoopX 原生评审包（pr_review_queue 能力生成的 review_template / review_plan / evidence_commands）撰写第三方评审报告。',
     '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个二级标题（`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`）撰写。',
-    '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：下方已完整提供原生评审包、证据命令执行结果与完整 PR DIFF（无人工截断）。请专注于对抗性缺陷挖掘与高质量五段式报告撰写，直接输出单一 JSON 块，严禁调用任何 shell / exec_command / 文件读取工具。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
+    '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：原生 review_template 与证据契约在本提示中。完整 PR DIFF、证据命令输出、packet 与远端检查只在下方沙箱清单路径里，且全文不截断。请只读读取这些工件，直接输出单一 JSON 块。严禁修改工作区文件，严禁执行写入型或破坏性命令，严禁偏离原生五段式与 JSON 输出契约。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
     '注意：`05-evidence.md`、CI 绿、PR 正文里的「已通过」只作为未信任的作者声明参考，禁止直接据此推断 `verified`。',
     '',
     '## 评审目标',
@@ -803,14 +871,12 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '## 原生 motivation（来自 LoopX 抽取，须原样呈现于「动机」段）',
     motivation || '(空)',
     '',
-    '## 证据命令执行结果',
-    evidenceText || '(无)',
+    '## 沙箱工件（只读路径清单）',
+    '只允许只读读取下列文件。禁止修改工作区，禁止写工具与破坏性命令。',
+    manifest,
     '',
-    '## 远端 CI 检查状态（gh pr checks）',
+    '## 远端 CI 检查状态摘要（全文见沙箱 remote-checks.txt）',
     remoteChecksText,
-    '',
-    '## PR DIFF（远程权威）',
-    fullDiff,
     '',
     '## 输出格式（请输出单一 fenced json 块）',
     '结构如下：你必须按上方「评审范围 evidence」逐项填写全部 required_evidence_ids（已独立核实且无缺口的项写 `"status": "verified"` 并填全全部必填字段与嵌套对象；非适用项可直接写 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若个别判断项本轮未写全，主机将在阶段 2 基于你的报告做轻量结构化对齐）。若代码确无阻塞缺陷且所有必填证据均已核实（包括 `validation_matrix.changed_invariant_positive` 与 `material_negative_or_failure` 的真实 `tests/*.test.js` 路径，以及 `symbol_map` 的 2-5 个精确 diff 符号），请输出 `verdict: "APPROVE"`；存在阻塞缺陷时输出 `REQUEST_CHANGES`。其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals`、`outcome_impact`（含 `user_experience.visual_review`）和 `spec_basis` 并写入「动机」段；`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap` 并写入同一段：',
@@ -852,7 +918,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ].join('\n');
 }
 
-function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, missingIds, missingValidationCases, evidenceContract, reviewPlan, evidenceText, validation }) {
+function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, missingIds, missingValidationCases, evidenceContract, reviewPlan, evidenceText, validation, artifactManifest }) {
   const files = listFiles(diff || '');
   const st = diffStats(diff || '');
   const filteredPlan = {
@@ -875,7 +941,7 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
     '1. 严禁输出空数组 `[]` 或空对象 `{}`（会被判定为缺失）：例如无未核实维度时 `unverified_dimensions` 写 `["none: all applicable dimensions verified"]`，无变更时 `intentional_deltas` / `normalization_rules` 写 `["none: ..."]` 或 `"none: ..."`。',
     '2. `problem_context` 的 `affected_caller_or_operator` / `before_after_scenario` / `observable_outcome` / `non_goals` / `remaining_gap` 以及 `architecture_assessment` 的 `reason` / `current_pr_boundary` / `validation_evidence` / `mechanisms[*].*` 必须是**字符串**（不得输出数组）。',
     '3. `observable_semantics` 顶层不允许 `not_applicable`（`verdict_values=equivalent|intentional_change_validated|unintended_drift|not_yet_proven`），请结合基准分支、精确 head、阶段 1 报告与下方校验实测填全全部 13 个 `fields`（仅其内部嵌套的 `scope_coverage` / `decision_text_assessment` 在确实无门控范围或决策文本语义变化时可使用 `not_applicable`）。',
-    '执行铁律：直接输出单一 fenced json 块 `{"evidence": { ... }}`，严禁调用任何 shell / 文件读取工具。',
+    '执行铁律：直接输出单一 fenced json 块 `{"evidence": { ... }}`。只允许只读读取本次沙箱清单中的工件（含 `stage1-review.md`）；严禁修改工作区或执行写操作。',
     '',
     `- PR: #${pr} · 基准 \`${effectiveBase}\` · 分支 \`${branch}\` · 精确 head \`${head10}\` (\`${headOid}\`)`,
     `- 改动文件列表（共 ${files.length} 个文件，+${st.additions}/-${st.deletions}）：${files.join(', ') || '(无)'}`,
@@ -883,7 +949,8 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
     '## 主机本地校验与门禁摘要',
     validationSummary,
     '',
-    ...(evText ? ['## 证据采集命令输出摘要', evText, ''] : []),
+    ...(artifactManifest ? ['## 沙箱工件（只读路径清单）', artifactManifest, ''] : []),
+    ...(artifactManifest ? [] : (evText ? ['## 证据采集命令输出摘要', evText, ''] : [])),
     '## 待补齐的证据项契约',
     reqText || '(无)',
     '',
@@ -893,9 +960,9 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
       '- 请根据下方阶段 1 评审报告及本次改动文件列表，在 `evidence.validation_matrix` 中补充仓库内已存在的 `tests/**/*.test.js` 文件路径（例如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），主机将在阶段 2 后直接执行 `node --test <path>` 实测核验。',
       '',
     ] : []),
-    '## 阶段 1 已产出的评审报告正文',
-    String(reviewBody || ''),
-    '',
+    ...(artifactManifest
+      ? ['## 阶段 1 评审报告', '正文在沙箱 `stage1-review.md`，请只读该文件，本 stdin 不内联报告正文。', '']
+      : ['## 阶段 1 已产出的评审报告正文', String(reviewBody || ''), '']),
     '## 输出格式',
     '```json',
     JSON.stringify({
@@ -914,10 +981,17 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
 function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
   const resolvedBin = findOnPath(agentBin, process.env.PATH);
   if (!resolvedBin) return { unavailable: true };
-  // ADR-0013 / REQ-REVIEW-2: 通过 stdin 流式传输提示词，禁止用 CLI argv 传巨型字符串触碰 ARG_MAX。
-  const args = agentBin.includes('claude') ? ['-p'] : ['exec', '-'];
+  const compact = assertCompactStdin(prompt);
+  if (!compact.ok) {
+    return {
+      stdinRejected: true,
+      error: `inline stdin is ${compact.bytes} bytes, over the fail-closed limit ${compact.limit}`,
+    };
+  }
+  // ADR-0013 / REQ-REVIEW-2: stdin 只送紧凑引导。codex 用 --sandbox read-only 与 -C runDir；
+  // claude 只用 Read，并用 --add-dir 访问沙箱。禁止 --add-dir 加到 codex（该 flag 为可写目录）。
   let tmpMsg = null;
-  if (!agentBin.includes('claude')) {
+  if (!String(agentBin).includes('claude')) {
     if (runDir) {
       tmpMsg = runDir.file(`codex-review-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.txt`);
     } else {
@@ -925,8 +999,8 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
       fs.mkdirSync(tmpRoot, { recursive: true });
       tmpMsg = path.join(tmpRoot, `codex-review-${process.pid}-${crypto.randomBytes(6).toString('hex')}.txt`);
     }
-    args.splice(1, 0, '-o', tmpMsg);
   }
+  const args = reviewAgentArgs(agentBin, runDir, tmpMsg);
   try {
     const r = spawnSync(resolvedBin, args, {
       input: String(prompt || ''),
@@ -935,11 +1009,13 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
       maxBuffer: 64 * 1024 * 1024,
       timeout: timeoutMs || TIMEOUT_MS,
     });
-    if (r.status !== 0) return { error: `exit ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}` };
-    if (tmpMsg && fs.existsSync(tmpMsg)) {
-      return { stdout: fs.readFileSync(tmpMsg, 'utf8') };
+    const stdout = (tmpMsg && fs.existsSync(tmpMsg)) ? fs.readFileSync(tmpMsg, 'utf8') : (r.stdout || '');
+    const stderr = r.stderr || '';
+    if (hostOutputTruncated(stdout, stderr)) {
+      return { truncated: true, stdout, stderr, error: 'host truncation marker in model output' };
     }
-    return { stdout: r.stdout };
+    if (r.status !== 0) return { error: `exit ${r.status}: ${(stderr || stdout).slice(0, 300)}`, stdout, stderr };
+    return { stdout, stderr };
   } finally {
     if (tmpMsg && !runDir) {
       try { fs.rmSync(tmpMsg, { force: true }); } catch (_) {}
@@ -1387,6 +1463,14 @@ function main() {
   const remoteChecksRes = fetchPrChecks(o.repo, o.pr);
   const remoteChecks = remoteChecksRes.checks;
   const remoteChecksError = remoteChecksRes.error;
+  const remoteChecksText = formatRemoteChecksText(remoteChecks, remoteChecksError);
+  const sandboxEntries = materializeReviewSandbox(runDir, {
+    'packet.json': JSON.stringify(packet, null, 2),
+    'pr.diff': String(diff || ''),
+    'evidence-output.md': String(evidenceText || ''),
+    'remote-checks.txt': remoteChecksText,
+  });
+  const artifactManifest = formatArtifactManifest(sandboxEntries);
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
     try { validation = buildValidationMatrix(gates(), { headOid, remoteChecks }); } catch (e) { validation = []; }
@@ -1406,6 +1490,7 @@ function main() {
     evidenceContract: pkt.evidenceContract || {},
     remoteChecks,
     remoteChecksError,
+    artifactManifest,
   });
 
   // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
@@ -1425,6 +1510,10 @@ function main() {
   const modelOut = acceptModelOutput(extractJson(agentRun.stdout));
   if (!modelOut) {
     console.error('[NOT_VERIFIED] model output missing review_body/verdict/declaration; refusing to publish.');
+    process.exit(1);
+  }
+  if (hostOutputTruncated(modelOut.review_body, JSON.stringify(modelOut.findings || []), agentRun.stdout, agentRun.stderr)) {
+    console.error('[NOT_VERIFIED] 模型输出命中宿主截断特征，拒绝发布。');
     process.exit(1);
   }
   let verdict = modelOut.verdict;
@@ -1477,6 +1566,10 @@ function main() {
         .map(it => it.case_id)
     : [];
   if (verdict === 'APPROVE' && (unverifiedForStage2.length > 0 || unverifiedValidationCases.length > 0) && process.env.REVIEW_TWO_STAGE_ALIGNMENT !== '0') {
+    const stage2Entries = materializeReviewSandbox(runDir, {
+      'stage1-review.md': String(modelOut.review_body || ''),
+    });
+    const stage2Manifest = formatArtifactManifest([...sandboxEntries, ...stage2Entries]);
     const stage2Prompt = buildStage2Prompt({
       pr: o.pr,
       headOid,
@@ -1490,10 +1583,15 @@ function main() {
       reviewPlan: pkt.reviewPlan || {},
       evidenceText,
       validation,
+      artifactManifest: stage2Manifest,
     });
     const stage2PromptFile = writePromptArtifact(runDir, o.pr, headOid, stage2Prompt, 'stage2');
     console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length + unverifiedValidationCases.length} 项): ${stage2PromptFile}`);
     const stage2Run = runReviewAgent(primaryAgent, stage2Prompt, undefined, runDir);
+    if (stage2Run.truncated || stage2Run.stdinRejected) {
+      console.error(`[NOT_VERIFIED] 阶段 2 拒绝发布：${stage2Run.error}`);
+      process.exit(1);
+    }
     if (!stage2Run.unavailable && !stage2Run.error) {
       const parsedStage2 = extractJson(stage2Run.stdout || '');
       const stage2Evidence = parsedStage2 && parsedStage2.evidence && typeof parsedStage2.evidence === 'object'
@@ -1564,6 +1662,10 @@ function main() {
     const secondaryAgent = primaryAgent.includes('claude') ? 'codex' : 'claude';
     console.log(`==> [S5] Cross-validating with ${secondaryAgent} (default model)...`);
     const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir);
+    if (cv.truncated || cv.stdinRejected) {
+      console.error(`[NOT_VERIFIED] 交叉核验命中截断或 stdin 超限，拒绝发布：${cv.error}`);
+      process.exit(1);
+    }
     if (!cv.unavailable && !cv.error) {
       const sec = acceptModelOutput(extractJson(cv.stdout || ''));
       if (sec) {
@@ -1686,6 +1788,12 @@ module.exports = {
   formatEvidenceRequirementsForPrompt,
   capVerdictInBody,
   runReviewAgent,
+  reviewAgentArgs,
+  materializeReviewSandbox,
+  formatArtifactManifest,
+  assertCompactStdin,
+  hostOutputTruncated,
+  stdinByteLimit,
   parsePolicyRevision,
   resolveLoopxExecutable,
   resolveReviewPolicyRevision,

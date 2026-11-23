@@ -259,7 +259,7 @@ squash 不可回滚，merge 只做前向补偿；补偿以 PR/Goal/目录的可�
 5. 只接受 `fix_pr`、`comment_only`、`triage_only`。空路由或其他值退出。
 6. `fix_pr` 走与 Feature 相同的 Goal/Todo/Evidence/Gate2：先 red test，再修复、`check`、PR、Review、Gate2、`merge`；Fast Path 不得绕过 Gate2；`scripts/fast-fix-push.sh` 不得直推 `main`（改为分支+PR 或显式受控操作）。
 
-AGENTS 管线 B 的规程必须在 `REQ-ISSUE-PIPELINE-1` 内执行，不能把 Fast-Path 当作绕过 Gate2 的例外。
+AGENTS 管线 B 的规程必须在 `REQ-ISSUE-PIPELINE-1` 内执行，不能把 Fast-Path 当作绕过 Gate2 的例外。`fix_pr` 进入 Review 时，审查输入遵循 §8：大 Diff 落在运行沙箱并以只读路径传给审查者，stdin 超限或宿主截断标记一律 Fail-Closed，不在本管线内联大 Diff。
 
 ## 8. 审查
 
@@ -273,7 +273,7 @@ AGENTS 管线 B 的规程必须在 `REQ-ISSUE-PIPELINE-1` 内执行，不能把 
 - 复审：上轮 findings 必须逐条判定 `fixed` / `reproducible` / `obsolete`，并在 `check-result` **之前**进入 `review_body`；`reproducible` 未清时 verdict 上限 `REQUEST_CHANGES`。
 - 审查者 CLI 缺失时不得隐式改用另一个 CLI；只有显式 `--agent-bin` / `--cross-validate` 才换审查者。Reviewer 行与证据必须记录实际使用的模型。
 - **输入契约与两阶段解耦 (ADR-0013 / REQ-REVIEW-2)**：
-  - **输入通道**：严禁通过 CLI argv 命令行参数传递全量内存 Prompt 字符串（防止触碰 macOS/Linux 的 1MB `ARG_MAX` 崩溃）；彻底删除 240,000 字符硬编码截断。审查上下文与提示词统一写入项目沙箱 `.loopx/tmp/review-prompt-<pr>-<head>.md`，通过 stdin 管道输送给审查 CLI（`codex exec -` / `claude -p`）。
+  - **输入通道**：严禁通过 CLI argv 传递全量 Prompt（避免 `ARG_MAX`）。240,000 字符静默截断已删除。`packet.json`、`pr.diff`、`evidence-output.md`、`remote-checks.txt` 与阶段 2 的 `stage1-review.md` 写入 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/`。`stdin` 只含紧凑引导、原生模板/契约与路径及字节/行数清单。`codex exec` 使用 `--sandbox read-only -C <runDir>`（`--add-dir` 在 codex 中表示可写，禁止使用）。`claude -p` 使用 `--tools Read --permission-mode dontAsk --add-dir <runDir>`。stdin 超过 `REVIEW_STDIN_BYTE_LIMIT`（默认 32768）或输出含 `[... N bytes omitted ...]` 时 `[NOT_VERIFIED]`、非 0 退出、保留沙箱且不发布。
   - **两阶段解耦**：阶段 1 由模型产出对抗性缺陷与五段式报告正文；阶段 2 由主机静态装配四门禁、代码行分类、代码体量与符号行号等事实性证据，禁止在单轮 Prompt 中强迫模型手写庞大深层嵌套 JSON。
   - **非适用字段标准化免除**：`default_off_isolation` 等不适用字段提供标准化的 `not_applicable` 声明规范，本地校验与 LoopX 结果检查视同合规放行，杜绝伪造数据与封顶死锁。
   - **临时文件治理**：审查产生的全部中间 Prompt、Packet 与 Result 统一存放于 `.loopx/tmp/`，严禁写入系统根 `/tmp/`。

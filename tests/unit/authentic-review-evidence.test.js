@@ -16,6 +16,9 @@ const {
   buildStage2Prompt,
   finalizeReviewBody,
   capVerdictInBody,
+  materializeReviewSandbox,
+  formatArtifactManifest,
+  stdinByteLimit,
 } = require('../../skills/code-review/scripts/authentic-review.js');
 
 const DIFF = [
@@ -429,7 +432,7 @@ test('scanDiff finds high-signal additions only', () => {
   assert.strictEqual(findings.filter(f => f.rule === 'tracked-todo').length, 1);
 });
 
-test('ADR-0013：buildNativePrompt 完整透传超 240KB Diff（无人工截断）并支持 not_applicable 与两阶段提示词', () => {
+test('ADR-0013：超 240KB Diff 完整落盘沙箱且 stdin 不内联，并支持 not_applicable 与两阶段提示词', () => {
   const hugeProd = [
     'diff --git a/bin/huge-prod.js b/bin/huge-prod.js',
     '--- a/bin/huge-prod.js',
@@ -447,6 +450,14 @@ test('ADR-0013：buildNativePrompt 完整透传超 240KB Diff（无人工截断�
   ].join('\n');
   const full = `${hugeProd}\n${tailTest}`;
   assert.ok(full.length > 240000);
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'review-sandbox-'));
+  const runDir = { dir: sandbox, file: (name) => path.join(sandbox, name) };
+  const entries = materializeReviewSandbox(runDir, {
+    'pr.diff': full,
+    'evidence-output.md': '',
+    'packet.json': '{}',
+    'remote-checks.txt': '',
+  });
   const prompt = buildNativePrompt({
     pr: 28,
     headOid: 'a'.repeat(40),
@@ -459,9 +470,12 @@ test('ADR-0013：buildNativePrompt 完整透传超 240KB Diff（无人工截断�
     diff: full,
     priorFindings: [],
     evidenceContract: CONTRACT,
+    artifactManifest: formatArtifactManifest(entries),
   });
-  assert.ok(prompt.includes('tail invariant preserved'), 'full diff including tail tests must not be truncated');
-  assert.doesNotMatch(prompt, /\[TRUNCATED\]|FILE_DIFF_COMPACTED/);
+  assert.ok(Buffer.byteLength(prompt) <= stdinByteLimit(), 'stdin must stay within the compact limit');
+  assert.doesNotMatch(prompt, /padding_payload_|tail invariant preserved/);
+  assert.match(fs.readFileSync(path.join(sandbox, 'pr.diff'), 'utf8'), /tail invariant preserved/);
+  fs.rmSync(sandbox, { recursive: true, force: true });
 
   // not_applicable normalization for non-applicable dimensions
   const naContract = {
