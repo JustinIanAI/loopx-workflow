@@ -1659,7 +1659,7 @@ HELPTXT
             local pr_url
             local -a draft_args=()
             [[ "$draft" == "true" ]] && draft_args=(--draft)
-            if pr_url="$(printf '%s' "$pr_body" | gh pr create --title "$title" --base "$base" --body-file - "${draft_args[@]}" "${passthru_args[@]}")"; then
+            if pr_url="$(printf '%s' "$pr_body" | gh pr create --title "$title" --base "$base" --body-file - ${draft_args[@]+"${draft_args[@]}"} ${passthru_args[@]+"${passthru_args[@]}"})"; then
                 echo -e "${GREEN}[✓] PR 创建成功: ${pr_url}${NC}"
             else
                 echo -e "${RED}[-] PR 创建失败。${NC}" >&2

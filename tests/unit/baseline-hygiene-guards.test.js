@@ -136,7 +136,8 @@ describe('loopx-flow 现码止血', () => {
   }
 
   test('readiness_json_field 容忍非 JSON 前置噪声（含伪大括号）', () => {
-    const runner = path.join(os.tmpdir(), `readiness-probe-${process.pid}.sh`);
+    const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'readiness-probe-'));
+    const runner = path.join(probeDir, 'probe.sh');
     fs.writeFileSync(runner, `${extractFunction('readiness_json_field')}\nreadiness_json_field "$1"\n`);
     try {
       const noisy = '[WARN] 前置 {not-json} 噪声 {"ready":true,"blocking_reasons":[]}';
@@ -148,7 +149,7 @@ describe('loopx-flow 现码止血', () => {
       assert.strictEqual(bad.status, 1, '无 JSON 时必须解析失败');
       assert.match(bad.stderr, /readiness JSON 解析失败/);
     } finally {
-      fs.rmSync(runner, { force: true });
+      fs.rmSync(probeDir, { recursive: true, force: true });
     }
   });
 
@@ -158,19 +159,103 @@ describe('loopx-flow 现码止血', () => {
     assert.strictEqual(hits.length, 2, 'Mode A/B 两处 readiness 捕获必须保留 || true');
   });
 
-  test('cmd_pr create 透传 --base 与 passthru 参数', () => {
+  test('cmd_pr create 透传 --base 与 passthru 参数（源码断言）', () => {
     const script = fs.readFileSync(LOOPX_FLOW, 'utf8');
     const start = script.indexOf('cmd_pr() {');
     const end = script.indexOf('\ncmd_', start + 5);
     const body = script.slice(start, end);
     assert.match(body, /gh pr create --title "\$title" --base "\$base"/, '必须显式传递 --base');
-    assert.match(body, /"\$\{passthru_args\[@\]\}"/, '必须透传剩余参数');
     assert.strictEqual(body.includes('--body-file - "${draft_args[@]}" "$@"'), false, '不得丢弃解析后的剩余参数');
+  });
+
+  test('cmd_pr create 在 bash 3.2 + set -u 下空数组展开不崩溃，且 passthru 正确透传（可执行实测）', () => {
+    const script = fs.readFileSync(LOOPX_FLOW, 'utf8');
+    const line = script.split('\n').find((l) => l.includes('gh pr create --title "$title"'));
+    assert.ok(line, '应能定位 cmd_pr create 的 gh 调用行');
+    const open = line.indexOf('pr_url="$(');
+    const close = line.lastIndexOf(')"');
+    assert.ok(open >= 0 && close > open, '应能切出 pr_url 赋值中的 gh 调用');
+    // 取生产源码中的真实命令行，把 gh 换成记录参数的 stub。
+    const command = line.slice(open + 'pr_url="$('.length, close).replace(/\bgh\b/, '"$STUB_GH"');
+
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'pr-create-probe-'));
+    const stub = path.join(sandbox, 'gh');
+    const argvFile = path.join(sandbox, 'argv.txt');
+    fs.writeFileSync(stub, `#!/bin/bash\nprintf '%s\\n' "$@" > "$ARGV_OUT"\necho "https://example.invalid/pull/1"\n`, { mode: 0o755 });
+    const harness = path.join(sandbox, 'harness.sh');
+    fs.writeFileSync(harness, [
+      'set -euo pipefail',
+      'STUB_GH="$1"; export ARGV_OUT="$2"; shift 2',
+      'title="feat(x): y"; base="main"; pr_body="BODY"',
+      'draft_args=(); passthru_args=()',
+      'if [ "${1:-}" = "populated" ]; then draft_args=(--draft); passthru_args=(--label keep --assignee me); fi',
+      `if pr_url="$(${command})"; then echo "URL:$pr_url"; else echo "FAILED"; exit 1; fi`,
+    ].join('\n') + '\n');
+
+    try {
+      const empty = spawnSync('bash', [harness, stub, argvFile], { encoding: 'utf8' });
+      assert.strictEqual(empty.status, 0, `空数组展开必须成功（bash 3.2 set -u）:\n${empty.stdout}${empty.stderr}`);
+      const emptyArgs = fs.readFileSync(argvFile, 'utf8').trim().split('\n');
+      assert.deepStrictEqual(emptyArgs, ['pr', 'create', '--title', 'feat(x): y', '--base', 'main', '--body-file', '-']);
+
+      const populated = spawnSync('bash', [harness, stub, argvFile, 'populated'], { encoding: 'utf8' });
+      assert.strictEqual(populated.status, 0, `带参展开必须成功:\n${populated.stdout}${populated.stderr}`);
+      const args = fs.readFileSync(argvFile, 'utf8').trim().split('\n');
+      assert.deepStrictEqual(args, [
+        'pr', 'create', '--title', 'feat(x): y', '--base', 'main', '--body-file', '-',
+        '--draft', '--label', 'keep', '--assignee', 'me',
+      ]);
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 
   test('register-agent 不再无条件吞错，仅容忍幂等冲突', () => {
     const script = fs.readFileSync(LOOPX_FLOW, 'utf8');
     assert.strictEqual(/register-agent[^\n]*--execute[^\n]*\|\| true/.test(script), false, 'register-agent 不得无条件 || true');
     assert.match(script, /register-agent 失败（非幂等冲突/);
+  });
+
+  test('register-agent 非幂等失败会告警、幂等冲突保持静默（可执行实测）', () => {
+    const script = fs.readFileSync(LOOPX_FLOW, 'utf8');
+    const start = script.indexOf('    local register_out');
+    assert.ok(start >= 0, '应能定位 register-agent 失败处理块');
+    const end = script.indexOf('\n    local evidence', start);
+    assert.ok(end > start, 'register-agent 处理块应完整');
+    const block = script.slice(start, end);
+
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'register-agent-probe-'));
+    const stub = path.join(sandbox, 'loopx');
+    const harness = path.join(sandbox, 'harness.sh');
+    fs.writeFileSync(stub, '#!/bin/bash\necho "$STUB_MSG" >&2\nexit 1\n', { mode: 0o755 });
+    fs.writeFileSync(harness, [
+      'set -euo pipefail',
+      'YELLOW=""; NC=""',
+      'run_loopx() { "$STUB_LOOPX" "$@"; }',
+      'goal_id="g"; agent="a"',
+      'probe() {',
+      block,
+      '}',
+      'probe',
+      'echo "REACHED_END"',
+    ].join('\n') + '\n');
+
+    const run = (msg) => spawnSync('bash', [harness], {
+      encoding: 'utf8',
+      env: { ...process.env, STUB_LOOPX: stub, STUB_MSG: msg },
+    });
+    try {
+      const nonIdem = run('network timeout');
+      assert.strictEqual(nonIdem.status, 0, 'register-agent 失败不得中断审批');
+      assert.match(nonIdem.stderr, /register-agent 失败（非幂等冲突/, '非幂等失败必须告警');
+      assert.match(nonIdem.stdout, /REACHED_END/, '必须继续后续审批流程');
+
+      const idem = run('agent already registered');
+      assert.strictEqual(idem.status, 0);
+      assert.doesNotMatch(idem.stderr, /register-agent 失败/, '幂等冲突不应告警');
+      assert.match(idem.stdout, /REACHED_END/);
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 });

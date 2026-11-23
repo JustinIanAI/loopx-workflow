@@ -11,6 +11,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 
@@ -185,29 +186,35 @@ describe('.gitignore 凭据 / AI 工具目录 / 测试产出收口（Issue #21�
     }
   });
 
-  test('动态实验：新增敏感/工具/测试产物后 git status 无未跟踪泄漏', () => {
-    const created = [];
-    const mk = (rel, body) => {
-      const abs = path.join(PROJECT_ROOT, rel);
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, body);
-      created.push(abs);
-    };
+  test('动态实验：新增敏感/工具/测试产物后 git status 无未跟踪泄漏（隔离沙箱）', () => {
+    // 严禁在 PROJECT_ROOT 增删文件：开发者/Agent 本地可能存在真实 .claude/、.cursor/
+    // 与凭据，清理时递归删除会直接销毁宿主配置。改为隔离临时 Git 仓库复刻规则。
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'env-governance-test-'));
+    const run = (args) => spawnSync('git', args, { cwd: sandbox, encoding: 'utf8' });
     try {
-      mk('.env', 'TOKEN=redacted\n');
-      mk('.claude/settings.json', '{}\n');
-      mk('.cursor/rules.md', '# rules\n');
-      mk('test-results/probe.xml', '<testsuite/>\n');
-      mk('playwright-report/index.html', '<html></html>\n');
-      const res = spawnSync('git', ['status', '--porcelain', '--untracked-files=all', '--',
-        '.env', '.claude', '.cursor', 'test-results', 'playwright-report'], { cwd: PROJECT_ROOT, encoding: 'utf8' });
-      assert.strictEqual(res.status, 0, res.stderr);
-      assert.strictEqual(res.stdout.trim(), '', `忽略规则泄漏未跟踪文件:\n${res.stdout}`);
-    } finally {
-      for (const abs of created.reverse()) fs.rmSync(abs, { force: true });
-      for (const dir of ['.claude', '.cursor', 'test-results', 'playwright-report']) {
-        fs.rmSync(path.join(PROJECT_ROOT, dir), { recursive: true, force: true });
+      fs.copyFileSync(path.join(PROJECT_ROOT, '.gitignore'), path.join(sandbox, '.gitignore'));
+      assert.strictEqual(run(['init', '-q']).status, 0, '沙箱 git init 失败');
+      assert.strictEqual(run(['add', '.gitignore']).status, 0, '沙箱内 .gitignore 应可暂存');
+
+      for (const [rel, body] of [
+        ['.env', 'TOKEN=redacted\n'],
+        ['.env.local', 'TOKEN=redacted\n'],
+        ['.claude/settings.json', '{}\n'],
+        ['.cursor/rules.md', '# rules\n'],
+        ['test-results/probe.xml', '<testsuite/>\n'],
+        ['playwright-report/index.html', '<html></html>\n'],
+      ]) {
+        const abs = path.join(sandbox, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, body);
       }
+
+      const res = run(['status', '--porcelain', '--untracked-files=all']);
+      assert.strictEqual(res.status, 0, res.stderr);
+      const leaked = res.stdout.split('\n').filter((line) => line.startsWith('??'));
+      assert.deepStrictEqual(leaked, [], `忽略规则泄漏未跟踪文件:\n${leaked.join('\n')}`);
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
     }
   });
 
