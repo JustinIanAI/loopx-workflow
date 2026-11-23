@@ -1,10 +1,10 @@
 # PRD：LoopX Workflow
 
-- **状态**：目标基线（ADR-0008~ADR-0014 已 Accepted；[ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md) 处于 Proposed 待人类签批；按 M0~M5 实现）
+- **状态**：目标基线（ADR-0008~[ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md) 已 Accepted；按 M0~M5 实现）
 - **详细设计**：[docs/design/loopx-workflow-design.md](../design/loopx-workflow-design.md)
 - **增量决策**：[docs/adr/](../adr/README.md)
 - **决策者**：严君（架构师）。编码由 Agent 推进，签字只发生在两个断点。
-- **实现状态**：本版已纳入 ADR-0008~ADR-0014 的产品约束及 ADR-0015（Proposed）契约修订；现有代码与目标的差异由 M0~M5 跟踪。
+- **实现状态**：本版已纳入 ADR-0008~ADR-0015 的产品约束与契约修订（均已 Accepted）；现有代码与目标的差异由 M0~M5 跟踪。
 
 本文是产品需求的唯一正文。`specs/features/<feature>/02-prd.md` 只记录该胶囊覆盖哪些 `REQ-*` 或哪份 ADR，不再各写一份产品规格。
 
