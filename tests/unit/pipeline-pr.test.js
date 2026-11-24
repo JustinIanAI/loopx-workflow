@@ -7,6 +7,17 @@ const { spawnSync, execSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const h = require('./helpers/m0-sandbox');
 const { detachRepoConfig, withoutRepoConfig } = require('./helpers/repo-isolation');
+const {
+  diffStats,
+  buildEvidenceGraph,
+  scanDiff,
+} = require('../../skills/code-review/scripts/evidence-builder.js');
+const {
+  buildNativePrompt,
+  materializeReviewSandbox,
+  formatArtifactManifest,
+  stdinByteLimit,
+} = require('../../skills/code-review/scripts/authentic-review.js');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
@@ -316,5 +327,218 @@ test('Merge Readiness Fail-Closed: loopx-flow merge must block when LoopX readin
   } finally {
     cleanupMockGh();
     restoreConfig();
+  }
+});
+
+test('LoopX PR Admission Paradigm: removes 500-line hard limit and enforces Outcome + Spec + Boundary criteria', () => {
+  const prTemplate = fs.readFileSync(path.join(PROJECT_ROOT, '.github/PULL_REQUEST_TEMPLATE.md'), 'utf8');
+  assert.doesNotMatch(
+    prTemplate,
+    /(?:建议\s*)?[≤<=]\s*500\s*行/,
+    '.github/PULL_REQUEST_TEMPLATE.md must not prescribe a <= 500-line PR limit'
+  );
+  assert.match(prTemplate, /结果锚定/, 'PR template must require Outcome Anchoring (结果锚定)');
+  assert.match(prTemplate, /before\s*->\s*after/i, 'PR template must require observable before -> after');
+  for (const statusToken of ['implemented', 'deferred', 'out_of_scope', 'not_met']) {
+    assert.strictEqual(
+      prTemplate.includes(statusToken),
+      true,
+      `PR template must declare spec alignment status token: ${statusToken}`
+    );
+  }
+  assert.match(prTemplate, /边界声明/, 'PR template must require Scope & Boundary Declaration (边界声明)');
+  assert.match(prTemplate, /gap/i, 'PR template must require remaining gap declaration for incremental PRs');
+  assert.match(prTemplate, /owner/i, 'PR template must require next owner declaration for incremental PRs');
+  assert.match(prTemplate, /独立可测/, 'PR template must require independent testability for incremental PRs');
+  assert.match(prTemplate, /<!--\s*loopx-meta:/, 'PR template must preserve loopx-meta machine metadata');
+
+  const normativeDocs = [
+    'docs/guides/reviewer-inspection-guide.md',
+    'AGENTS.md',
+    'README.md',
+    'skills/README.md',
+    'docs/design/loopx-workflow-design.md',
+    'skills/code-review/SKILL.md',
+  ];
+  for (const rel of normativeDocs) {
+    const text = fs.readFileSync(path.join(PROJECT_ROOT, rel), 'utf8');
+    assert.doesNotMatch(
+      text,
+      /(?:Diff|改动行数|单\s*(?:PR|Feature)\s*Diff|单次\s*diff)[^。\n]*(?:≤|<=|不超过)\s*500\s*行/i,
+      `${rel} must not contain PR/Feature diff <= 500 lines limit`
+    );
+  }
+
+  const reviewerGuide = fs.readFileSync(path.join(PROJECT_ROOT, 'docs/guides/reviewer-inspection-guide.md'), 'utf8');
+  assert.match(reviewerGuide, /结果锚定/, 'reviewer-inspection-guide.md must include 结果锚定');
+  assert.match(reviewerGuide, /边界/, 'reviewer-inspection-guide.md must include 边界 declaration');
+  assert.match(reviewerGuide, /not_met/, 'reviewer-inspection-guide.md must prohibit not_met');
+  assert.match(reviewerGuide, /Review Prompt/i, 'reviewer-inspection-guide.md must clarify >500-line test file note is Review Prompt only');
+
+  // Ensure toolchain & CI contain no automated PR 500-line diff blocking logic
+  const gateScripts = [
+    '.github/workflows/ci.yml',
+    'scripts/gate-lint.sh',
+    'scripts/gate-build.sh',
+    'bin/loopx-flow',
+    'skills/code-review/scripts/authentic-review.js',
+    'skills/code-review/scripts/evidence-builder.js',
+    'skills/code-review/scripts/ingest-to-loopx-quality.js',
+  ];
+  for (const rel of gateScripts) {
+    const content = fs.readFileSync(path.join(PROJECT_ROOT, rel), 'utf8');
+    assert.doesNotMatch(
+      content,
+      /(?:diff|pr).*(?:lines?|additions).*(?:>|>=|-gt|-ge)\s*500/i,
+      `${rel} must not enforce an automated 500-line PR diff block`
+    );
+  }
+
+  // Review prompt must calibrate review agents against LOC-based rejection
+  const prompt = buildNativePrompt({
+    pr: 122,
+    headOid: 'b'.repeat(40),
+    branch: 'feat/pr-admission-align-loopx',
+    motivation: 'Align PR admission with LoopX',
+    reviewTemplate: { sections: [{ label: '动机', minimum_prose_characters: 1, agent_instruction: 'check' }] },
+    reviewPlan: { required_evidence_ids: [] },
+    evidenceCommands: [],
+    evidenceText: '',
+    diff: '',
+    priorFindings: [],
+    evidenceContract: {},
+    artifactManifest: '- `pr.diff`: 10 bytes',
+  });
+  assert.match(prompt, /禁止按代码行数|禁止以代码行数/, 'Review prompt must forbid rejecting PRs by LOC');
+  assert.match(prompt, /Review Prompt/i, 'Review prompt must clarify >500-line test reminder is Review Prompt only');
+});
+
+test('Large Diff (>500 lines) Compatibility: PR body rendering, evidence graph, review sandbox and lint/build gates pass without blocking', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-large-diff-'));
+  const featureName = 'large-protocol-contract-compat';
+  const featureDir = path.join(PROJECT_ROOT, 'specs/features', featureName);
+  const hadFeatureDir = fs.existsSync(featureDir);
+
+  // Construct a realistic >500-line multi-file diff (contract + implementation + >500-line test file)
+  const contractLines = Array.from({ length: 180 }, (_, i) => `+export interface ProtocolRule_${i} { id: string; enabled: boolean; }`);
+  const implLines = Array.from({ length: 160 }, (_, i) => `+function validateRule_${i}(rule) { return Boolean(rule && rule.id); }`);
+  const testLines = Array.from({ length: 520 }, (_, i) => `+test('protocol rule ${i} invariant holds', () => { assert.strictEqual(${i} >= 0, true); });`);
+  const largeDiff = [
+    'diff --git a/specs/features/large-protocol-contract-compat/04-contract.md b/specs/features/large-protocol-contract-compat/04-contract.md',
+    '--- a/specs/features/large-protocol-contract-compat/04-contract.md',
+    '+++ b/specs/features/large-protocol-contract-compat/04-contract.md',
+    '@@ -1,2 +1,182 @@',
+    ' # Protocol Contract',
+    '-legacy_line',
+    ...contractLines,
+    'diff --git a/lib/protocol-contract.js b/lib/protocol-contract.js',
+    '--- a/lib/protocol-contract.js',
+    '+++ b/lib/protocol-contract.js',
+    '@@ -1,2 +1,162 @@',
+    ' "use strict";',
+    '-module.exports = {};',
+    ...implLines,
+    'diff --git a/tests/unit/protocol-contract.test.js b/tests/unit/protocol-contract.test.js',
+    '--- a/tests/unit/protocol-contract.test.js',
+    '+++ b/tests/unit/protocol-contract.test.js',
+    '@@ -1,1 +1,521 @@',
+    ' const assert = require("node:assert");',
+    ...testLines,
+    '',
+  ].join('\n');
+
+  const stats = diffStats(largeDiff);
+  assert.strictEqual(stats.additions, 860, 'diffStats must accurately count >500 additions without capping');
+  assert.strictEqual(stats.deletions, 2, 'diffStats must accurately count deletions');
+  assert.deepStrictEqual(scanDiff(largeDiff), [], 'Clean >500-line diff must produce zero false-positive scan findings');
+
+  try {
+    // 1. PR body rendering via authentic-review.js --generate-pr-body --diff-file
+    fs.mkdirSync(featureDir, { recursive: true });
+    fs.writeFileSync(path.join(featureDir, '02-prd.md'), '# PRD\n- Outcome: large protocol contract\n');
+    fs.writeFileSync(path.join(featureDir, '01-decisions.md'), '# Decisions\n- Single coherent PR without artificial LOC splitting\n');
+    fs.writeFileSync(path.join(featureDir, '05-evidence.md'), [
+      '# Evidence',
+      '### 验证矩阵',
+      '| Check | Result | Details |',
+      '|---|---|---|',
+      '| `npm run typecheck` | PASSED | exit 0 |',
+      '| `npm run lint` | PASSED | exit 0 |',
+      '| `npm run build` | PASSED | exit 0 |',
+      '| `npm run test` | PASSED | exit 0 |',
+    ].join('\n'));
+
+    const diffFile = path.join(tmpDir, 'large-pr.diff');
+    fs.writeFileSync(diffFile, largeDiff, 'utf8');
+
+    const genRes = spawnSync(
+      process.execPath,
+      [path.join(PROJECT_ROOT, 'skills/code-review/scripts/authentic-review.js'), '--generate-pr-body', '--feature', featureName, '--diff-file', diffFile],
+      { encoding: 'utf8', cwd: PROJECT_ROOT }
+    );
+    assert.strictEqual(genRes.status, 0, `PR body rendering must succeed for >500-line diff: ${genRes.stderr}`);
+    assert.match(genRes.stdout, /## 动机 \/ Motivation/);
+    assert.match(genRes.stdout, /## 具体改动 \/ Changes/);
+    assert.match(genRes.stdout, /lib\/protocol-contract\.js/);
+    assert.match(genRes.stdout, /\+160 \/ -1/);
+    assert.match(genRes.stdout, /tests\/unit\/protocol-contract\.test\.js/);
+    assert.match(genRes.stdout, /\+520 \/ -0/);
+
+    // 2. Evidence graph code_volume accepts >500 additions as verified (no line-count penalty/block)
+    const graph = buildEvidenceGraph({
+      plan: { feature: featureName, required_evidence_ids: ['code_volume'] },
+      contract: {
+        evidence_requirements: [{
+          evidence_id: 'code_volume',
+          required_fields: ['additions', 'deletions', 'changed_line_shape', 'verdict'],
+        }],
+      },
+      modelEvidence: {
+        code_volume: { verdict: 'justified_coherent_contract' },
+      },
+      diff: largeDiff,
+      headOid: 'c'.repeat(40),
+      pr: 122,
+      motivation: 'Large protocol contract delivery',
+      validation: [],
+      repoRoot: PROJECT_ROOT,
+    });
+    assert.strictEqual(graph.code_volume.additions, 860);
+    assert.strictEqual(graph.code_volume.status, 'verified', 'code_volume must reach verified for >500-line diffs');
+
+    // 3. Sandbox materialization & compact stdin prompt handle >500-line diff without truncation
+    const runDir = { dir: tmpDir, file: (name) => path.join(tmpDir, name) };
+    const entries = materializeReviewSandbox(runDir, {
+      'packet.json': JSON.stringify({ pr: 122 }),
+      'pr.diff': largeDiff,
+      'evidence-output.md': 'all gates passed',
+    });
+    const prompt = buildNativePrompt({
+      pr: 122,
+      headOid: 'c'.repeat(40),
+      branch: 'feat/large-protocol-contract-compat',
+      motivation: 'Deliver coherent 860-line protocol contract',
+      reviewTemplate: { sections: [{ label: '动机', minimum_prose_characters: 1, agent_instruction: 'review outcome' }] },
+      reviewPlan: { required_evidence_ids: ['code_volume'] },
+      evidenceCommands: [],
+      evidenceText: 'all gates passed',
+      diff: largeDiff,
+      priorFindings: [],
+      evidenceContract: {},
+      artifactManifest: formatArtifactManifest(entries),
+    });
+    assert.ok(Buffer.byteLength(prompt, 'utf8') <= stdinByteLimit(), 'Prompt stdin must stay within compact byte limit for >500-line diff');
+    assert.strictEqual(fs.readFileSync(path.join(tmpDir, 'pr.diff'), 'utf8'), largeDiff, 'Full >500-line diff must be preserved in sandbox');
+
+    // 4. Local lint & build gates do not block when a large feature capsule exists
+    const lintRes = spawnSync(path.join(PROJECT_ROOT, 'scripts/gate-lint.sh'), [], { encoding: 'utf8', cwd: PROJECT_ROOT });
+    assert.strictEqual(lintRes.status, 0, `gate-lint.sh must pass: ${lintRes.stderr}${lintRes.stdout}`);
+    const buildRes = spawnSync(path.join(PROJECT_ROOT, 'scripts/gate-build.sh'), [], { encoding: 'utf8', cwd: PROJECT_ROOT });
+    assert.strictEqual(buildRes.status, 0, `gate-build.sh must pass: ${buildRes.stderr}${buildRes.stdout}`);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (!hadFeatureDir && fs.existsSync(featureDir)) {
+      fs.rmSync(featureDir, { recursive: true, force: true });
+    }
   }
 });

@@ -27,7 +27,7 @@
 | `design-grill` | 阶段 1：方案研讨 | 代码库感知压力测试，探查事实，收敛 3～6 个顶级决策分支，消除所有“it depends”。 |
 | `create-prd` | 阶段 2：精益 PRD | 快速生成 8 板块高信息密度精益 PRD，明确业务旅程与非目标 (Out of Scope)。 |
 | `strategy-red-team` | 阶段 2：红队对抗 | 攻击方案的致命盲区，定位承重假设，设计极低成本的反驳测试用例。 |
-| `user-stories` | 阶段 3：特性拆解 | 按 Job Story 语法拆解需求，控制单 PR Diff ≤ 500 行。 |
+| `user-stories` | 阶段 3：特性拆解 | 按 Job Story 语法围绕可独立验证的业务结果与边界拆解需求（不设行数上限，禁止为减小行数切碎代码；增量交付须声明剩余 gap、下一 owner 与独立可测性）。 |
 | `prioritize-features` | 阶段 3：排期与优先级 | 基于 Impact × Confidence / Effort 评估矩阵进行价值排期。 |
 | `test-driven-development` | 阶段 5：TDD 实现 | 严格执行 Red-Green-Refactor，单测必须先红后绿，四大门禁 100% 通过。 |
 | `anti-entropy-governance` | 阶段 5 / 收尾：反熵增 | 执行 `delete-first` 原则，彻底清除旧废弃路径、孤儿代码与无意义兜底层。 |

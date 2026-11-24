@@ -47,6 +47,7 @@
    - 当 loopx-flow 场景封装缺少能力时，允许**受控降级**到 LoopX 原生 `loopx` CLI，但必须在交付报告与 PR 评论中披露：(a) 实际命令与结果；(b) 能力缺口与绕过原因；且**不得绕过 Goal/Gate/Receipt/Review/Merge 权威约束**。`issue-fix.feasibility`/`integration-branch` 缺失时 `issue`/`integrate` 直接非 0，不得降级为静默成功。
    - 降级是临时手段而非终点：一旦确认能力缺口，必须在同一次交付中补上 `loopx-flow` 场景化命令或登记该缺口，逐步收敛降级路径（anti-entropy）。
    - 评审报告格式以 LoopX `pr-review` 返回的 `review_template`（动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价）为唯一权威，严禁任何自造 Block 模板；代码类变更必须在「具体改动」下提供 `### 关键代码讲解`。`loopx-flow review` 与 `loopx-flow respond` 均复用该原生格式。
+   - PR 准入对齐 LoopX 原生「**结果锚定 + 证据核验 + 边界声明**」范式：明确可观察的 `before -> after`、逐条标注 `implemented`/`deferred`/`out_of_scope`（杜绝 `not_met`）、禁止按代码行数（LOC）拒绝有效 PR 或为减小行数切碎代码；增量 PR 必须显式声明剩余 gap、下一 owner 与独立可测性；测试文件超过 500 行仅作人工 Review Prompt，绝非自动阻断门禁。
 
 ---
 
@@ -55,7 +56,7 @@
 - **阶段 0：前置体检** ➔ 运行 `loopx-flow doctor` 确保 Git、CLI、认证、四大门禁与目录就绪；首次接入由 `loopx-flow init` 确认 `authorization_mode`（`independent`/`single_owner`）与风险接受，`doctor` 校验配置。
 - **阶段 1：方案研讨** ➔ 调用 `design-grill` 排除事实疑问。产品级取舍写入 `docs/adr/` 并修订 `docs/prd/loopx-workflow.md` 与必要时的详细设计。`specs/features/<feature>/01-decisions.md` 只记录本胶囊的实现取舍并链接该 ADR。
 - **阶段 2：需求切片** ➔ 对照产品 PRD 列出本胶囊要满足的 `REQ-*`。行为不在 PRD 中则先完成阶段 1 的 ADR，禁止在 `02-prd.md` 另立产品需求。`strategy-red-team` 只攻击本切片的承重假设。
-- **阶段 3：特性拆分** ➔ `user-stories` / `prioritize-features`，控制单 Feature Diff ≤ 500 行，产出 `specs/features/<feature>/03-stories.md`。
+- **阶段 3：特性拆分** ➔ `user-stories` / `prioritize-features`，按独立可验证的业务结果与边界拆分（不设 PR/Feature Diff 行数上限，禁止纯粹为减小行数切碎代码；增量 PR 必须声明剩余 gap、下一 owner 与独立可测性），产出 `specs/features/<feature>/03-stories.md`。
 - **阶段 4：规格包与断点 1 审批** ➔ 在 `04-contract.md` 固化 TypeScript 签名 + AC 矩阵/Scope/Verification Plan/依赖顺序；`00-INDEX.md` 作为规格包视图；可按 `REQ-PR-LIFECYCLE-1` 创建 Draft PR 展示；人类执行 `loopx-flow approve contract <feature>`：校验规格完整性、TTY/第二账号、锁 SHA 并写 `user_gate` 授权记录后放行。
 - **阶段 5：TDD 循环实现与反熵增** ➔ `loopx-flow todo claim` 认领排他租约 ➔ 红绿重构（单测先写先红）➔ 依 `anti-entropy-governance` 清理退役旧逻辑 ➔ 四大门禁全绿。
 - **阶段 6：代码审查与质量收据融合** ➔ 执行 `loopx-flow check`，运行语义审查（选配 OCR）并通过适配器写入 LoopX `change-quality` 严格 Receipt，回写 `specs/features/<feature>/05-evidence.md`。

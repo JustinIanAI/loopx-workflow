@@ -75,11 +75,19 @@ cat specs/features/<feature-name>/05-evidence.md
 - **阵地**：GitHub PR 页面 (Web UI) 与 `loopx-flow merge <PR_ID>`
 - **准入时机**：人类审批人在 GitHub 网页点击 **Approve** 并合入主干前。
 
+### LoopX 三大准入判据（严禁按代码行数机械评审）
+
+评审员与审查 Agent 必须依据 LoopX 原生「**结果锚定 + 证据核验 + 边界声明**」范式评估 PR，**禁止以代码行数（LOC）评判质量或拒绝有效 PR**：
+
+1. **结果锚定 (Outcome Anchoring)**：明确 PR 交付的具体业务结果与可观察的 `before -> after`。
+2. **规格对齐 (Spec Alignment & Evidence)**：对照需求/契约逐条标注 `implemented` / `deferred` / `out_of_scope` / `not_met`，**杜绝 `not_met`**，每条附可复现验证证据。
+3. **边界声明 (Scope & Increment Boundary)**：禁止纯粹为减小行数而切碎代码；若为增量 PR，必须明确声明剩余 gap、下一 owner 与独立可测性。对单文件测试过长（例如超过 500 行）的提示仅作为人工 **Review Prompt**，绝非自动阻断门禁。
+
 ### 审批人“8 项事实”逐项核验表 (8-Point Inspection Verification)
 
 | 序号 | 事实核验项 | 审查核心与合格标准 | 快速核验操作 |
 |---|---|---|---|
-| **1** | **改动范围 (Scope)** | 改动行数建议 ≤ 500 行，无多余未跟踪文件或无意义格式微调 | 网页 Files Changed，或 `gh pr diff <PR> --stat` |
+| **1** | **结果锚定与边界独立性 (Outcome & Boundary)** | 明确业务结果与可观察的 `before -> after`；规格逐条标注 `implemented` / `deferred` / `out_of_scope`（零 `not_met`）；无无关文件或无意义格式微调；禁止按代码行数（LOC）拒绝有效 PR 或为凑行数切碎代码；增量 PR 须声明剩余 gap、下一 owner 与独立可测性 | 核对 PR 描述三大准入判据、Files Changed 与验收证据 |
 | **2** | **契约稳定性** | 严格遵守 `04-contract.md` 冻结的 TypeScript 接口，无破坏性变更 | 对比契约文件顶部的类型定义与实际代码 |
 | **3** | **四大门禁凭证** | 本地四大门禁全绿，且在 `05-evidence.md` 中如实填报 | 查阅 PR 描述或顶置原生五段式报告中的门禁凭证 |
 | **4** | **代码审查闭环** | 零 Actionable 缺陷，幽灵代码已彻底删除 (`delete-first`) | 查阅顶置原生五段式报告与 `05-evidence.md` |

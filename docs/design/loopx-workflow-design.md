@@ -200,7 +200,7 @@ L0 命令不是 LoopX 转发器，而是场景操作契约（遵循 [ADR-0010](.
 | 0 体检 | 无 | `doctor`，必要时 `init`（确认 `authorization_mode`） |
 | 1 实现取舍 | `01-decisions.md`，产品级取舍另写 ADR | `gate verify decisions` 只检查 APPROVED 标记 |
 | 2 需求切片 | `02-prd.md` 列出 `REQ-*` 或 ADR | 若行为超出 PRD，先改 PRD |
-| 3 故事 | `03-stories.md` | 单次 diff 以不超过 500 行为目标，不是程序强制 |
+| 3 故事 | `03-stories.md` | 按独立可验证的业务结果与边界拆分（不设 diff 行数上限，禁止为减小行数切碎代码；增量 PR 须声明剩余 gap、下一 owner 与独立可测性） |
 | 4 规格包与断点 1 | `04-contract.md`（签名/不变量 + AC 矩阵/Scope/Verification Plan/依赖顺序）；`00-INDEX.md` 规格包视图 | `approve contract`（Specification Authorization） |
 | 5 实现 | 代码与测试 | `todo claim` 后再改；红灯测试先写 |
 | 6 门禁 | `05-evidence.md` | `check` |
@@ -270,6 +270,7 @@ AGENTS 管线 B 的规程必须在 `REQ-ISSUE-PIPELINE-1` 内执行，不能把 
 - 审查者使用本机默认模型的 CLI（主路径是 `codex exec`，不在编排器里写死型号）。CLI 不存在、执行失败、输出缺 `review_body` / verdict / declaration，均 `NOT_VERIFIED`。
 - 代码类变更要在「具体改动」下有 `### 关键代码讲解`。
 - 仅当原生 `check-result` 的 `ok === true` 才发布。
+- PR 准入遵循 LoopX「结果锚定 + 证据核验 + 边界声明」三判据：核验可观察的 `before -> after`、逐条标注 `implemented`/`deferred`/`out_of_scope`/`not_met`（杜绝 `not_met`）及增量 PR 的剩余 gap / 下一 owner / 独立可测性；禁止以代码行数（LOC）评判质量或拒绝有效 PR，禁止要求仅为减小行数而切碎代码；测试文件超过 500 行的提醒仅作人工 Review Prompt，绝非自动阻断门禁。
 - 复审：上轮 findings 必须逐条判定 `fixed` / `reproducible` / `obsolete`，并在 `check-result` **之前**进入 `review_body`；`reproducible` 未清时 verdict 上限 `REQUEST_CHANGES`。
 - 审查者 CLI 缺失时不得隐式改用另一个 CLI；只有显式 `--agent-bin` / `--cross-validate` 才换审查者。Reviewer 行与证据必须记录实际使用的模型。
 - **输入契约与两阶段解耦 (ADR-0013 / REQ-REVIEW-2)**：
