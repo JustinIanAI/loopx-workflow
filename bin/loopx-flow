@@ -56,6 +56,36 @@ run_loopx() {
 }
 
 RED='\033[0;31m'
+CAPABILITY_PROBE_LIB="$WORKFLOW_ROOT/lib/capability-probe.js"
+export CAPABILITY_PROBE_LIB
+
+# 集中式三层能力探针（ADR-0010 / ADR-0015）：doctor 呈现矩阵，L0 命令前置 Fail-Closed 阻断。
+probe_loopx_capabilities() {
+    local scope="doctor" format="text"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope) scope="$2"; shift 2 ;;
+            --format) format="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    node "$CAPABILITY_PROBE_LIB" matrix --scope "$scope" --format "$format"
+}
+
+require_loopx_capabilities() {
+    local scope="$1" out="" rc=0
+    command -v node >/dev/null 2>&1 || {
+        echo -e "[-] [FAIL-CLOSED] node 缺失，无法执行 LoopX 能力探针 (scope=$scope)。" >&2
+        exit 1
+    }
+    out="$(node "$CAPABILITY_PROBE_LIB" require --scope "$scope" --format quiet 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        printf '%s\n' "$out" >&2
+        echo -e "${RED}[-] [FAIL-CLOSED] LoopX 能力探针未通过 (scope=$scope)，命令已阻断。${NC}" >&2
+        exit 1
+    fi
+}
+
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
@@ -380,6 +410,9 @@ cmd_doctor() {
         echo -e "🛠️ 修复指令: python3 -m pip install --upgrade loopx && loopx doctor" >&2 # loopx-allow: install hint text
         exit 1
     fi
+
+    echo -e "\n${BLUE}==> LoopX Required Capability Set 能力矩阵 (ADR-0010 / ADR-0015)...${NC}"
+    probe_loopx_capabilities --scope doctor --format text
 
     # 环境治理：路由/registry 一致性 + API 预算基线（WARN 不阻断，但给出可执行修复指令）
     if ! cmd_doctor_control_plane; then
@@ -2359,6 +2392,8 @@ cmd_issue() {
         exit 1
     fi
 
+    require_loopx_capabilities issue
+
     # 解析 Agent 观察量 (reproduction / scope)
     local repro="missing" scope="uncertain"
     while [[ $# -gt 0 ]]; do
@@ -2458,6 +2493,8 @@ cmd_integrate() {
         echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，无法执行 LoopX 原生集成分支预演。${NC}" >&2
         exit 1
     fi
+
+    require_loopx_capabilities integrate
 
     if [[ "$mode" == "status" ]]; then
         echo -e "${BLUE}==> 正在查询 LoopX 集成分支状态 (base/source/integration heads)...${NC}"
@@ -2917,8 +2954,14 @@ if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 if (payload.ok !== true) {
   process.stdout.write(`bad\tLoopX claim 拒绝: ${payload.error_code || "unknown"}\n`); process.exit(0);
 }
-if (payload.schema_version !== "loopx_coordination_todo_claim_result_v0") {
-  process.stdout.write(`bad\tclaim schema_version 不在白名单: ${payload.schema_version || "missing"}\n`); process.exit(0);
+let probeLib;
+try { probeLib = require(process.env.CAPABILITY_PROBE_LIB); }
+catch (_) { process.stdout.write("bad\t无法加载 lib/capability-probe.js\n"); process.exit(0); }
+const schemaVerdict = probeLib.assertSchemaVersion("todo.claim", payload);
+if (!schemaVerdict.ok) {
+  const version = probeLib.readLoopxVersion(process.env.LOOPX_BIN || "loopx").raw;
+  process.stderr.write(`${probeLib.schemaDiagnosticCard("todo.claim", schemaVerdict, version)}\n`);
+  process.stdout.write(`bad\tclaim ${schemaVerdict.reason}\n`); process.exit(0);
 }
 if (typeof payload.claim_operation_id !== "string" || !payload.claim_operation_id) {
   process.stdout.write("bad\tclaim 返回缺少 claim_operation_id\n"); process.exit(0);
@@ -2963,8 +3006,14 @@ if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 if (payload.ok !== true) {
   process.stdout.write(`bad\tLoopX complete 拒绝: ${payload.error_code || payload.reason_code || "unknown"}\n`); process.exit(0);
 }
-if (payload.schema_version !== "loopx_coordination_todo_terminal_lifecycle_result_v0") {
-  process.stdout.write(`bad\tcomplete schema_version 不在白名单: ${payload.schema_version || "missing"}\n`); process.exit(0);
+let probeLib;
+try { probeLib = require(process.env.CAPABILITY_PROBE_LIB); }
+catch (_) { process.stdout.write("bad\t无法加载 lib/capability-probe.js\n"); process.exit(0); }
+const schemaVerdict = probeLib.assertSchemaVersion("todo.complete", payload);
+if (!schemaVerdict.ok) {
+  const version = probeLib.readLoopxVersion(process.env.LOOPX_BIN || "loopx").raw;
+  process.stderr.write(`${probeLib.schemaDiagnosticCard("todo.complete", schemaVerdict, version)}\n`);
+  process.stdout.write(`bad\tcomplete ${schemaVerdict.reason}\n`); process.exit(0);
 }
 if (payload.completed !== true || payload.status !== "done") {
   process.stdout.write(`bad\tcomplete 未确认原子完成: status=${payload.status || "missing"} completed=${payload.completed}\n`); process.exit(0);
@@ -3138,6 +3187,8 @@ cmd_todo_lease() {
             exit 1
         }
     fi
+
+    require_loopx_capabilities todo
 
     if [[ "$mode" == "claim" ]]; then
         echo -e "${BLUE}==> [受管 Todo] 正在认领: $todo_id @ $goal_id ...${NC}"

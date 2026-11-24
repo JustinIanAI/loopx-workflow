@@ -19,8 +19,18 @@ function setupMocks() {
   fs.mkdirSync(LOOPX_TMP, { recursive: true });
   fs.writeFileSync(REGISTRY_FILE, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
   fs.writeFileSync(path.join(MOCK_BIN_DIR, 'loopx'), `#!/usr/bin/env bash
-echo "$*" >> ${CALLS_LOG}
 args="$*"
+if [[ "$args" == "--version" ]]; then echo "loopx 2.3.0"; exit 0; fi
+if [[ "$args" == *"--help"* ]]; then
+  case "$args" in
+    *"todo claim"*) echo "usage: loopx todo claim --goal-id <id> --todo-id <id> --agent-id <a> --claimed-by <a>" ;;
+    *"todo complete"*) echo "usage: loopx todo complete --claim-operation-id <op> --evidence <ev>" ;;
+    *"todo add"*) echo "usage: loopx todo add --required-write-scope --task-domain --task-repository --validation-command --operation-id --claim-operation-id --task-class --decision-scope --decision-outcome --global-gate" ;;
+    *) echo "usage: loopx" ;;
+  esac
+  exit 0
+fi
+echo "$*" >> ${CALLS_LOG}
 goal=""; todo=""
 for ((i=1; i<=$#; i++)); do
   case "\${!i}" in
