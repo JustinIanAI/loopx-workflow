@@ -3,7 +3,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync, execSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const LOOPX_FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
@@ -12,39 +12,68 @@ const TEST_TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'loopx-native-dispatc
 const MOCK_BIN_DIR = path.join(TEST_TMP_DIR, 'mock-bin');
 const CALLS_LOG = path.join(TEST_TMP_DIR, 'native-dispatch-mock-calls.log');
 const TEST_REGISTRY = path.join(TEST_TMP_DIR, 'registry.json');
+const TEST_LOOPX_TMP = path.join(TEST_TMP_DIR, 'loopx-tmp');
 after(() => fs.rmSync(TEST_TMP_DIR, { recursive: true, force: true }));
 
 function setupMocks() {
-  if (!fs.existsSync(MOCK_BIN_DIR)) {
-    fs.mkdirSync(MOCK_BIN_DIR, { recursive: true });
-  }
+  fs.mkdirSync(MOCK_BIN_DIR, { recursive: true });
+  fs.mkdirSync(TEST_LOOPX_TMP, { recursive: true });
   fs.writeFileSync(TEST_REGISTRY, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
 
   fs.writeFileSync(path.join(MOCK_BIN_DIR, 'loopx'), `#!/usr/bin/env bash
 echo "$*" >> ${CALLS_LOG}
 args="$*"
+goal=""; todo=""
+for ((i=1; i<=$#; i++)); do
+  case "\${!i}" in
+    --goal-id) j=$((i+1)); goal="\${!j}" ;;
+    --todo-id) j=$((i+1)); todo="\${!j}" ;;
+  esac
+done
 
 if [[ "$args" == *"agent-directory"* ]]; then
   echo '{"ok":true,"registered_agent_count":1,"rows":[{"agent_id":"native-dispatch-agent","registered":true}]}'
   exit 0
 fi
 
-if [[ "$args" == *"task-lease inspect"* ]]; then
-  echo '{"ok":true,"action":"inspect","active":false,"lease":null,"version":1,"owner":"loopx-flow-agent"}'
-  exit 0
-fi
-
-if [[ "$args" == *"task-lease acquire"* ]]; then
-  if [[ "\${MOCK_TASK_LEASE_FAIL:-}" == "1" ]]; then
-    echo "[Mock LoopX] lease conflict: held by another agent" >&2
+if [[ "$args" == *"todo claim"* ]]; then
+  if [[ "\${MOCK_CLAIM_FAIL:-}" == "1" ]]; then
+    echo '{"ok":false,"schema_version":"loopx_coordination_todo_claim_result_v0","error_code":"todo_lease_conflict","error":"held"}'
     exit 1
   fi
-  echo "[Mock LoopX] lease acquired"
+  echo "{\\"ok\\":true,\\"schema_version\\":\\"loopx_coordination_todo_claim_result_v0\\",\\"claim_operation_id\\":\\"todo-claim:\${goal}:\${todo}:mock\\",\\"handoff_mode\\":\\"hard_lease\\",\\"execution_managed\\":true,\\"status\\":\\"applied\\"}"
   exit 0
 fi
 
-if [[ "$args" == *"task-lease release"* ]]; then
-  echo "[Mock LoopX] lease released"
+if [[ "$args" == *"task-lease inspect"* ]]; then
+  case "\${MOCK_LEASE_MODE:-active}" in
+    released)
+      echo '{"ok":true,"schema_version":"task_lease_v0","active":false,"handoff_mode":"hard_lease","lease":{"status":"released","owner":"native-dispatch-agent","expires_at":"2099-01-01T00:00:00Z"}}'
+      ;;
+    expired)
+      echo '{"ok":true,"schema_version":"task_lease_v0","active":false,"handoff_mode":"hard_lease","lease":{"status":"active","owner":"native-dispatch-agent","expires_at":"2000-01-01T00:00:00Z"}}'
+      ;;
+    other)
+      echo '{"ok":true,"schema_version":"task_lease_v0","active":true,"handoff_mode":"hard_lease","lease":{"status":"active","owner":"other-agent","expires_at":"2099-01-01T00:00:00Z"}}'
+      ;;
+    *)
+      echo '{"ok":true,"schema_version":"task_lease_v0","active":true,"handoff_mode":"hard_lease","lease":{"status":"active","owner":"native-dispatch-agent","expires_at":"2099-01-01T00:00:00Z"}}'
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "$args" == *"todo list"* ]]; then
+  echo "{\\"ok\\":true,\\"todo\\":{\\"todo_id\\":\\"\${todo}\\",\\"status\\":\\"\${MOCK_TODO_STATUS:-open}\\",\\"claimed_by\\":\\"native-dispatch-agent\\",\\"done\\":false}}"
+  exit 0
+fi
+
+if [[ "$args" == *"todo complete"* ]]; then
+  if [[ "\${MOCK_COMPLETE_FAIL:-}" == "1" ]]; then
+    echo '{"ok":false,"schema_version":"loopx_coordination_todo_terminal_lifecycle_result_v0","error_code":"claim_execution_unavailable","status":"failed","changed":false,"recovery":{"action":"reconcile_lease_owner","execution_authority_granted":false}}'
+    exit 1
+  fi
+  echo '{"ok":true,"schema_version":"loopx_coordination_todo_terminal_lifecycle_result_v0","completed":true,"status":"done","changed":true}'
   exit 0
 fi
 
@@ -90,15 +119,10 @@ exit 0
 }
 
 function cleanupMocks() {
-  if (fs.existsSync(MOCK_BIN_DIR)) {
-    fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true });
-  }
-  if (fs.existsSync(CALLS_LOG)) {
-    fs.unlinkSync(CALLS_LOG);
-  }
-  if (fs.existsSync(TEST_REGISTRY)) {
-    fs.unlinkSync(TEST_REGISTRY);
-  }
+  fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true });
+  fs.rmSync(CALLS_LOG, { force: true });
+  fs.rmSync(TEST_REGISTRY, { force: true });
+  fs.rmSync(TEST_LOOPX_TMP, { recursive: true, force: true });
 }
 
 function runFlow(args, extraEnv = {}) {
@@ -110,103 +134,139 @@ function runFlow(args, extraEnv = {}) {
       PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
       LOOPX_AGENT_ID: '',
       LOOPX_REGISTRY: TEST_REGISTRY,
+      LOOPX_TMP_DIR: TEST_LOOPX_TMP,
       ...extraEnv
     }
   });
 }
 
-test('1. Todo lease claim: must acquire exclusive lease via task-lease acquire and fail closed on conflict', () => {
+function callsText() {
+  return fs.existsSync(CALLS_LOG) ? fs.readFileSync(CALLS_LOG, 'utf8') : '';
+}
+
+function claimCachePath(goal, todo) {
+  return path.join(TEST_LOOPX_TMP, 'claims', `${goal}--${todo}.json`);
+}
+
+test('1. Todo claim delegates to managed loopx todo claim and caches the five-tuple receipt', () => {
   cleanupMocks();
   setupMocks();
-
   try {
-    const res = runFlow(['todo', 'claim', 'todo_ab12cd34ef56', '--goal-id', 'native-dispatch-deep-integration-goal']);
+    const goal = 'native-dispatch-deep-integration-goal';
+    const todo = 'todo_ab12cd34ef56';
+    const res = runFlow(['todo', 'claim', todo, '--goal-id', goal]);
     assert.strictEqual(res.status, 0, `claim must succeed: ${res.stderr}`);
-    const calls = fs.readFileSync(CALLS_LOG, 'utf8');
-    assert.strictEqual(
-      calls.includes('task-lease acquire --goal-id native-dispatch-deep-integration-goal --todo-id todo_ab12cd34ef56'),
-      true,
-      `must call task-lease acquire with goal-id and todo-id, got: ${calls}`
-    );
+    const calls = callsText();
+    assert.match(calls, /todo claim --goal-id native-dispatch-deep-integration-goal --todo-id todo_ab12cd34ef56 --agent-id native-dispatch-agent --claimed-by native-dispatch-agent/);
+    assert.doesNotMatch(calls, /task-lease acquire/);
 
-    // Negative: lease conflict must fail closed with exit 1
-    fs.unlinkSync(CALLS_LOG);
-    const blocked = runFlow(['todo', 'claim', 'todo_ab12cd34ef56', '--goal-id', 'native-dispatch-deep-integration-goal'], { MOCK_TASK_LEASE_FAIL: '1' });
-    assert.strictEqual(blocked.status, 1, 'claim must exit 1 when lease acquire fails');
-    assert.strictEqual(
-      `${blocked.stderr}${blocked.stdout}`.includes('租约'),
-      true,
-      'claim must print explicit lease fail-closed message'
-    );
+    const cache = JSON.parse(fs.readFileSync(claimCachePath(goal, todo), 'utf8'));
+    assert.strictEqual(cache.claim_operation_id, `todo-claim:${goal}:${todo}:mock`);
+    assert.strictEqual(cache.goal_id, goal);
+    assert.strictEqual(cache.todo_id, todo);
+    assert.strictEqual(cache.agent_id, 'native-dispatch-agent');
+    assert.strictEqual(cache.handoff_mode, 'hard_lease');
+    assert.strictEqual(cache.registry_path, fs.realpathSync(TEST_REGISTRY));
+
+    fs.rmSync(CALLS_LOG, { force: true });
+    const blocked = runFlow(['todo', 'claim', todo, '--goal-id', goal], { MOCK_CLAIM_FAIL: '1' });
+    assert.strictEqual(blocked.status, 1, 'claim must exit 1 when managed claim fails');
+    assert.match(`${blocked.stderr}${blocked.stdout}`, /todo_lease_conflict/);
+    assert.doesNotMatch(callsText(), /task-lease acquire/);
   } finally {
     cleanupMocks();
   }
 });
 
-test('2. Todo lease done: must inspect lease and resolve owner before todo done, then release with SHA256 key', () => {
+test('2. Todo done reuses the cached claim_operation_id and cleans the cache after managed complete', () => {
   cleanupMocks();
   setupMocks();
-
   try {
-    const res = runFlow(['todo', 'done', 'todo_ab12cd34ef56', '--goal-id', 'native-dispatch-deep-integration-goal']);
+    const goal = 'native-dispatch-deep-integration-goal';
+    const todo = 'todo_ab12cd34ef56';
+    assert.strictEqual(runFlow(['todo', 'claim', todo, '--goal-id', goal]).status, 0);
+    fs.rmSync(CALLS_LOG, { force: true });
+
+    const res = runFlow(['todo', 'done', todo, '--goal-id', goal, '--evidence', 'green']);
     assert.strictEqual(res.status, 0, `done must succeed: ${res.stderr}`);
-    const calls = fs.readFileSync(CALLS_LOG, 'utf8').trim().split('\n');
-    const agentIdx = calls.findIndex(c => c.includes('agent-directory'));
-    const inspectIdx = calls.findIndex(c => c.includes('task-lease inspect'));
-    const completeIdx = calls.findIndex(c => c.includes('--status done'));
-    const releaseIdx = calls.findIndex(c => c.includes('task-lease release'));
-    assert.ok(agentIdx >= 0, `must resolve registered owner via agent-directory, got: ${calls.join(' | ')}`);
-    assert.ok(inspectIdx >= 0, `must inspect lease before todo done, got: ${calls.join(' | ')}`);
-    assert.ok(completeIdx > inspectIdx, `task-lease inspect must precede todo --status done, got: ${calls.join(' | ')}`);
-    assert.ok(releaseIdx > completeIdx, `todo --status done must precede task-lease release, got: ${calls.join(' | ')}`);
-    const completeCall = calls[completeIdx];
-    const releaseCall = calls[releaseIdx];
-    assert.strictEqual(completeCall.includes('--todo-id todo_ab12cd34ef56'), true, 'complete must target the todo');
-    assert.strictEqual(releaseCall.includes('--todo-id todo_ab12cd34ef56'), true, 'release must target the todo');
-    assert.strictEqual(releaseCall.includes('--owner native-dispatch-agent'), true, 'release must use resolved registered owner');
-    assert.strictEqual(releaseCall.includes('--expected-version 1'), true, 'release must use inspect version CAS');
-    assert.match(releaseCall, /--idempotency-key loopx-flow:release:[0-9a-f]{64}/, 'release must use public-safe SHA256 idempotency key');
+    const calls = callsText();
+    assert.match(calls, /todo complete --goal-id native-dispatch-deep-integration-goal --todo-id todo_ab12cd34ef56 --agent-id native-dispatch-agent --claim-operation-id todo-claim:native-dispatch-deep-integration-goal:todo_ab12cd34ef56:mock --evidence green/);
+    assert.doesNotMatch(calls, /task-lease release/);
+    assert.strictEqual(fs.existsSync(claimCachePath(goal, todo)), false, 'successful complete must clean the claim cache');
   } finally {
     cleanupMocks();
   }
 });
 
-test('3. Issue feasibility routing: must consult loopx issue-fix feasibility and honor its route verdict', () => {
+test('3. Todo done auto-reclaims only when the lease is active and owned by the same agent', () => {
   cleanupMocks();
   setupMocks();
+  try {
+    const goal = 'native-dispatch-deep-integration-goal';
+    const todo = 'todo_ab12cd34ef56';
+    assert.strictEqual(runFlow(['todo', 'claim', todo, '--goal-id', goal]).status, 0);
+    fs.rmSync(claimCachePath(goal, todo), { force: true });
+    fs.rmSync(CALLS_LOG, { force: true });
 
+    const res = runFlow(['todo', 'done', todo, '--goal-id', goal]);
+    assert.strictEqual(res.status, 0, res.stderr);
+    const calls = callsText();
+    assert.strictEqual((calls.match(/todo claim /g) || []).length, 1, 'must re-claim once');
+    assert.strictEqual((calls.match(/todo complete /g) || []).length, 1, 'must complete once');
+  } finally {
+    cleanupMocks();
+  }
+});
+
+test('4. Todo done fails closed with LoopX recovery when the lease is expired or owned by another agent', () => {
+  cleanupMocks();
+  setupMocks();
+  try {
+    const goal = 'native-dispatch-deep-integration-goal';
+    const todo = 'todo_ab12cd34ef56';
+    for (const mode of ['expired', 'released', 'other']) {
+      fs.rmSync(CALLS_LOG, { force: true });
+      const res = runFlow(['todo', 'done', todo, '--goal-id', goal], { MOCK_LEASE_MODE: mode });
+      assert.strictEqual(res.status, 1, `${mode} must fail closed`);
+      const output = `${res.stdout}${res.stderr}`;
+      assert.match(output, /recovery/);
+      assert.match(output, /claim_task|reconcile_lease_owner/);
+      assert.doesNotMatch(callsText(), /todo claim /, `${mode} must not silently re-claim`);
+    }
+  } finally {
+    cleanupMocks();
+  }
+});
+
+test('5. Issue feasibility routing: must consult loopx issue-fix feasibility and honor its route verdict', () => {
+  cleanupMocks();
+  setupMocks();
   try {
     const res = runFlow(['issue', '123', '--reproduction', 'confirmed', '--scope', 'bounded']);
     assert.strictEqual(res.status, 0, `issue must succeed: ${res.stderr}`);
-    const calls = fs.readFileSync(CALLS_LOG, 'utf8');
+    const calls = callsText();
     assert.strictEqual(calls.includes('issue-fix feasibility'), true, 'must invoke issue-fix feasibility');
     assert.strictEqual(calls.includes('--reproduction-status confirmed'), true, 'must pass reproduction observation');
     assert.strictEqual(calls.includes('--scope-class bounded'), true, 'must pass scope observation');
     assert.strictEqual(calls.includes('--issue-ref 123'), true, 'must pass issue ref');
     assert.strictEqual(res.stdout.includes('fix_pr'), true, `must honor feasibility route verdict, got: ${res.stdout}`);
 
-    // Negative: feasibility failure must fail closed
-    fs.unlinkSync(CALLS_LOG);
+    fs.rmSync(CALLS_LOG, { force: true });
     const blocked = runFlow(['issue', '123'], { MOCK_FEASIBILITY_FAIL: '1' });
     assert.strictEqual(blocked.status, 1, 'issue must exit 1 when feasibility fails');
-    assert.strictEqual(
-      `${blocked.stderr}${blocked.stdout}`.includes('可行性'),
-      true,
-      'issue must print explicit feasibility fail-closed message'
-    );
+    assert.match(`${blocked.stderr}${blocked.stdout}`, /可行性/);
   } finally {
     cleanupMocks();
   }
 });
 
-test('4. Integrate: preview by default, --execute only when explicit, --status passthrough', () => {
+test('6. Integrate: preview by default, --execute only when explicit, --status passthrough', () => {
   cleanupMocks();
   setupMocks();
-
   try {
     const preview = runFlow(['integrate']);
     assert.strictEqual(preview.status, 0, `integrate preview must succeed: ${preview.stderr}`);
-    let calls = fs.readFileSync(CALLS_LOG, 'utf8');
+    let calls = callsText();
     assert.strictEqual(calls.includes('integration-branch sync'), true, 'must call integration-branch sync');
     assert.strictEqual(
       /(^|\s)--execute(\s|$)/.test(calls.split('integration-branch sync')[1] || ''),
@@ -214,10 +274,10 @@ test('4. Integrate: preview by default, --execute only when explicit, --status p
       'preview must NOT pass --execute'
     );
 
-    fs.unlinkSync(CALLS_LOG);
+    fs.rmSync(CALLS_LOG, { force: true });
     const exec = runFlow(['integrate', '--execute']);
     assert.strictEqual(exec.status, 0, `integrate --execute must succeed: ${exec.stderr}`);
-    calls = fs.readFileSync(CALLS_LOG, 'utf8');
+    calls = callsText();
     assert.strictEqual(calls.includes('integration-branch sync'), true, 'must call integration-branch sync');
     assert.strictEqual(
       /(^|\s)--execute(\s|$)/.test(calls.split('integration-branch sync')[1] || ''),
@@ -225,27 +285,21 @@ test('4. Integrate: preview by default, --execute only when explicit, --status p
       'explicit execute must pass --execute'
     );
 
-    fs.unlinkSync(CALLS_LOG);
+    fs.rmSync(CALLS_LOG, { force: true });
     const status = runFlow(['integrate', '--status']);
     assert.strictEqual(status.status, 0, `integrate --status must succeed: ${status.stderr}`);
-    calls = fs.readFileSync(CALLS_LOG, 'utf8');
+    calls = callsText();
     assert.strictEqual(calls.includes('integration-branch status'), true, 'must passthrough integration-branch status');
   } finally {
     cleanupMocks();
   }
 });
 
-test('5. Source invariants: no silent escape on lease/feasibility/integration native calls', () => {
+test('7. Source invariants: todo claim/done never calls the low-level task-lease primitives', () => {
   const flowCode = fs.readFileSync(LOOPX_FLOW, 'utf8');
-  // claim/done/issue/integrate paths must not swallow native failures with || true
-  const claimDoneSection = flowCode.slice(flowCode.indexOf('cmd_todo()'));
-  const issueSection = flowCode.slice(flowCode.indexOf('cmd_issue()'));
-  const integrateSection = flowCode.slice(flowCode.indexOf('cmd_integrate()'));
-  for (const [name, section] of [['cmd_todo', claimDoneSection], ['cmd_issue', issueSection], ['cmd_integrate', integrateSection]]) {
-    assert.strictEqual(
-      /loopx [^|]*\|\| true/.test(section.split('\n\n')[0] || section),
-      false,
-      `${name} native dispatch must not use "|| true" escape hatch`
-    );
-  }
+  assert.doesNotMatch(flowCode, /loopx[^\n]*task-lease\s+(acquire|release|renew)/);
+  assert.doesNotMatch(flowCode, /loopx-flow:claim:/);
+  assert.doesNotMatch(flowCode, /loopx-flow:release:/);
+  const claimDoneSection = flowCode.slice(flowCode.indexOf('cmd_todo_lease()'));
+  assert.doesNotMatch(claimDoneSection, /run_loopx[^\n]*\|\| true/, 'todo claim/done must not swallow native failures');
 });
