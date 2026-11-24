@@ -158,7 +158,15 @@ test('changed_line_classification and code_volume become verified only when requ
         changed_line_shape: 'fake',
         largest_production_hotspots: 'skills/code-review/scripts/evidence-builder.js',
         active_call_site_evidence: 'authentic-review.js calls buildEvidenceGraph',
-        compatibility_assessment: { decision: 'compatible', reason: 'review scripts only' },
+        compatibility_assessment: {
+          decision: 'compatible',
+          reason: 'review scripts only',
+          deployment_boundary: 'same_repo',
+          consumer_inventory: 'authentic-review.js only',
+          persisted_contract: 'none',
+          simpler_alternative: 'none',
+          validation_evidence: 'node --test tests/unit/authentic-review-evidence.test.js',
+        },
         verdict: 'necessary',
         highest_value_simplification: 'do not mark a partial fact row verified',
         behavior_preserving_validation: 'node --test tests/unit/authentic-review-evidence.test.js',
@@ -788,4 +796,37 @@ test('ADR-0013 schema hardening: coerces string arrays on problem_context/archit
   });
   assert.deepStrictEqual(badRan, []);
   assert.strictEqual(badEv.validation_matrix.items.find(i => i.case_id === 'changed_invariant_positive').status, 'unverified');
+});
+
+test('#70 code_volume stays unverified when compatibility_assessment nested fields are partial', () => {
+  const { compatibilityAssessmentComplete } = require('../../skills/code-review/scripts/evidence-builder.js');
+  const full = {
+    decision: 'retain',
+    reason: 'r',
+    deployment_boundary: 'same_repo',
+    consumer_inventory: 'c',
+    persisted_contract: 'p',
+    simpler_alternative: 's',
+    validation_evidence: 'v',
+  };
+  assert.strictEqual(compatibilityAssessmentComplete(undefined, full), true);
+  assert.strictEqual(compatibilityAssessmentComplete(undefined, { decision: 'retain', reason: 'r' }), false);
+  assert.strictEqual(compatibilityAssessmentComplete(undefined, { decision: 'not_applicable', reason: 'r' }), true);
+  assert.strictEqual(compatibilityAssessmentComplete(undefined, { ...full, validation_evidence: '' }), false);
+  assert.strictEqual(compatibilityAssessmentComplete({ deployment_boundary_values: ['cross_service'] }, full), false);
+  assert.strictEqual(compatibilityAssessmentComplete({ decision_values: ['not_applicable'] }, full), false);
+
+  const partial = build({
+    modelEvidence: {
+      code_volume: {
+        largest_production_hotspots: 'evidence-builder.js',
+        active_call_site_evidence: 'authentic-review.js',
+        compatibility_assessment: { decision: 'retain', reason: 'only top-level' },
+        verdict: 'necessary',
+        highest_value_simplification: 'none',
+        behavior_preserving_validation: 'node --test',
+      },
+    },
+  });
+  assert.strictEqual(partial.code_volume.status, 'unverified');
 });

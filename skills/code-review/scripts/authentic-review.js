@@ -541,7 +541,7 @@ function buildBody(feature, diff, repoRoot) {
 }
 
 let GATES_CACHE = null;
-function isolatedGateEnv(baseEnv = process.env) {
+function isolatedGateEnv(baseEnv = process.env, opts = {}) {
   const clean = { ...baseEnv };
   delete clean.REVIEW_SHORTCIRCUIT;
   delete clean.REVIEW_DEBOUNCE_SECONDS;
@@ -555,6 +555,13 @@ function isolatedGateEnv(baseEnv = process.env) {
   delete clean.LOOPX_KEEP_TMP;
   delete clean.REVIEW_MODEL;
   delete clean.REVIEW_REASONING_EFFORT;
+  // macOS has no C.UTF-8 locale; bash prints a setlocale warning to stderr
+  // that pollutes JSON parsed by gate tests. Normalize to a valid locale.
+  if ((opts.platform || process.platform) === 'darwin') {
+    for (const k of ['LC_ALL', 'LANG', 'LC_CTYPE']) {
+      if (clean[k] === 'C.UTF-8') clean[k] = 'en_US.UTF-8';
+    }
+  }
   return clean;
 }
 
