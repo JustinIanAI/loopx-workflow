@@ -1,0 +1,164 @@
+'use strict';
+
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+
+const PROJECT_ROOT = path.resolve(__dirname, '../..');
+const SCRIPT = path.join(PROJECT_ROOT, 'skills/code-review/scripts/authentic-review.js');
+const FLOW = path.join(PROJECT_ROOT, 'bin/loopx-flow');
+const {
+  reviewAgentArgs, resolveReviewRuntimeSelection, declaredModelFamily,
+  resolveReviewerDeclaration, isolatedGateEnv,
+} = require(SCRIPT);
+
+const runDir = { dir: '/sandbox/review-pr67' };
+const out = '/sandbox/review-pr67/out.txt';
+const codexBase = ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral', '-C', runDir.dir];
+const claudeBase = ['-p', '--tools', 'Read', '--permission-mode', 'dontAsk', '--add-dir', runDir.dir];
+
+test('default-off keeps the historical codex and claude argv', () => {
+  const off = { env: {} };
+  assert.deepStrictEqual(reviewAgentArgs('codex', runDir, out, off), [...codexBase, '-o', out, '-']);
+  assert.deepStrictEqual(reviewAgentArgs('claude', runDir, null, off), claudeBase);
+});
+
+test('codex and claude map model and reasoning effort, CLI outranks env', () => {
+  assert.deepStrictEqual(reviewAgentArgs('codex', runDir, out, {
+    model: 'agy-cli/gemini-3.8-flash', reasoningEffort: 'high',
+    env: { REVIEW_MODEL: 'from-env', REVIEW_REASONING_EFFORT: 'low' },
+  }), [...codexBase, '-m', 'agy-cli/gemini-3.8-flash', '-c', 'model_reasoning_effort=high', '-o', out, '-']);
+  assert.deepStrictEqual(reviewAgentArgs('claude', runDir, null, {
+    env: { REVIEW_MODEL: 'provider:openai/gpt-4o', REVIEW_REASONING_EFFORT: 'max' },
+  }), [...claudeBase, '--model', 'provider:openai/gpt-4o', '--effort', 'max']);
+  assert.deepStrictEqual(resolveReviewRuntimeSelection({
+    model: 'from-cli', env: { REVIEW_MODEL: 'from-env', REVIEW_REASONING_EFFORT: 'low' },
+  }), { model: 'from-cli', reasoningEffort: 'low' });
+});
+
+test('empty, control-character, and illegal effort values fail closed', () => {
+  for (const selection of [
+    { model: '', env: {} },
+    { model: 'bad\nid', env: {} },
+    { model: 'has space', env: {} },
+    { reasoningEffort: 'turbo', env: {} },
+  ]) {
+    assert.throws(() => reviewAgentArgs('codex', runDir, null, selection), /FAIL-CLOSED/);
+  }
+  assert.throws(() => resolveReviewRuntimeSelection({ env: { REVIEW_REASONING_EFFORT: '' } }), /FAIL-CLOSED/);
+  assert.throws(() => resolveReviewRuntimeSelection({ env: { REVIEW_MODEL: 'ok\r' } }), /FAIL-CLOSED/);
+});
+
+test('declared_model strips router, gateway, and endpoint prefixes and stays self_reported', () => {
+  const samples = {
+    'agy-cli/gemini-3.8-flash': 'gemini-3.8-flash',
+    'auto/gpt-5.4': 'gpt-5.4',
+    'magpie/claude-sonnet': 'claude-sonnet',
+    'provider:openai/gpt-4o': 'gpt-4o',
+    'https://gateway.example/v1/models/gemini-2.5-pro': 'gemini-2.5-pro',
+    'gpt-5.4@2026-01-01': 'gpt-5.4',
+    'gemini-3.8-flash-high': 'gemini-3.8-flash-high',
+  };
+  for (const [raw, family] of Object.entries(samples)) {
+    assert.strictEqual(declaredModelFamily(raw), family);
+  }
+  const selfReported = resolveReviewerDeclaration(
+    { reviewer_execution: { status: 'unavailable' } },
+    { reviewer: { declared_model: 'agy-cli/gemini-3.8-flash', declared_provider: 'google', declaration_source: 'runtime_reported' } },
+    'codex', null, 'agy-cli/gemini-3.8-flash',
+  );
+  assert.strictEqual(selfReported.declaration_source, 'self_reported');
+  assert.strictEqual(selfReported.declared_model, 'gemini-3.8-flash');
+  assert.doesNotMatch(selfReported.declared_model, /[\/:@]/);
+  const runtime = resolveReviewerDeclaration(
+    { reviewer_execution: { status: 'runtime_reported', model: 'magpie/gpt-5', provider: 'openai', reasoning_effort: 'high', observation_id: 'obs-1' } },
+    null, 'codex', null, null,
+  );
+  assert.strictEqual(runtime.declaration_source, 'runtime_reported');
+  assert.strictEqual(runtime.declared_model, 'gpt-5');
+  assert.strictEqual(runtime.declared_reasoning_effort, 'high');
+});
+
+test('sanitized family passes loopx 2.3.0 reviewer declaration; the raw router id does not', () => {
+  const family = declaredModelFamily('agy-cli/gemini-3.8-flash');
+  const probe = spawnSync('python3', ['-c', `
+from loopx.capabilities.pr_review_queue.result_check import _reviewer_errors
+family, raw = ${JSON.stringify(family)}, "agy-cli/gemini-3.8-flash"
+def packet(model):
+    return {"actor_kind":"model_agent","declaration_source":"self_reported","declared_model":model,"declared_provider":"google"}
+ok = _reviewer_errors(packet(family), f"Reviewer: model_agent model {family} provider google declaration self_reported head abc\\n")
+bad = _reviewer_errors(packet(raw), "Reviewer: model_agent model agy-cli/gemini-3.8-flash provider google declaration self_reported head abc\\n")
+print("OK" if ok == [] else "UNEXPECTED " + ",".join(ok))
+print("BAD" if any("not_a_product_family_name" in item for item in bad) else "MISSING " + ",".join(bad))
+`], { encoding: 'utf8' });
+  assert.strictEqual(probe.status, 0, probe.stderr || probe.stdout);
+  assert.match(probe.stdout, /^OK\nBAD\n/);
+});
+
+test('isolatedGateEnv removes REVIEW_MODEL and REVIEW_REASONING_EFFORT', () => {
+  const clean = isolatedGateEnv({
+    PATH: '/usr/bin', REVIEW_MODEL: 'agy-cli/gemini-3.8-flash',
+    REVIEW_REASONING_EFFORT: 'high', REVIEW_SHORTCIRCUIT: '1', KEEP: 'yes',
+  });
+  assert.strictEqual(clean.REVIEW_MODEL, undefined);
+  assert.strictEqual(clean.REVIEW_REASONING_EFFORT, undefined);
+  assert.strictEqual(clean.REVIEW_SHORTCIRCUIT, undefined);
+  assert.strictEqual(clean.PATH, '/usr/bin');
+  assert.strictEqual(clean.KEEP, 'yes');
+});
+
+test('authentic-review --help and illegal CLI values fail closed before any review', () => {
+  const help = spawnSync(process.execPath, [SCRIPT, '--help'], { encoding: 'utf8' });
+  assert.strictEqual(help.status, 0, help.stderr);
+  for (const needle of ['--model', '--reasoning-effort', 'REVIEW_MODEL']) assert.match(help.stdout, new RegExp(needle));
+  const bad = spawnSync(process.execPath, [SCRIPT, '--pr', '1', '--repo', 'o/r', '--reasoning-effort', 'turbo'], { encoding: 'utf8' });
+  const empty = spawnSync(process.execPath, [SCRIPT, '--model'], { encoding: 'utf8' });
+  const cliBeatsEnv = spawnSync(process.execPath, [SCRIPT, '--reasoning-effort', 'nope'], {
+    encoding: 'utf8', env: { ...process.env, REVIEW_REASONING_EFFORT: 'low' },
+  });
+  for (const result of [bad, empty]) {
+    assert.notStrictEqual(result.status, 0);
+    assert.match(result.stderr, /FAIL-CLOSED/);
+  }
+  assert.notStrictEqual(cliBeatsEnv.status, 0);
+  assert.match(cliBeatsEnv.stderr, /非法值/);
+});
+
+test('loopx-flow review help, fail-closed, and flag forwarding', () => {
+  const help = spawnSync('bash', [FLOW, 'review', '--help'], { encoding: 'utf8' });
+  assert.strictEqual(help.status, 0, help.stderr);
+  for (const needle of ['--model <id>', '--reasoning-effort <level>', 'model_reasoning_effort', 'default-off']) {
+    assert.match(help.stdout, new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+  const cases = [
+    [['review', '12', '--reasoning-effort', 'turbo'], /FAIL-CLOSED/],
+    [['review', '12', '--model', ''], /FAIL-CLOSED/],
+    [['review', '12', '--model', 'bad\nid'], /控制字符/],
+  ];
+  for (const [argv, pattern] of cases) {
+    const result = spawnSync('bash', [FLOW, ...argv], { encoding: 'utf8' });
+    assert.notStrictEqual(result.status, 0);
+    assert.match(result.stderr, pattern);
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-flow-'));
+  const capture = path.join(dir, 'node-args');
+  fs.writeFileSync(path.join(dir, 'gh'), '#!/bin/sh\ncase "$*" in *repo*view*) echo owner/repo ;; *pr*view*) echo false ;; esac\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(dir, 'node'), `#!/bin/sh\nprintf '%s\\n' "$*" > ${JSON.stringify(capture)}\nexit 0\n`, { mode: 0o755 });
+  const forwarded = spawnSync('bash', [
+    FLOW, 'review', '12', '--model', 'agy-cli/gemini-3.8-flash', '--reasoning-effort', 'high', '--agent-bin', 'claude',
+  ], { encoding: 'utf8', env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, LOOPX_TMP_DIR: dir, REVIEW_MODEL: 'env-model' } });
+  try {
+    assert.strictEqual(forwarded.status, 0, forwarded.stderr || forwarded.stdout);
+    const args = fs.readFileSync(capture, 'utf8');
+    assert.match(args, /authentic-review\.js/);
+    assert.match(args, /--model agy-cli\/gemini-3\.8-flash/);
+    assert.match(args, /--reasoning-effort high/);
+    assert.match(args, /--agent-bin claude/);
+    assert.doesNotMatch(args, /env-model/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

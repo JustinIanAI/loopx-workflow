@@ -11,7 +11,10 @@ export interface ReviewAgentInvocation {
   /** 审查包来源：远端权威 diff（gh pr diff），禁止本地 working tree */
   prId: number;
   headOid: string;
-  /** codex exec | claude -p；一律使用 CLI 默认模型，禁止 -m/--model 指定 */
+  /** codex exec | claude -p。默认不传模型参数（default_off）。
+   *  仅当显式 --model / REVIEW_MODEL 或 --reasoning-effort / REVIEW_REASONING_EFFORT 时透传：
+   *  codex 使用 -m 与 -c model_reasoning_effort=；claude 使用 --model 与 --effort。
+   *  declared_model 只发布产品家族名，不携带 router/gateway/endpoint。 */
   agent: 'codex' | 'claude';
   prompt: string;            // 含 head_oid、胶囊契约摘要、JSON 输出协议要求
   timeoutMs: number;         // 默认 600_000
@@ -49,6 +52,9 @@ export interface AuthenticReviewResult {
 // INV2: 发布前 head 重读 gh pr view 必须与 headOid 一致（防漂移）
 // INV3: verdict 必须经 loopx pr-review --check-result（或 packet）核验后发布
 // INV4: reproducible 未清零 → verdict 上限 request_changes
+// INV5: 未传 --model/--reasoning-effort 且未设置 REVIEW_MODEL/REVIEW_REASONING_EFFORT 时，
+//       reviewAgentArgs() 与默认 argv 一致。空值、控制字符、非法 reasoning_effort Fail-Closed。
+//       无 reviewer_execution.status=runtime_reported 时 declaration_source 保持 self_reported。
 
 // ---------- 报告与组装层 ----------
 export interface FiveBlockReport {

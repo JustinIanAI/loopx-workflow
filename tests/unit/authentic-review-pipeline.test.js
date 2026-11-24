@@ -217,7 +217,12 @@ function run(sbx, args, envExtra) {
   delete env.REVIEW_KEEP_PROMPT;
   delete env.REVIEW_TWO_STAGE_ALIGNMENT;
   delete env.REVIEW_STDIN_BYTE_LIMIT;
-  if (envExtra) Object.assign(env, envExtra);
+  if (envExtra) {
+    for (const [key, value] of Object.entries(envExtra)) {
+      if (value == null) delete env[key];
+      else env[key] = value;
+    }
+  }
   try {
     const out = execFileSync('node', [SCRIPT, ...args], { env, encoding: 'utf8', cwd: PROJECT_ROOT, timeout: 120000 });
     return { code: 0, out };
@@ -231,7 +236,7 @@ const FEATURE = 'native-dispatch-deep-integration';
 describe('S1 invocation: codex exec with default model', () => {
   test('prompt carries head oid, remote diff and JSON protocol; no model flag', () => {
     const sbx = makeSandbox();
-    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { REVIEW_MODEL: null });
     assert.strictEqual(r.code, 0, r.out);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
     assert.match(calls, /codex exec --sandbox read-only/);
@@ -239,6 +244,39 @@ describe('S1 invocation: codex exec with default model', () => {
     assert.match(calls, /-o \S+ -$/m);
     assert.doesNotMatch(calls, /--add-dir/);
     assert.doesNotMatch(calls, /codex exec .*-m |codex exec .*--model /);
+    assert.doesNotMatch(calls, /model_reasoning_effort=/);
+  });
+
+  test('REVIEW_MODEL and REVIEW_REASONING_EFFORT are forwarded, declared_model is the product family', () => {
+    const sbx = makeSandbox();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {
+      REVIEW_MODEL: 'agy-cli/gemini-3.8-flash',
+      REVIEW_REASONING_EFFORT: 'low',
+    });
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /-m agy-cli\/gemini-3\.8-flash/);
+    assert.match(calls, /-c model_reasoning_effort=low/);
+    assert.match(r.out, /self_reported/);
+    assert.match(r.out, /model=gemini-3\.8-flash/);
+    assert.doesNotMatch(r.out, /model=agy-cli\//);
+  });
+
+  test('explicit CLI model and effort outrank env and map onto claude flags', () => {
+    const f = path.join(os.tmpdir(), 'claude-model-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'request_changes', findings: [] }));
+    const sbx = makeSandbox({ omitCodex: true, claudeStdoutFile: f, verdict: 'request_changes' });
+    const r = run(sbx, [
+      '--pr', '7', '--repo', 'o/r', '--feature', FEATURE,
+      '--agent-bin', 'claude', '--model', 'magpie/claude-sonnet', '--reasoning-effort', 'high',
+    ], { REVIEW_MODEL: 'env-model', REVIEW_REASONING_EFFORT: 'low' });
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /claude -p --tools Read --permission-mode dontAsk --add-dir \S+ --model magpie\/claude-sonnet --effort high/);
+    assert.doesNotMatch(calls, /--model env-model/);
+    assert.doesNotMatch(calls, /--effort low/);
+    assert.match(r.out, /model=claude-sonnet/);
+    assert.doesNotMatch(r.out, /model=magpie\//);
   });
 });
 
