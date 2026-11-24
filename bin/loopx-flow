@@ -145,12 +145,11 @@ usage() {
   status                  查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
   status --next [feature] 只读投影 + 下一步建议（不写 Goal/Todo/Lease/Gate，不是 resume）
   todo list [goal_id]     列出指定或当前 Goal 下的全部 Agent / User Todos
-  todo claim <tid>        申领排他租约 (task-lease acquire --owner 与代际 --idempotency-key)
-                          先读完 agent-directory 分页，再按 task-lease inspect 选键。
-                          活动租约且 owner 相同则复用当前键；过期、释放或不存在则换新代际键。
-                          可传 --idempotency-key 原样透传。多个身份时设置 LOOPX_AGENT_ID。
+  todo claim <tid>        受管认领 Todo (loopx todo claim)，缓存 claim_operation_id 五元组凭证
+                          先读完 agent-directory 分页解析已注册 owner；多个身份时设置 LOOPX_AGENT_ID。
                           未注册则 Fail-Closed，并打印 loopx register-agent ... --execute
-  todo done <tid>         标记任务完成并释放排他租约 (loopx todo --status done + task-lease release --expected-version)
+  todo done <tid>         受管完成 Todo (loopx todo complete)，优先复用 --claim-operation-id 或缓存凭证
+                          缓存缺失/失效时仅在有效且同 Owner 时自动补领；过期/释放/转让/deferred 一律停机
   help, --help, -h        显示本帮助信息
 
 USAGETXT
@@ -2510,115 +2509,6 @@ print_register_agent_repair() {
     echo -e "${YELLOW}    修复: loopx ${REGISTRY_FLAG} --format json register-agent --goal-id ${goal_q} --agent-id ${agent_q} --execute${NC}" >&2
 }
 
-# 幂等键：显式 --idempotency-key 原样透传。否则先看 inspect。
-# 活动且同一 owner 复用该代际键；过期、释放或其他代际用 epoch/version 生成下一把键。
-# 没有租约记录时，仍用 goal、todo、owner 的稳定键，方便首次申领重试。
-claim_idempotency_key() {
-    INSPECT_RAW="${5:-}" node - "$1" "$2" "$3" "$4" <<'NODE'
-const crypto = require("crypto");
-const [goalId, todoId, owner, explicit] = process.argv.slice(2);
-if (!goalId || !todoId || !owner) process.exit(2);
-const token = /^[A-Za-z0-9_.:@\/-]{1,160}$/;
-function emit(key) {
-  if (!token.test(key)) {
-    process.stderr.write("幂等键不是 LoopX public-safe token\n");
-    process.exit(3);
-  }
-  process.stdout.write(key);
-}
-if (explicit) {
-  emit(explicit);
-  process.exit(0);
-}
-function firstJson(text) {
-  const start = text.indexOf("{");
-  if (start < 0) return null;
-  let depth = 0, inStr = false, esc = false;
-  for (let i = start; i < text.length; i++) {
-    const c = text[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (c === "\\") esc = true;
-      else if (c === "\"") inStr = false;
-      continue;
-    }
-    if (c === "\"") { inStr = true; continue; }
-    if (c === "{") depth++;
-    else if (c === "}") {
-      depth--;
-      if (depth === 0) return text.slice(start, i + 1);
-    }
-  }
-  return null;
-}
-const raw = process.env.INSPECT_RAW || "";
-if (!raw) {
-  process.stderr.write("缺少 task-lease inspect 结果，已阻断申领\n");
-  process.exit(4);
-}
-let payload;
-try { payload = JSON.parse(firstJson(raw) || ""); }
-catch (_) {
-  process.stderr.write("task-lease inspect 输出不是 JSON，已阻断申领\n");
-  process.exit(4);
-}
-if (!payload || payload.ok !== true) {
-  const code = payload && payload.error_code ? payload.error_code : "inspect_failed";
-  process.stderr.write("task-lease inspect 失败: " + code + "\n");
-  process.exit(4);
-}
-const lease = payload.lease == null ? null : payload.lease;
-if (lease != null && (typeof lease !== "object" || Array.isArray(lease))) {
-  process.stderr.write("task-lease inspect 的 lease 字段无法解析，已阻断申领\n");
-  process.exit(4);
-}
-function digest(material) {
-  return crypto.createHash("sha256").update(material, "utf8").digest("hex");
-}
-const baseMaterial = goalId + "\n" + todoId + "\n" + owner;
-const baseKey = "loopx-flow:claim:" + digest(baseMaterial);
-function integerField(value, fallback) {
-  if (value == null || value === "") return fallback;
-  const number = typeof value === "number"
-    ? value
-    : (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value) ? Number(value) : NaN);
-  if (!Number.isSafeInteger(number) || number < 0) return null;
-  return number;
-}
-function timeActive(record) {
-  if (record.schema_version !== "task_lease_v0" || record.status !== "active") return false;
-  if (typeof record.expires_at !== "string") return null;
-  const expiresAt = Date.parse(record.expires_at);
-  if (!Number.isFinite(expiresAt)) return null;
-  return expiresAt > Date.now();
-}
-if (lease == null) {
-  emit(baseKey);
-  process.exit(0);
-}
-const active = timeActive(lease);
-if (active == null) {
-  process.stderr.write("活动租约缺少可解析的 expires_at，已阻断申领\n");
-  process.exit(4);
-}
-if (active === true && lease.owner === owner) {
-  if (typeof lease.idempotency_key !== "string") {
-    process.stderr.write("活动租约没有可复用的 idempotency_key，已阻断申领\n");
-    process.exit(4);
-  }
-  emit(lease.idempotency_key);
-  process.exit(0);
-}
-const epoch = integerField(lease.lease_epoch, 1);
-const version = integerField(lease.version, 0);
-if (epoch == null || version == null) {
-  process.stderr.write("租约代际 lease_epoch / version 无法解析，已阻断申领\n");
-  process.exit(4);
-}
-emit("loopx-flow:claim:" + digest(baseMaterial + "\n" + String(epoch) + "\n" + String(version) + "\nnext"));
-NODE
-}
-
 # 读完 agent-directory 的全部分页后再判定 owner。首页最多 24 行，诊断行会占满首页。
 # 成功时向 stdout 打印已注册 agent id。失败时打印修复指令并返回 1，不申领租约。
 resolve_claim_owner() {
@@ -2891,71 +2781,112 @@ cmd_todo() {
     esac
 }
 
-cmd_todo_lease() {
-    local mode="$1"
-    shift
-
-    local todo_id="" goal_id="" agent_id="" idempotency_key=""
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --goal-id)
-                if [[ $# -lt 2 ]]; then
-                    echo -e "${RED}[-] 错误: --goal-id 需要一个值。${NC}" >&2
-                    exit 1
-                fi
-                goal_id="$2"; shift 2 ;;
-            --owner|--agent-id)
-                if [[ $# -lt 2 ]]; then
-                    echo -e "${RED}[-] 错误: $1 需要一个值。${NC}" >&2
-                    exit 1
-                fi
-                agent_id="$2"; shift 2 ;;
-            --idempotency-key)
-                if [[ $# -lt 2 ]]; then
-                    echo -e "${RED}[-] 错误: --idempotency-key 需要一个 public-safe token。${NC}" >&2
-                    exit 1
-                fi
-                idempotency_key="$2"; shift 2 ;;
-            *)
-                if [[ -z "$todo_id" ]]; then todo_id="$1"; fi; shift ;;
-        esac
-    done
-
-    if [[ -z "$todo_id" ]]; then
-        echo -e "${RED}[-] 错误: 请指定 Todo ID，例如: loopx-flow todo claim todo_ab12cd34ef56${NC}" >&2
-        exit 1
+# 受管 Todo 认领/完成：只调用 LoopX 高层 `todo claim` / `todo complete`，
+# 底层 task-lease acquire/release/renew 一律不碰（ADR-0015 delete-first）。
+todo_claim_cache_path() {
+    local goal_id="$1" todo_id="$2"
+    if [[ -z "$goal_id" || -z "$todo_id" ]]; then
+        return 1
     fi
+    case "$goal_id" in
+        .|..|*/*|*$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    case "$todo_id" in
+        .|..|*/*|*$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    printf '%s/claims/%s--%s.json' "$LOOPX_TMP_DIR" "$goal_id" "$todo_id"
+}
 
-    if [[ -z "$goal_id" ]]; then
-        goal_id="$(resolve_goal_id)" || {
-            echo -e "${RED}[-] [FAIL-CLOSED] 无法推导 Goal ID: 当前分支非 feature/* 且未显式传入 --goal-id。${NC}" >&2
-            exit 1
-        }
-    fi
+canonical_registry_path() {
+    node -e '
+const fs = require("fs");
+const path = require("path");
+const raw = process.argv[1];
+const absolute = path.resolve(raw);
+try { process.stdout.write(fs.realpathSync(absolute)); }
+catch (_) { process.stdout.write(absolute); }
+' "$LOOPX_REGISTRY_PATH"
+}
 
-    if [[ "$mode" == "claim" ]]; then
-        echo -e "${BLUE}==> [租约流转] 正在申领排他租约: $todo_id @ $goal_id ...${NC}"
-        local owner="" inspect_raw="" explicit_key="$idempotency_key"
-        owner="$(resolve_claim_owner "$goal_id")" || exit 1
-        if [[ -z "$explicit_key" ]]; then
-            local inspect_rc=0
-            inspect_raw="$(run_loopx --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || inspect_rc=$?
-            if [[ "$inspect_rc" -ne 0 ]]; then
-                echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的租约状态，已阻断申领。${NC}" >&2
-                printf '%s\n' "$inspect_raw" >&2
-                exit 1
-            fi
-        fi
-        if ! idempotency_key="$(claim_idempotency_key "$goal_id" "$todo_id" "$owner" "$explicit_key" "$inspect_raw")"; then
-            echo -e "${RED}[-] [FAIL-CLOSED] 无法为 Todo ${todo_id} 生成 public-safe 幂等键，已阻断租约申领。${NC}" >&2
-            exit 1
-        fi
-        local acquire_out="" acquire_rc=0 acquire_code=""
-        acquire_out="$(run_loopx --format json task-lease acquire --goal-id "$goal_id" --todo-id "$todo_id" --owner "$owner" --idempotency-key "$idempotency_key" 2>&1)" || acquire_rc=$?
-        if [[ "$acquire_rc" -ne 0 ]]; then
-            printf '%s\n' "$acquire_out" >&2
-            acquire_code="$(ACQUIRE_OUT="$acquire_out" node - <<'NODE'
-const raw = process.env.ACQUIRE_OUT || "";
+write_todo_claim_cache() {
+    local cache_path="$1" op="$2" goal_id="$3" todo_id="$4" owner="$5" registry_path="$6" mode="$7"
+    mkdir -p "$(dirname "$cache_path")"
+    CLAIM_CACHE_PATH="$cache_path" node - "$op" "$goal_id" "$todo_id" "$owner" "$registry_path" "$mode" <<'NODE'
+const fs = require("fs");
+const [op, goalId, todoId, agentId, registryPath, handoffMode] = process.argv.slice(2);
+const target = process.env.CLAIM_CACHE_PATH;
+const payload = {
+  schema_version: "loopx_flow_claim_cache_v0",
+  claim_operation_id: op,
+  goal_id: goalId,
+  todo_id: todoId,
+  agent_id: agentId,
+  registry_path: registryPath,
+  handoff_mode: handoffMode,
+  created_at: new Date().toISOString()
+};
+const tmp = `${target}.tmp.${process.pid}`;
+try {
+  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, target);
+} catch (error) {
+  try { fs.unlinkSync(tmp); } catch (_) {}
+  process.stderr.write(`无法写入 claim 凭证缓存: ${error.message}\n`);
+  process.exit(1);
+}
+NODE
+}
+
+read_todo_claim_cache() {
+    local cache_path="$1" goal_id="$2" todo_id="$3" owner="$4" registry_path="$5" expected_mode="$6"
+    CLAIM_CACHE_PATH="$cache_path" CACHE_GOAL_ID="$goal_id" CACHE_TODO_ID="$todo_id" \
+        CACHE_AGENT_ID="$owner" CACHE_REGISTRY_PATH="$registry_path" CACHE_HANDOFF_MODE="$expected_mode" \
+        node <<'NODE'
+const fs = require("fs");
+const target = process.env.CLAIM_CACHE_PATH;
+const expected = {
+  goal_id: process.env.CACHE_GOAL_ID || "",
+  todo_id: process.env.CACHE_TODO_ID || "",
+  agent_id: process.env.CACHE_AGENT_ID || "",
+  registry_path: process.env.CACHE_REGISTRY_PATH || "",
+  handoff_mode: process.env.CACHE_HANDOFF_MODE || ""
+};
+if (!fs.existsSync(target)) {
+  process.stdout.write("missing\t凭证缓存不存在\n");
+  process.exit(0);
+}
+let payload;
+try {
+  payload = JSON.parse(fs.readFileSync(target, "utf8"));
+} catch (error) {
+  process.stdout.write(`invalid\t凭证缓存 JSON 损坏: ${error.message}\n`);
+  process.exit(0);
+}
+if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  process.stdout.write("invalid\t凭证缓存不是 JSON 对象\n");
+  process.exit(0);
+}
+if (payload.schema_version !== "loopx_flow_claim_cache_v0") {
+  process.stdout.write("invalid\t凭证缓存 schema_version 不兼容\n");
+  process.exit(0);
+}
+if (typeof payload.claim_operation_id !== "string" || !payload.claim_operation_id) {
+  process.stdout.write("invalid\t凭证缓存缺少 claim_operation_id\n");
+  process.exit(0);
+}
+for (const field of ["goal_id", "todo_id", "agent_id", "registry_path", "handoff_mode"]) {
+  if (payload[field] !== expected[field]) {
+    process.stdout.write(`invalid\t五元组字段 ${field} 不匹配: cache=${JSON.stringify(payload[field])} current=${JSON.stringify(expected[field])}\n`);
+    process.exit(0);
+  }
+}
+process.stdout.write(`ok\t${payload.claim_operation_id}\n`);
+NODE
+}
+
+parse_todo_claim_result() {
+    CLAIM_RAW="$1" node <<'NODE'
+const raw = process.env.CLAIM_RAW || "";
 function firstJson(text) {
   const start = text.indexOf("{");
   if (start < 0) return null;
@@ -2977,103 +2908,426 @@ function firstJson(text) {
   }
   return null;
 }
-let code = "";
-try {
-  const payload = JSON.parse(firstJson(raw) || "");
-  if (payload && typeof payload.error_code === "string") code = payload.error_code;
-} catch (_) {}
-if (!code) {
-  const matched = raw.match(/idempotency_key_reuse|todo_lease_conflict|write_scope_conflict|owner_not_registered/);
-  if (matched) code = matched[0];
+let payload;
+try { payload = JSON.parse(firstJson(raw) || ""); }
+catch (_) { process.stdout.write("bad\tclaim 返回不是可解析 JSON\n"); process.exit(0); }
+if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  process.stdout.write("bad\tclaim 返回不是 JSON 对象\n"); process.exit(0);
 }
-process.stdout.write(code);
+if (payload.ok !== true) {
+  process.stdout.write(`bad\tLoopX claim 拒绝: ${payload.error_code || "unknown"}\n`); process.exit(0);
+}
+if (payload.schema_version !== "loopx_coordination_todo_claim_result_v0") {
+  process.stdout.write(`bad\tclaim schema_version 不在白名单: ${payload.schema_version || "missing"}\n`); process.exit(0);
+}
+if (typeof payload.claim_operation_id !== "string" || !payload.claim_operation_id) {
+  process.stdout.write("bad\tclaim 返回缺少 claim_operation_id\n"); process.exit(0);
+}
+if (payload.handoff_mode !== "hard_lease" && payload.handoff_mode !== "soft_claim") {
+  process.stdout.write(`bad\tclaim handoff_mode 未知: ${payload.handoff_mode || "missing"}\n`); process.exit(0);
+}
+process.stdout.write(`ok\t${payload.claim_operation_id}\t${payload.handoff_mode}\n`);
 NODE
-)"
-            case "$acquire_code" in
-                idempotency_key_reuse)
-                    echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: LoopX 拒绝 idempotency_key_reuse。该幂等键属于已结束的租约代际，操作已阻断。${NC}" >&2
-                    ;;
-                todo_lease_conflict|write_scope_conflict)
-                    echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: Todo $todo_id 可能已被其他 Agent 持有，操作已阻断。${NC}" >&2
-                    ;;
-                *)
-                    if [[ -n "$acquire_code" ]]; then
-                        echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: LoopX 返回 ${acquire_code}，操作已阻断。${NC}" >&2
-                    else
-                        echo -e "${RED}[-] [FAIL-CLOSED] 租约申领失败: LoopX 拒绝了 task-lease acquire，操作已阻断。${NC}" >&2
-                    fi
-                    ;;
-            esac
-            exit 1
-        fi
-        printf '%s\n' "$acquire_out"
-        echo -e "${GREEN}[✓] 排他租约已获取 (ACQUIRED): $todo_id${NC}"
-    else
-        if [[ -z "$agent_id" ]]; then
-            agent_id="$(resolve_claim_owner "$goal_id")" || exit 1
-        fi
-        local inspect_json lease_meta lease_version lease_owner lease_status
-        inspect_json="$(run_loopx --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || {
-            echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的租约状态，拒绝变更 Todo 状态: $inspect_json${NC}" >&2
-            exit 1
-        }
-        lease_meta="$(node -e '
-const raw = process.argv[1] || "";
-const start = raw.indexOf("{");
-let d = {};
-if (start >= 0) {
-  try { d = JSON.parse(raw.slice(start)); } catch (_) { process.exit(1); }
-} else {
-  process.exit(1);
 }
-const lease = d.lease && typeof d.lease === "object" ? d.lease : null;
-const v = d.version ?? (lease && lease.version) ?? d.lease_version ?? (d.lease_state && d.lease_state.version) ?? "";
-const owner = (lease && lease.owner) || d.owner || "";
-const status = (lease && lease.status) || "";
-process.stdout.write([v === null || v === undefined ? "" : String(v), String(owner), String(status)].join("|"));
-' "$inspect_json" 2>/dev/null)" || {
-            echo -e "${RED}[-] [FAIL-CLOSED] task-lease inspect 输出不可解析，拒绝变更 Todo 状态。${NC}" >&2
-            exit 1
-        }
-        IFS="|" read -r lease_version lease_owner lease_status <<< "$lease_meta"
-        if [[ -z "$lease_version" ]]; then
-            echo -e "${RED}[-] [FAIL-CLOSED] 无法从 task-lease inspect 读取租约版本，拒绝变更 Todo 状态与盲释放。${NC}" >&2
-            exit 1
-        fi
-        if [[ "$lease_status" == "active" && -n "$lease_owner" && "$lease_owner" != "$agent_id" ]]; then
-            echo -e "${RED}[-] [FAIL-CLOSED] Todo ${todo_id} 活动租约由 ${lease_owner} 持有，与当前身份 ${agent_id} 不一致，拒绝完成与释放。${NC}" >&2
-            exit 1
-        fi
-        local identity_key=""
-        identity_key="$(node - "$goal_id" "$todo_id" "$agent_id" "$lease_version" "$idempotency_key" <<'NODE'
-const crypto = require("crypto");
-const [goalId, todoId, owner, version, explicit] = process.argv.slice(2);
-const token = /^[A-Za-z0-9_.:@\/-]{1,160}$/;
-if (explicit) {
-  if (!token.test(explicit)) {
-    process.stderr.write("幂等键不是 LoopX public-safe token\n");
-    process.exit(3);
+
+parse_todo_complete_result() {
+    COMPLETE_RAW="$1" node <<'NODE'
+const raw = process.env.COMPLETE_RAW || "";
+function firstJson(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === "\"") inStr = false;
+      continue;
+    }
+    if (c === "\"") { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
   }
-  process.stdout.write(explicit);
-  process.exit(0);
+  return null;
 }
-const digest = crypto.createHash("sha256")
-  .update(`${goalId}\n${todoId}\n${owner}\n${version}`, "utf8")
-  .digest("hex");
-process.stdout.write(`loopx-flow:release:${digest}`);
+let payload;
+try { payload = JSON.parse(firstJson(raw) || ""); }
+catch (_) { process.stdout.write("bad\tcomplete 返回不是可解析 JSON\n"); process.exit(0); }
+if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  process.stdout.write("bad\tcomplete 返回不是 JSON 对象\n"); process.exit(0);
+}
+if (payload.ok !== true) {
+  process.stdout.write(`bad\tLoopX complete 拒绝: ${payload.error_code || payload.reason_code || "unknown"}\n`); process.exit(0);
+}
+if (payload.schema_version !== "loopx_coordination_todo_terminal_lifecycle_result_v0") {
+  process.stdout.write(`bad\tcomplete schema_version 不在白名单: ${payload.schema_version || "missing"}\n`); process.exit(0);
+}
+if (payload.completed !== true || payload.status !== "done") {
+  process.stdout.write(`bad\tcomplete 未确认原子完成: status=${payload.status || "missing"} completed=${payload.completed}\n`); process.exit(0);
+}
+process.stdout.write("ok\n");
 NODE
-)" || exit 1
-        echo -e "${BLUE}==> [租约流转] 正在完成 Todo 并释放租约: $todo_id @ $goal_id (owner=$agent_id)...${NC}"
-        if ! run_loopx todo --goal-id "$goal_id" --todo-id "$todo_id" --status done; then
-            echo -e "${RED}[-] [FAIL-CLOSED] Todo 完成回写失败: ${todo_id}，租约保留以便重试。${NC}" >&2
-            exit 1
-        fi
-        if ! run_loopx task-lease release --goal-id "$goal_id" --todo-id "$todo_id" --owner "$agent_id" --idempotency-key "$identity_key" --expected-version "$lease_version"; then
-            echo -e "${RED}[-] [FAIL-CLOSED] 租约释放失败: ${todo_id}，请通过 task-lease inspect 人工核查。${NC}" >&2
-            exit 1
-        fi
-        echo -e "${GREEN}[✓] Todo 已完成且排他租约已释放 (RELEASED): $todo_id${NC}"
+}
+
+parse_todo_observation() {
+    INSPECT_RAW="$1" TODO_RAW="$2" node <<'NODE'
+const inspectRaw = process.env.INSPECT_RAW || "";
+const todoRaw = process.env.TODO_RAW || "";
+function firstJson(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === "\"") inStr = false;
+      continue;
+    }
+    if (c === "\"") { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+function parse(raw) {
+  try { return JSON.parse(firstJson(raw) || ""); } catch (_) { return null; }
+}
+const inspect = parse(inspectRaw);
+const todoPayload = parse(todoRaw);
+if (!inspect || typeof inspect !== "object" || Array.isArray(inspect)) {
+  process.stdout.write("bad\t无法解析 task-lease inspect\n"); process.exit(0);
+}
+if (inspect.ok !== true) {
+  process.stdout.write(`bad\ttask-lease inspect 拒绝: ${inspect.error_code || "unknown"}\n`); process.exit(0);
+}
+if (!todoPayload || typeof todoPayload !== "object" || Array.isArray(todoPayload)) {
+  process.stdout.write("bad\t无法解析 todo list\n"); process.exit(0);
+}
+if (todoPayload.ok !== true) {
+  process.stdout.write(`bad\ttodo list 拒绝: ${todoPayload.error_code || "unknown"}\n`); process.exit(0);
+}
+const todo = todoPayload.todo && typeof todoPayload.todo === "object" ? todoPayload.todo : null;
+if (!todo) {
+  process.stdout.write("bad\ttodo list 未返回目标 Todo\n"); process.exit(0);
+}
+const lease = inspect.lease && typeof inspect.lease === "object" ? inspect.lease : null;
+const mode = typeof inspect.handoff_mode === "string" ? inspect.handoff_mode : "";
+const active = inspect.active === true ? "true" : "false";
+const leaseStatus = lease && typeof lease.status === "string" ? lease.status : "";
+const leaseOwner = lease && typeof lease.owner === "string" ? lease.owner : "";
+const expiresAt = lease && typeof lease.expires_at === "string" ? lease.expires_at : "";
+const todoStatus = typeof todo.status === "string" ? todo.status : "";
+const todoClaimed = typeof todo.claimed_by === "string" ? todo.claimed_by : "";
+const todoDone = todo.done === true ? "true" : "false";
+process.stdout.write(["ok", mode, active, leaseStatus, leaseOwner, expiresAt, todoStatus, todoClaimed, todoDone].join("|") + "\n");
+NODE
+}
+
+emit_todo_q1_failure() {
+    local code="$1" action="$2" reason="$3" next_step="$4" inspect_raw="$5" todo_raw="$6" goal_id="$7" todo_id="$8" owner="$9"
+    Q1_CODE="$code" Q1_ACTION="$action" Q1_REASON="$reason" Q1_NEXT="$next_step" \
+        Q1_GOAL_ID="$goal_id" Q1_TODO_ID="$todo_id" Q1_OWNER="$owner" \
+        INSPECT_RAW="$inspect_raw" TODO_RAW="$todo_raw" node <<'NODE'
+const inspectRaw = process.env.INSPECT_RAW || "";
+const todoRaw = process.env.TODO_RAW || "";
+function firstJson(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === "\"") inStr = false;
+      continue;
+    }
+    if (c === "\"") { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+function parse(raw) {
+  try { return JSON.parse(firstJson(raw) || ""); } catch (_) { return null; }
+}
+const goalId = process.env.Q1_GOAL_ID || "";
+const todoId = process.env.Q1_TODO_ID || "";
+const owner = process.env.Q1_OWNER || "";
+const action = process.env.Q1_ACTION || "claim_task";
+const payload = {
+  ok: false,
+  schema_version: "loopx_flow_todo_q1_result_v0",
+  error_code: process.env.Q1_CODE || "claim_receipt_unavailable",
+  recovery: {
+    action,
+    execution_authority_granted: false,
+    reason: process.env.Q1_REASON || "",
+    next: process.env.Q1_NEXT || "",
+    claim: {
+      command: "loopx todo claim",
+      cli_args: ["--goal-id", goalId, "--todo-id", todoId, "--agent-id", owner, "--claimed-by", owner]
+    }
+  },
+  loopx_task_lease_inspect: parse(inspectRaw),
+  loopx_todo: parse(todoRaw)
+};
+process.stdout.write(`${JSON.stringify(payload)}\n`);
+NODE
+}
+
+cmd_todo_lease() {
+    local mode="$1"
+    shift
+
+    local todo_id="" goal_id="" agent_id="" claim_operation_id="" evidence=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --goal-id)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}[-] 错误: --goal-id 需要一个值。${NC}" >&2
+                    exit 1
+                fi
+                goal_id="$2"; shift 2 ;;
+            --owner|--agent-id)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}[-] 错误: $1 需要一个值。${NC}" >&2
+                    exit 1
+                fi
+                agent_id="$2"; shift 2 ;;
+            --claim-operation-id)
+                if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                    echo -e "${RED}[-] 错误: --claim-operation-id 需要一个非空值。${NC}" >&2
+                    exit 1
+                fi
+                claim_operation_id="$2"; shift 2 ;;
+            --evidence)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}[-] 错误: --evidence 需要一个值。${NC}" >&2
+                    exit 1
+                fi
+                evidence="$2"; shift 2 ;;
+            --idempotency-key|--idempotency-key=*)
+                echo -e "${RED}[-] [FAIL-CLOSED] --idempotency-key 已随 ADR-0015 退役；请使用受管 todo claim/complete。${NC}" >&2
+                exit 1 ;;
+            *)
+                if [[ -z "$todo_id" ]]; then todo_id="$1"; fi; shift ;;
+        esac
+    done
+
+    if [[ -z "$todo_id" ]]; then
+        echo -e "${RED}[-] 错误: 请指定 Todo ID，例如: loopx-flow todo claim todo_ab12cd34ef56${NC}" >&2
+        exit 1
     fi
+
+    if [[ -z "$goal_id" ]]; then
+        goal_id="$(resolve_goal_id)" || {
+            echo -e "${RED}[-] [FAIL-CLOSED] 无法推导 Goal ID: 当前分支非 feature/* 且未显式传入 --goal-id。${NC}" >&2
+            exit 1
+        }
+    fi
+
+    if [[ "$mode" == "claim" ]]; then
+        echo -e "${BLUE}==> [受管 Todo] 正在认领: $todo_id @ $goal_id ...${NC}"
+        local owner="" claim_out="" claim_rc=0 claim_meta
+        if [[ -n "$agent_id" ]]; then
+            owner="$(LOOPX_AGENT_ID="$agent_id" resolve_claim_owner "$goal_id")" || exit 1
+        else
+            owner="$(resolve_claim_owner "$goal_id")" || exit 1
+        fi
+        claim_out="$(run_loopx --format json todo claim --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$owner" --claimed-by "$owner" 2>&1)" || claim_rc=$?
+        if [[ "$claim_rc" -ne 0 ]]; then
+            printf '%s\n' "$claim_out" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] 受管 Todo 认领失败: LoopX 拒绝了 todo claim，操作已阻断。${NC}" >&2
+            exit 1
+        fi
+        claim_meta="$(parse_todo_claim_result "$claim_out")"
+        if [[ "$claim_meta" != ok$'\t'* ]]; then
+            printf '%s\n' "$claim_out" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] ${claim_meta#bad$'\t'}${NC}" >&2
+            exit 1
+        fi
+        local claim_op claim_mode cache_path registry_path
+        IFS=$'\t' read -r _ claim_op claim_mode <<< "$claim_meta"
+        if ! cache_path="$(todo_claim_cache_path "$goal_id" "$todo_id")"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal/Todo ID 含路径分隔符，拒绝写入 claim 凭证缓存。${NC}" >&2
+            exit 1
+        fi
+        registry_path="$(canonical_registry_path)"
+        if ! write_todo_claim_cache "$cache_path" "$claim_op" "$goal_id" "$todo_id" "$owner" "$registry_path" "$claim_mode"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] claim_operation_id 凭证缓存写入失败，拒绝放行。${NC}" >&2
+            exit 1
+        fi
+        printf '%s\n' "$claim_out"
+        echo -e "${GREEN}[✓] 受管 Todo 已认领 (CLAIMED): $todo_id (handoff_mode=$claim_mode)${NC}"
+        return 0
+    fi
+
+    # mode == done
+    if [[ -z "$agent_id" ]]; then
+        agent_id="$(resolve_claim_owner "$goal_id")" || exit 1
+    fi
+
+    local registry_path="" cache_path="" cache_meta="" cache_status="" cache_op="" cache_reason=""
+    registry_path="$(canonical_registry_path)"
+    if ! cache_path="$(todo_claim_cache_path "$goal_id" "$todo_id")"; then
+        echo -e "${RED}[-] [FAIL-CLOSED] Goal/Todo ID 含路径分隔符，无法定位 claim 凭证缓存。${NC}" >&2
+        exit 1
+    fi
+
+    local inspect_out="" inspect_rc=0 todo_out="" todo_rc=0 observation=""
+    inspect_out="$(run_loopx --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || inspect_rc=$?
+    if [[ "$inspect_rc" -ne 0 ]]; then
+        printf '%s\n' "$inspect_out" >&2
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的租约状态，拒绝变更 Todo 状态。${NC}" >&2
+        exit 1
+    fi
+    todo_out="$(run_loopx --format json todo list --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || todo_rc=$?
+    if [[ "$todo_rc" -ne 0 ]]; then
+        printf '%s\n' "$todo_out" >&2
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的当前状态，拒绝变更。${NC}" >&2
+        exit 1
+    fi
+    observation="$(parse_todo_observation "$inspect_out" "$todo_out")"
+    if [[ "$observation" != "ok|"* ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] ${observation#bad$'\t'}${NC}" >&2
+        exit 1
+    fi
+    local current_mode inspect_active lease_status lease_owner lease_expires todo_status todo_claimed todo_done
+    IFS="|" read -r _ current_mode inspect_active lease_status lease_owner lease_expires todo_status todo_claimed todo_done <<< "$observation"
+
+    local claim_op="" claim_source=""
+    if [[ -n "$claim_operation_id" ]]; then
+        claim_op="$claim_operation_id"
+        claim_source="explicit"
+    else
+        cache_meta="$(read_todo_claim_cache "$cache_path" "$goal_id" "$todo_id" "$agent_id" "$registry_path" "$current_mode")"
+        cache_status="${cache_meta%%$'\t'*}"
+        if [[ "$cache_status" == "ok" ]]; then
+            claim_op="${cache_meta#ok$'\t'}"
+            claim_source="cache"
+        else
+            cache_reason="${cache_meta#*$'\t'}"
+        fi
+    fi
+
+    if [[ -z "$claim_op" ]]; then
+        local same_owner="false" q1_code="claim_receipt_unavailable" q1_action="claim_task"
+        local q1_reason="无法确认有效且同 Owner 的 claim receipt；不得静默重新 claim。" q1_next=""
+        local expired="0"
+        if [[ -n "$lease_expires" ]]; then
+            expired="$(EXPIRES_AT="$lease_expires" node -e 'const t = Date.parse(process.env.EXPIRES_AT || ""); process.stdout.write(Number.isFinite(t) && t <= Date.now() ? "1" : "0");')"
+        fi
+        if [[ "$current_mode" == "soft_claim" ]]; then
+            if [[ "$todo_status" == "deferred" ]]; then
+                q1_code="todo_not_open"
+                q1_action="reopen_todo"
+                q1_reason="Todo 处于 deferred 挂起态；LoopX 拒绝直接认领或完成。"
+                q1_next="先由 Owner 执行: loopx todo update --status open --clear-resume-when --goal-id ${goal_id} --todo-id ${todo_id}，再显式重跑: loopx-flow todo claim ${todo_id} --goal-id ${goal_id}"
+            elif [[ "$todo_status" == "open" && "$todo_claimed" == "$agent_id" ]]; then
+                same_owner="true"
+            elif [[ -n "$todo_claimed" && "$todo_claimed" != "$agent_id" ]]; then
+                q1_code="owner_conflicts_with_claim"
+                q1_action="reconcile_lease_owner"
+                q1_reason="Todo 当前由 ${todo_claimed} 持有，与本次操作身份 ${agent_id} 不一致。"
+                q1_next="核对所有权后显式重跑: loopx-flow todo claim $todo_id --goal-id $goal_id"
+            else
+                q1_reason="Todo 当前未处于 ${agent_id} 的活跃认领态 (status=${todo_status:-unknown}, claimed_by=${todo_claimed:-none})。"
+                q1_next="核对现状后显式重跑: loopx-flow todo claim $todo_id --goal-id $goal_id"
+            fi
+        elif [[ "$current_mode" == "hard_lease" ]]; then
+            if [[ "$lease_status" == "released" ]]; then
+                q1_code="lease_released"
+                q1_reason="Todo 租约已释放 (released)；不得静默重新 claim。"
+                q1_next="核对现状后显式重跑: loopx-flow todo claim $todo_id --goal-id $goal_id"
+            elif [[ "$expired" == "1" ]]; then
+                q1_code="lease_expired"
+                q1_reason="Todo 租约已过期 (lease_state=expired)；不得静默重新 claim。"
+                q1_next="核对现状后显式重跑: loopx-flow todo claim $todo_id --goal-id $goal_id"
+            elif [[ -n "$lease_owner" && "$lease_owner" != "$agent_id" ]]; then
+                q1_code="owner_conflicts_with_claim"
+                q1_action="reconcile_lease_owner"
+                q1_reason="Todo 租约由 ${lease_owner} 持有，与本次操作身份 ${agent_id} 不一致。"
+                q1_next="先核对并 reconcile 所有权，再显式重跑: loopx-flow todo claim $todo_id --goal-id $goal_id"
+            elif [[ "$inspect_active" == "true" && "$lease_status" == "active" && "$lease_owner" == "$agent_id" ]]; then
+                same_owner="true"
+            elif [[ "$todo_status" == "deferred" ]]; then
+                q1_code="todo_not_open"
+                q1_action="reopen_todo"
+                q1_reason="Todo 处于 deferred 挂起态；LoopX 拒绝直接认领或完成。"
+                q1_next="先由 Owner 执行: loopx todo update --status open --clear-resume-when --goal-id ${goal_id} --todo-id ${todo_id}，再显式重跑: loopx-flow todo claim ${todo_id} --goal-id ${goal_id}"
+            else
+                q1_reason="无法确认有效且同 Owner 的活动租约 (active=${inspect_active}, lease_status=${lease_status:-none}, owner=${lease_owner:-none})。"
+                q1_next="核对现状后显式重跑: loopx-flow todo claim $todo_id --goal-id $goal_id"
+            fi
+        else
+            q1_reason="当前 handoff_mode 不是 hard_lease/soft_claim (${current_mode:-unknown})，无法复用 claim receipt。"
+            q1_next="核对 Goal handoff_mode 后显式重跑: loopx-flow todo claim $todo_id --goal-id $goal_id"
+        fi
+
+        if [[ "$same_owner" != "true" ]]; then
+            echo -e "${YELLOW}[i] ${cache_reason:-凭证缓存不可用}；已按 Q1 分流 B 停机，不静默重新 claim。${NC}" >&2
+            emit_todo_q1_failure "$q1_code" "$q1_action" "$q1_reason" "$q1_next" "$inspect_out" "$todo_out" "$goal_id" "$todo_id" "$agent_id"
+            echo -e "${RED}[-] [FAIL-CLOSED] ${q1_reason}${NC}" >&2
+            echo -e "${YELLOW}    LoopX recovery: action=${q1_action}${NC}" >&2
+            echo -e "${YELLOW}    恢复指引: ${q1_next}${NC}" >&2
+            exit 1
+        fi
+
+        echo -e "${YELLOW}[i] ${cache_reason:-凭证缓存不可用}；租约有效且同 Owner，按 Q1 分流 A 自动补领 receipt。${NC}" >&2
+        local reclaim_out="" reclaim_rc=0 reclaim_meta reclaim_op reclaim_mode
+        reclaim_out="$(run_loopx --format json todo claim --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent_id" --claimed-by "$agent_id" 2>&1)" || reclaim_rc=$?
+        if [[ "$reclaim_rc" -ne 0 ]]; then
+            printf '%s\n' "$reclaim_out" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] Q1 分流 A 自动补领失败: LoopX 拒绝了 todo claim。${NC}" >&2
+            exit 1
+        fi
+        reclaim_meta="$(parse_todo_claim_result "$reclaim_out")"
+        if [[ "$reclaim_meta" != ok$'\t'* ]]; then
+            printf '%s\n' "$reclaim_out" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] ${reclaim_meta#bad$'\t'}${NC}" >&2
+            exit 1
+        fi
+        IFS=$'\t' read -r _ reclaim_op reclaim_mode <<< "$reclaim_meta"
+        if ! write_todo_claim_cache "$cache_path" "$reclaim_op" "$goal_id" "$todo_id" "$agent_id" "$registry_path" "$reclaim_mode"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] 自动补领后的凭证缓存写入失败，拒绝放行。${NC}" >&2
+            exit 1
+        fi
+        claim_op="$reclaim_op"
+        claim_source="reclaimed"
+    fi
+
+    echo -e "${BLUE}==> [受管 Todo] 正在完成: $todo_id @ $goal_id (owner=$agent_id, claim=$claim_source)...${NC}"
+    local complete_out="" complete_rc=0 complete_meta
+    local -a complete_args=(--format json todo complete --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent_id" --claim-operation-id "$claim_op")
+    [[ -n "$evidence" ]] && complete_args+=(--evidence "$evidence")
+    complete_out="$(run_loopx "${complete_args[@]}" 2>&1)" || complete_rc=$?
+    if [[ "$complete_rc" -ne 0 ]]; then
+        printf '%s\n' "$complete_out" >&2
+        echo -e "${RED}[-] [FAIL-CLOSED] Todo 完成回写失败: ${todo_id}；LoopX 拒绝语义为唯一权威，未自动重新 claim。${NC}" >&2
+        exit 1
+    fi
+    complete_meta="$(parse_todo_complete_result "$complete_out")"
+    if [[ "$complete_meta" != "ok" ]]; then
+        printf '%s\n' "$complete_out" >&2
+        echo -e "${RED}[-] [FAIL-CLOSED] ${complete_meta#bad$'\t'}${NC}" >&2
+        exit 1
+    fi
+    rm -f -- "$cache_path" 2>/dev/null || true
+    printf '%s\n' "$complete_out"
+    echo -e "${GREEN}[✓] Todo 已完成且受管租约已原子释放 (DONE): $todo_id${NC}"
 }
 
 # 命令路由
