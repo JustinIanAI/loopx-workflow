@@ -19,7 +19,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const SCRIPT = path.join(PROJECT_ROOT, 'skills/code-review/scripts/authentic-review.js');
@@ -720,6 +720,52 @@ describe('P0-A1 gates env isolation', () => {
       else process.env.AUTHENTIC_REVIEW_GATES_BIN = prevBin;
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test('isolatedGateEnv strips LOOPX_TMP_DIR and LOOPX_KEEP_TMP before issue-8 runs', () => {
+    const { isolatedGateEnv } = require(SCRIPT);
+    const clean = isolatedGateEnv({
+      LOOPX_TMP_DIR: '/tmp/leak',
+      LOOPX_KEEP_TMP: '1',
+      REVIEW_SHORTCIRCUIT: '1',
+      KEEP_ME: 'ok',
+    });
+    assert.strictEqual(clean.LOOPX_TMP_DIR, undefined);
+    assert.strictEqual(clean.LOOPX_KEEP_TMP, undefined);
+    assert.strictEqual(clean.REVIEW_SHORTCIRCUIT, undefined);
+    assert.strictEqual(clean.KEEP_ME, 'ok');
+
+    const leaked = path.join(os.tmpdir(), 'loopx-gate-env-leak');
+    const env = isolatedGateEnv({
+      ...process.env,
+      LOOPX_TMP_DIR: leaked,
+      LOOPX_KEEP_TMP: '1',
+      REVIEW_SHORTCIRCUIT: '1',
+    });
+    delete env.NODE_TEST_CONTEXT;
+    assert.strictEqual(env.LOOPX_TMP_DIR, undefined);
+    assert.strictEqual(env.LOOPX_KEEP_TMP, undefined);
+    assert.strictEqual(env.REVIEW_SHORTCIRCUIT, undefined);
+    const res = spawnSync(process.execPath, [
+      '--test',
+      '--test-concurrency=1',
+      'tests/unit/issues/issue-8.test.js',
+    ], {
+      cwd: PROJECT_ROOT,
+      env,
+      encoding: 'utf8',
+    });
+    assert.strictEqual(res.status, 0, `${res.stdout}\n${res.stderr}`);
+    assert.match(res.stdout, /D2 gc/);
+    assert.match(res.stdout, /# fail 0/);
+  });
+
+  test('stage2 manifest includes priorEntries with the sandbox and stage2 files', () => {
+    const src = fs.readFileSync(SCRIPT, 'utf8');
+    assert.match(
+      src,
+      /const stage2Manifest = formatArtifactManifest\(\[\.\.\.sandboxEntries, \.\.\.priorEntries, \.\.\.stage2Entries\]\);/,
+    );
   });
 });
 

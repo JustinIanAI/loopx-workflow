@@ -548,6 +548,11 @@ function isolatedGateEnv(baseEnv = process.env) {
   delete clean.REVIEW_UPSERT_PUBLISH;
   delete clean.REVIEW_BACKOFF_BASE_MS;
   delete clean.REVIEW_MAX_RETRIES;
+  // bin/loopx-flow exports these for its own run directory. gates() spawns
+  // `npm test`; inheriting them points issue-8 at a foreign sandbox and caps
+  // the review verdict on a false failure.
+  delete clean.LOOPX_TMP_DIR;
+  delete clean.LOOPX_KEEP_TMP;
   delete clean.REVIEW_MODEL;
   delete clean.REVIEW_REASONING_EFFORT;
   return clean;
@@ -980,7 +985,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '- 判断类 id 由你独立核实后在 `evidence` 中填写；未核实或形状不完整的项将保持 `status: "unverified"`，主机绝不预填或回填占位句：',
     evidenceRequirements || '(本 PR 无额外 evidence requirements)',
     '',
-    hasManifest ? '## 证据采集命令（运行结果见沙箱文件 evidence-output.md）' : '## 证据采集命令（下方已附运行结果）',
+    hasManifest ? '## 证据采集命令（运行结果见沙箱文件 evidence-output.md）' : '## 证据采集命令（运行结果不内联进 stdin）',
     evdCmds,
     '',
     '## 上轮 findings 裁决（有上轮 findings 时必须逐条）',
@@ -1725,7 +1730,7 @@ function main() {
     const stage2Entries = materializeReviewSandbox(runDir, {
       'stage1-review.md': String(modelOut.review_body || ''),
     });
-    const stage2Manifest = formatArtifactManifest([...sandboxEntries, ...stage2Entries]);
+    const stage2Manifest = formatArtifactManifest([...sandboxEntries, ...priorEntries, ...stage2Entries]);
     const stage2Prompt = buildStage2Prompt({
       pr: o.pr,
       headOid,
