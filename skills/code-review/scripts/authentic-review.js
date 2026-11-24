@@ -235,12 +235,39 @@ function parseArgs(argv) {
     else if (a === '--pr') o.pr = argv[++i];
     else if (a === '--repo') o.repo = argv[++i];
     else if (a === '--feature') o.feature = argv[++i];
-    else if (a === '--agent-bin') o.agentBin = argv[++i];
+    else if (a === '--agent-bin' || a.startsWith('--agent-bin=')) {
+      if (!a.startsWith('--agent-bin=')) o.agentBin = argv[++i];
+      else o.agentBin = a.slice(a.indexOf('=') + 1);
+      if (!o.agentBin || String(o.agentBin).startsWith('--')) { console.error('[FAIL-CLOSED] --agent-bin 需要 codex 或 claude'); process.exit(1); }
+    }
     else if (a === '--packet-file') o.packetFile = argv[++i];
     else if (a === '--force-recheck') o.forceRecheck = true;
+    else if (a === '--help' || a === '-h') o.help = true;
+    else if (/^--(model|reasoning-effort)(=|$)/.test(a)) {
+      const eq = a.indexOf('=');
+      const name = eq < 0 ? a : a.slice(0, eq);
+      const key = name === '--model' ? 'model' : 'reasoningEffort';
+      if (eq >= 0) o[key] = a.slice(eq + 1);
+      else o[key] = (argv[i + 1] == null || String(argv[i + 1]).startsWith('--')) ? '' : argv[++i];
+    }
   }
   return o;
 }
+
+const REVIEW_CLI_HELP = [
+  '用法: node authentic-review.js --pr <id> --repo <owner/repo> [options]',
+  '',
+  '可选参数（default-off：未传且未设置对应环境变量时，不向 codex/claude 附加模型参数）:',
+  '  --model <id>                 透传模型。优先级: 该参数 > REVIEW_MODEL > runtime 默认',
+  '                               codex: -m <id>；claude: --model <id>',
+  '  --reasoning-effort <level>   透传推理强度。优先级: 该参数 > REVIEW_REASONING_EFFORT > runtime 默认',
+  '                               允许: none|minimal|low|medium|high|xhigh|max|ultra',
+  '                               codex: -c model_reasoning_effort=<level>；claude: --effort <level>',
+  '  --agent-bin <codex|claude>   审查执行器，默认 codex（或 REVIEW_AGENT_BIN）',
+  '',
+  '空值、换行/空白/控制字符、非法 reasoning-effort 一律 Fail-Closed。',
+  '传给 CLI 的是原始模型 ID；result.json 与 Reviewer 行的 declared_model 只保留产品家族名。',
+].join('\n');
 
 function sh(bin, args, timeoutMs, env, input) {
   return spawnSync(bin, args, {
@@ -526,6 +553,8 @@ function isolatedGateEnv(baseEnv = process.env) {
   // the review verdict on a false failure.
   delete clean.LOOPX_TMP_DIR;
   delete clean.LOOPX_KEEP_TMP;
+  delete clean.REVIEW_MODEL;
+  delete clean.REVIEW_REASONING_EFFORT;
   return clean;
 }
 
@@ -603,13 +632,16 @@ function runEvidenceCommands(evidenceCommands) {
 }
 
 function readConfiguredReviewModel() {
-  const clean = (v) => String(v || '').replace(/[\r\n]+/g, '-').replace(/[\/:@`]/g, '-').trim();
-  if (process.env.REVIEW_MODEL) return clean(process.env.REVIEW_MODEL);
+  const raw = (v) => {
+    const s = String(v || '').trim();
+    return s || null;
+  };
+  if (process.env.REVIEW_MODEL) return raw(process.env.REVIEW_MODEL);
   try {
     const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     const text = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
     const m = text.match(/^model\s*=\s*"([^"]+)"/m);
-    return m ? clean(m[1]) : null;
+    return m ? raw(m[1]) : null;
   } catch (_) { return null; }
 }
 
@@ -816,16 +848,88 @@ function formatRemoteChecksText(remoteChecks, remoteChecksError) {
   return remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)';
 }
 
+// loopx 2.3.0 reasoning_effort.REASONING_EFFORTS。非法值 Fail-Closed，不静默降级。
+const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const REASONING_EFFORT_SET = new Set(REASONING_EFFORTS);
+const DECLARED_MODEL_PREFIXES = [/^agy-cli\//i, /^auto\//i, /^magpie\//i, /^provider:/i];
+
+function failClosed(message) {
+  const err = new Error(`[FAIL-CLOSED] ${message}`);
+  err.failClosed = true;
+  return err;
+}
+
+function assertPlainToken(value, label) {
+  const s = String(value);
+  if (s.trim() === '') throw failClosed(`${label} 为空，拒绝执行`);
+  if (/[\u0000-\u001F\u007F]/.test(s) || /\s/.test(s)) {
+    throw failClosed(`${label} 含换行、空白或控制字符，拒绝执行`);
+  }
+  return s.trim();
+}
+
+// CLI 显式值优先于环境变量；两者都缺省时返回 null，调用方不得追加参数（default-off）。
+function resolveReviewRuntimeSelection(selection) {
+  const input = selection || {};
+  const env = input.env || process.env;
+  const modelSource = Object.prototype.hasOwnProperty.call(input, 'model')
+    ? input.model
+    : (Object.prototype.hasOwnProperty.call(env, 'REVIEW_MODEL') ? env.REVIEW_MODEL : null);
+  const effortSource = Object.prototype.hasOwnProperty.call(input, 'reasoningEffort')
+    ? input.reasoningEffort
+    : (Object.prototype.hasOwnProperty.call(env, 'REVIEW_REASONING_EFFORT') ? env.REVIEW_REASONING_EFFORT : null);
+  const model = modelSource == null ? null : assertPlainToken(modelSource, '--model / REVIEW_MODEL');
+  let reasoningEffort = null;
+  if (effortSource != null) {
+    reasoningEffort = assertPlainToken(effortSource, '--reasoning-effort / REVIEW_REASONING_EFFORT');
+    if (!REASONING_EFFORT_SET.has(reasoningEffort)) {
+      throw failClosed(`--reasoning-effort / REVIEW_REASONING_EFFORT 非法值 "${reasoningEffort}"，允许: ${REASONING_EFFORTS.join('|')}`);
+    }
+  }
+  return { model, reasoningEffort };
+}
+
+// 发布用产品家族名。原始模型 ID 仍原样传给 CLI。剥离 router/gateway/协议前缀与 URL，
+// 去掉 model@version 的版本限定，使 declared_model 通过 loopx REVIEWER_DECLARATION（禁止 / : @）。
+function declaredModelFamily(value, fallback) {
+  let s = String(value == null ? '' : value).trim();
+  if (!s) s = String(fallback == null ? '' : fallback).trim();
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  s = s.split(/[?#]/)[0].trim();
+  for (let i = 0; i < 8; i += 1) {
+    const next = DECLARED_MODEL_PREFIXES.reduce((acc, re) => acc.replace(re, ''), s).trim();
+    if (next === s) break;
+    s = next;
+  }
+  if (s.includes('/')) {
+    const parts = s.split('/').filter(Boolean);
+    s = parts.length ? parts[parts.length - 1] : s;
+  }
+  if (s.includes('@')) s = s.split('@')[0];
+  s = s.replace(/[\u0000-\u001F\u007F]/g, '').replace(/[\/:@`]/g, '').trim();
+  if (!s) {
+    const fb = String(fallback == null ? '' : fallback).replace(/[\/:@`]/g, '').trim();
+    return fb || 'codex';
+  }
+  return s;
+}
+
 // codex --add-dir 在 `codex exec --help` 中是可写附加目录，故不用它。
 // 只读边界：`--sandbox read-only` + `-C <runDir>`。claude 仅开放 Read，并用 --add-dir 访问沙箱。
-function reviewAgentArgs(agentBin, runDir, tmpMsg) {
+// selection 缺省时读取 REVIEW_MODEL / REVIEW_REASONING_EFFORT；都未设置则 argv 与历史默认完全一致。
+function reviewAgentArgs(agentBin, runDir, tmpMsg, selection) {
+  const { model, reasoningEffort } = resolveReviewRuntimeSelection(selection);
   if (String(agentBin || '').includes('claude')) {
     const args = ['-p', '--tools', 'Read', '--permission-mode', 'dontAsk'];
     if (runDir && runDir.dir) args.push('--add-dir', runDir.dir);
+    if (model) args.push('--model', model);
+    if (reasoningEffort) args.push('--effort', reasoningEffort);
     return args;
   }
   const args = ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral'];
   if (runDir && runDir.dir) args.push('-C', runDir.dir);
+  if (model) args.push('-m', model);
+  if (reasoningEffort) args.push('-c', `model_reasoning_effort=${reasoningEffort}`);
   if (tmpMsg) args.push('-o', tmpMsg);
   args.push('-');
   return args;
@@ -1001,7 +1105,7 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
   ].join('\n');
 }
 
-function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText) {
+function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, selection) {
   const resolvedBin = findOnPath(agentBin, process.env.PATH);
   if (!resolvedBin) return { unavailable: true };
   const compact = assertCompactStdin(prompt);
@@ -1023,7 +1127,12 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText) {
       tmpMsg = path.join(tmpRoot, `codex-review-${process.pid}-${crypto.randomBytes(6).toString('hex')}.txt`);
     }
   }
-  const args = reviewAgentArgs(agentBin, runDir, tmpMsg);
+  let args;
+  try {
+    args = reviewAgentArgs(agentBin, runDir, tmpMsg, selection);
+  } catch (err) {
+    return { error: err && err.message ? err.message : String(err) };
+  }
   try {
     const r = spawnSync(resolvedBin, args, {
       input: String(prompt || ''),
@@ -1212,8 +1321,8 @@ function bodyFormatPasses(checkReport) {
 // 仅当 LoopX 运行时（packet.reviewer_execution.status === 'runtime_reported'）才声明
 // runtime_reported，并携带 model/provider/reasoning_effort/observation_id；
 // 第三方模型自报（无运行时绑定）一律 self_reported，禁止伪造运行时观测。
-function resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel) {
-  const sanitize = (value, fallback) => {
+function resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel, explicitRawModel) {
+  const sanitizeName = (value, fallback) => {
     const s = String(value || fallback || '').replace(/[\/:@\r\n`]/g, '-').trim();
     return s || String(fallback || '');
   };
@@ -1222,20 +1331,22 @@ function resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredMo
     return {
       actor_kind: 'model_agent',
       declaration_source: 'runtime_reported',
-      declared_model: sanitize(execution.model, configuredModel || primaryAgent),
-      declared_provider: sanitize(execution.provider, 'openai'),
-      declared_reasoning_effort: sanitize(execution.reasoning_effort, 'effort_unavailable'),
-      execution_observation_id: sanitize(execution.observation_id, 'observation-unavailable'),
+      declared_model: declaredModelFamily(execution.model, explicitRawModel || configuredModel || primaryAgent),
+      declared_provider: sanitizeName(execution.provider, 'openai'),
+      declared_reasoning_effort: sanitizeName(execution.reasoning_effort, 'effort_unavailable'),
+      execution_observation_id: sanitizeName(execution.observation_id, 'observation-unavailable'),
     };
   }
   const modelDecl = modelOut && modelOut.reviewer && typeof modelOut.reviewer === 'object'
     ? modelOut.reviewer
     : null;
+  const reported = modelDecl && modelDecl.declared_model;
+  const raw = explicitRawModel || reported || configuredModel || primaryAgent;
   return {
     actor_kind: 'model_agent',
     declaration_source: 'self_reported',
-    declared_model: sanitize(modelDecl && modelDecl.declared_model, configuredModel || primaryAgent),
-    declared_provider: sanitize(modelDecl && modelDecl.declared_provider, 'openai'),
+    declared_model: declaredModelFamily(raw, primaryAgent || 'codex'),
+    declared_provider: sanitizeName(modelDecl && modelDecl.declared_provider, 'openai'),
   };
 }
 
@@ -1327,6 +1438,20 @@ function acceptModelOutput(raw) {
 // ---------------------------------------------------------------------------
 function main() {
   const o = parseArgs(process.argv);
+  if (o.help) {
+    console.log(REVIEW_CLI_HELP);
+    process.exit(0);
+  }
+  let runtimeSelection;
+  try {
+    const cliSelection = {};
+    if (Object.prototype.hasOwnProperty.call(o, 'model')) cliSelection.model = o.model;
+    if (Object.prototype.hasOwnProperty.call(o, 'reasoningEffort')) cliSelection.reasoningEffort = o.reasoningEffort;
+    runtimeSelection = resolveReviewRuntimeSelection(cliSelection);
+  } catch (err) {
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  }
 
   // PR 提交版式预览（对齐 PR #7545 双语 4-Part）
   const repoRoot = resolveRepoRoot(process.cwd());
@@ -1529,11 +1654,11 @@ function main() {
     artifactManifest,
   });
 
-  // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
+  // --- 4. 跑真实模型审查（default-off：仅显式 CLI/env 才附加 -m/--model 与 reasoning effort）---
   const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || 'codex';
   const stage1PromptFile = writePromptArtifact(runDir, o.pr, headOid, prompt, 'stage1');
   console.log(`[i] 阶段 1 评审提示词已写入沙箱文件: ${stage1PromptFile} (通过 stdin 流式传入 ${primaryAgent})`);
-  const agentRun = runReviewAgent(primaryAgent, prompt, undefined, runDir, diff);
+  const agentRun = runReviewAgent(primaryAgent, prompt, undefined, runDir, diff, runtimeSelection);
   if (agentRun.unavailable) {
     console.error(`[NOT_VERIFIED] ${primaryAgent} CLI unavailable; refusing to publish an unreviewed report.`);
     process.exit(1);
@@ -1556,7 +1681,7 @@ function main() {
   const findings = modelOut.findings;
   // 声明来源由宿主运行时裁决，不信任模型自报的 runtime_reported（原生 reviewer_declaration 契约）。
   const configuredModel = primaryAgent.includes('claude') ? null : readConfiguredReviewModel();
-  const reviewer = resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel);
+  const reviewer = resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel, runtimeSelection.model);
   console.log(`[i] Reviewer 声明: ${reviewer.declaration_source} · model=${reviewer.declared_model} · provider=${reviewer.declared_provider}`);
 
   // 模型若携带 headOid 且与当前 PR head 不一致 -> 视为 head 漂移，fail-closed（INV2）
@@ -1623,7 +1748,7 @@ function main() {
     });
     const stage2PromptFile = writePromptArtifact(runDir, o.pr, headOid, stage2Prompt, 'stage2');
     console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length + unverifiedValidationCases.length} 项): ${stage2PromptFile}`);
-    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt, undefined, runDir, diff);
+    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt, undefined, runDir, diff, runtimeSelection);
     if (stage2Run.truncated || stage2Run.stdinRejected) {
       console.error(`[NOT_VERIFIED] 阶段 2 拒绝发布：${stage2Run.error}`);
       process.exit(1);
@@ -1697,7 +1822,7 @@ function main() {
   if (o.crossValidate) {
     const secondaryAgent = primaryAgent.includes('claude') ? 'codex' : 'claude';
     console.log(`==> [S5] Cross-validating with ${secondaryAgent} (default model)...`);
-    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir, diff);
+    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir, diff, { model: null, reasoningEffort: null });
     if (cv.truncated || cv.stdinRejected) {
       console.error(`[NOT_VERIFIED] 交叉核验命中截断或 stdin 超限，拒绝发布：${cv.error}`);
       process.exit(1);
@@ -1835,4 +1960,7 @@ module.exports = {
   resolveReviewPolicyRevision,
   isolatedGateEnv,
   gates,
+  resolveReviewRuntimeSelection,
+  declaredModelFamily,
+  resolveReviewerDeclaration,
 };

@@ -208,7 +208,6 @@ function run(sbx, args, envExtra) {
     ...process.env,
     PATH: `${sbx.bin}:${process.env.PATH}`,
     AUTHENTIC_REVIEW_HEAD_OID: HEAD,
-    REVIEW_MODEL: 'codex',
     LOOPX_TMP_DIR: sbx.tmpDir,
   };
   delete env.REVIEW_SHORTCIRCUIT;
@@ -217,6 +216,8 @@ function run(sbx, args, envExtra) {
   delete env.REVIEW_KEEP_PROMPT;
   delete env.REVIEW_TWO_STAGE_ALIGNMENT;
   delete env.REVIEW_STDIN_BYTE_LIMIT;
+  delete env.REVIEW_MODEL;
+  delete env.REVIEW_REASONING_EFFORT;
   if (envExtra) Object.assign(env, envExtra);
   try {
     const out = execFileSync('node', [SCRIPT, ...args], { env, encoding: 'utf8', cwd: PROJECT_ROOT, timeout: 120000 });
@@ -239,6 +240,39 @@ describe('S1 invocation: codex exec with default model', () => {
     assert.match(calls, /-o \S+ -$/m);
     assert.doesNotMatch(calls, /--add-dir/);
     assert.doesNotMatch(calls, /codex exec .*-m |codex exec .*--model /);
+    assert.doesNotMatch(calls, /model_reasoning_effort=/);
+  });
+
+  test('REVIEW_MODEL and REVIEW_REASONING_EFFORT are forwarded, declared_model is the product family', () => {
+    const sbx = makeSandbox();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {
+      REVIEW_MODEL: 'agy-cli/gemini-3.8-flash',
+      REVIEW_REASONING_EFFORT: 'low',
+    });
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /-m agy-cli\/gemini-3\.8-flash/);
+    assert.match(calls, /-c model_reasoning_effort=low/);
+    assert.match(r.out, /self_reported/);
+    assert.match(r.out, /model=gemini-3\.8-flash/);
+    assert.doesNotMatch(r.out, /model=agy-cli\//);
+  });
+
+  test('explicit CLI model and effort outrank env and map onto claude flags', () => {
+    const f = path.join(os.tmpdir(), 'claude-model-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'request_changes', findings: [] }));
+    const sbx = makeSandbox({ omitCodex: true, claudeStdoutFile: f, verdict: 'request_changes' });
+    const r = run(sbx, [
+      '--pr', '7', '--repo', 'o/r', '--feature', FEATURE,
+      '--agent-bin=claude', '--model=magpie/claude-sonnet', '--reasoning-effort=high',
+    ], { REVIEW_MODEL: 'env-model', REVIEW_REASONING_EFFORT: 'low' });
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /claude -p --tools Read --permission-mode dontAsk --add-dir \S+ --model magpie\/claude-sonnet --effort high/);
+    assert.doesNotMatch(calls, /--model env-model/);
+    assert.doesNotMatch(calls, /--effort low/);
+    assert.match(r.out, /model=claude-sonnet/);
+    assert.doesNotMatch(r.out, /model=magpie\//);
   });
 });
 
@@ -492,6 +526,16 @@ describe('S5 cross validation', () => {
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--cross-validate']);
     assert.strictEqual(r.code, 0, r.out);
     assert.match(r.out, /DISPUTED|cross|CROSS/i);
+  });
+
+  test('--cross-validate secondary agent does not inherit --model or --reasoning-effort', () => {
+    const sbx = makeSandbox();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--cross-validate', '--model', 'magpie/only-primary', '--reasoning-effort', 'high']);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /\/codex .*-m magpie\/only-primary .*model_reasoning_effort=high/);
+    const secondary = calls.split('\n').find((line) => line.includes('/claude ') && line.includes('--add-dir'));
+    assert.ok(secondary && !/--model|--effort|only-primary/.test(secondary), secondary);
   });
 });
 describe('R3 carryover adjudication', () => {

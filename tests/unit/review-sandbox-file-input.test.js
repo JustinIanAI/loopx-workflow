@@ -81,12 +81,14 @@ test('oversized stdin is rejected before the agent process starts', () => {
 
 test('codex stays read-only and claude is limited to Read on the sandbox', () => {
   const runDir = { dir: '/sandbox/review-pr57-abc' };
-  const codex = reviewAgentArgs('codex', runDir, '/sandbox/review-pr57-abc/out.txt');
+  const off = { env: {} };
+  const codex = reviewAgentArgs('codex', runDir, '/sandbox/review-pr57-abc/out.txt', off);
   assert.deepStrictEqual(codex.slice(0, 7), ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral', '-C', runDir.dir]);
   assert.ok(codex.includes('-o'));
   assert.strictEqual(codex.at(-1), '-');
   assert.ok(!codex.includes('--add-dir'));
-  const claude = reviewAgentArgs('claude', runDir, null);
+  assert.ok(!codex.includes('-m'));
+  const claude = reviewAgentArgs('claude', runDir, null, off);
   assert.deepStrictEqual(claude, ['-p', '--tools', 'Read', '--permission-mode', 'dontAsk', '--add-dir', runDir.dir]);
 });
 
@@ -102,13 +104,14 @@ test('runReviewAgent spawns both backends with the read-only argv and flags trun
   const runDir = makeRunDir(path.join(dir, 'run'));
   fs.mkdirSync(runDir.dir, { recursive: true });
   try {
-    const codexRun = runReviewAgent('codex', 'compact prompt', 5000, runDir);
+    const codexRun = runReviewAgent('codex', 'compact prompt', 5000, runDir, undefined, { env: {} });
     assert.strictEqual(codexRun.stdout.trim(), 'ok');
     const codexArgs = fs.readFileSync(path.join(dir, 'codex.args'), 'utf8');
     assert.match(codexArgs, /exec --sandbox read-only/);
     assert.match(codexArgs, /-C /);
     assert.doesNotMatch(codexArgs, /--add-dir/);
-    const claudeRun = runReviewAgent('claude', 'compact prompt', 5000, runDir);
+    assert.doesNotMatch(codexArgs, /(^| )-m /);
+    const claudeRun = runReviewAgent('claude', 'compact prompt', 5000, runDir, undefined, { env: {} });
     assert.strictEqual(claudeRun.truncated, true);
     const claudeArgs = fs.readFileSync(path.join(dir, 'claude.args'), 'utf8');
     assert.match(claudeArgs, /-p --tools Read --permission-mode dontAsk --add-dir /);
