@@ -173,10 +173,27 @@ test('realistic packet stays inside 64KB without inlining checks or prior findin
     });
     assert.ok(Buffer.byteLength(prompt) <= stdinByteLimit());
     assert.match(prompt, /证据采集命令（运行结果见沙箱文件 evidence-output.md）/);
+    assert.doesNotMatch(prompt, /下方已附运行结果/);
     assert.match(prompt, /40 项（通过 40）/);
     assert.match(prompt, /prior-findings\.md/);
     assert.doesNotMatch(prompt, /CHECK_LINK_SENTINEL_|FINDING_SUMMARY_SENTINEL_|EVIDENCE_SHOULD_NOT_INLINE|state=SUCCESS/);
     assert.match(fs.readFileSync(path.join(dir, 'prior-findings.md'), 'utf8'), /FINDING_SUMMARY_SENTINEL_19/);
+
+    const unmanifested = buildNativePrompt({
+      pr: 59, headOid: 'c'.repeat(40), branch: 'fix/x', motivation: 'm',
+      reviewTemplate: { sections: [], output_hint: '' },
+      reviewPlan: { required_evidence_ids: [] },
+      evidenceCommands: ['echo evidence-ok'],
+      evidenceText: 'EVIDENCE_SHOULD_NOT_INLINE',
+      diff: 'DIFF_SHOULD_NOT_INLINE',
+      priorFindings: [],
+      evidenceContract: {},
+      remoteChecks: [],
+    });
+    assert.match(unmanifested, /## 证据采集命令（运行结果不内联进 stdin）/);
+    assert.doesNotMatch(unmanifested, /下方已附运行结果/);
+    assert.doesNotMatch(unmanifested, /EVIDENCE_SHOULD_NOT_INLINE/);
+    assert.doesNotMatch(unmanifested, /DIFF_SHOULD_NOT_INLINE/);
   } finally {
     if (prev === undefined) delete process.env.REVIEW_STDIN_BYTE_LIMIT;
     else process.env.REVIEW_STDIN_BYTE_LIMIT = prev;
