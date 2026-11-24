@@ -388,9 +388,38 @@ function copyReviewerFactField(modelRow, key) {
   return modelRow[key];
 }
 
+const COMPAT_DEFAULT_FIELDS = ['decision', 'reason'];
+const COMPAT_DEFAULT_APPLICABLE_FIELDS = [
+  'deployment_boundary',
+  'consumer_inventory',
+  'persisted_contract',
+  'simpler_alternative',
+  'validation_evidence',
+];
+
+// LoopX result_check rejects a partial compatibility_assessment; a truthy
+// object alone must not mark code_volume verified, or Stage 2 skips repair.
+function compatibilityAssessmentComplete(spec, ca) {
+  if (!isPlainObject(ca)) return false;
+  const s = isPlainObject(spec) ? spec : {};
+  const list = (v, d) => (Array.isArray(v) && v.length ? v : d);
+  if (list(s.fields, COMPAT_DEFAULT_FIELDS).some(f => isMissingValue(ca[f]))) return false;
+  const decisions = list(s.decision_values, []);
+  if (decisions.length && !decisions.includes(ca.decision)) return false;
+  if (ca.decision === 'not_applicable') return true;
+  if (list(s.applicable_fields, COMPAT_DEFAULT_APPLICABLE_FIELDS).some(f => isMissingValue(ca[f]))) return false;
+  const boundaries = list(s.deployment_boundary_values, []);
+  if (boundaries.length && !boundaries.includes(ca.deployment_boundary)) return false;
+  return true;
+}
+
 function factRowStatus(req, row) {
   const fields = Array.isArray(req && req.fields) ? req.fields : [];
   if (fields.some(field => isMissingValue(row[field]))) return 'unverified';
+  if (fields.includes('compatibility_assessment')
+    && !compatibilityAssessmentComplete(req && req.compatibility_assessment, row.compatibility_assessment)) {
+    return 'unverified';
+  }
   if (Array.isArray(req && req.verdict_values) && req.verdict_values.length && !req.verdict_values.includes(row.verdict)) {
     return 'unverified';
   }
@@ -765,6 +794,7 @@ function scanDiff(diff) {
 }
 
 module.exports = {
+  compatibilityAssessmentComplete,
   listFiles,
   splitFileDiffs,
   diffStats,

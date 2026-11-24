@@ -185,3 +185,17 @@ test('loopx-flow review help, fail-closed, and flag forwarding', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('#70 isolatedGateEnv normalizes C.UTF-8 locale on darwin only', () => {
+  const base = { LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8', LC_CTYPE: 'C.UTF-8', KEEP: 'x' };
+  const mac = isolatedGateEnv(base, { platform: 'darwin' });
+  assert.strictEqual(mac.LC_ALL, 'en_US.UTF-8');
+  assert.strictEqual(mac.LANG, 'en_US.UTF-8');
+  assert.strictEqual(mac.LC_CTYPE, 'en_US.UTF-8');
+  assert.strictEqual(mac.KEEP, 'x');
+  assert.strictEqual(base.LC_ALL, 'C.UTF-8');
+  const linux = isolatedGateEnv(base, { platform: 'linux' });
+  assert.strictEqual(linux.LC_ALL, 'C.UTF-8');
+  const other = isolatedGateEnv({ LC_ALL: 'zh_CN.UTF-8' }, { platform: 'darwin' });
+  assert.strictEqual(other.LC_ALL, 'zh_CN.UTF-8');
+});

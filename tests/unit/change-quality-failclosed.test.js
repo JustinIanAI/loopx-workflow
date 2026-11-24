@@ -114,3 +114,11 @@ test('3. LoopX-Flow Check Fail-Closed: loopx-flow check must propagate non-zero 
     'loopx-flow check must not use || true on change-quality verify'
   );
 });
+
+test('#70 change-quality verify keeps stderr out of the --format json payload', () => {
+  const flow = fs.readFileSync(LOOPX_FLOW, 'utf8');
+  const line = flow.split('\n').find(l => l.includes('cq_json="$(run_loopx change-quality verify'));
+  assert.ok(line, 'change-quality verify invocation must exist');
+  assert.ok(!line.includes('2>&1'), 'stderr must not be merged into JSON stdout');
+  assert.ok(line.includes('2>/dev/null'), 'stderr must be redirected away from JSON stdout');
+});

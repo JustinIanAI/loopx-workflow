@@ -1331,7 +1331,7 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
         exit 1
     fi
     local cq_json cq_ok
-    cq_json="$(run_loopx change-quality verify --goal-id "$resolved_goal" --repo-path "$PROJECT_ROOT" --base-ref "$cq_base_ref" --format json 2>&1 || echo '{}')"
+    cq_json="$(run_loopx change-quality verify --goal-id "$resolved_goal" --repo-path "$PROJECT_ROOT" --base-ref "$cq_base_ref" --format json 2>/dev/null || echo '{}')"
     cq_ok="$(node -e '
 const fs = require("fs");
 let d = {};
