@@ -63,6 +63,8 @@ function makeSandbox(opts = {}) {
   const logs = path.join(dir, 'logs');
   fs.mkdirSync(logs, { recursive: true });
 
+  const diffFile = path.join(dir, 'fixture.diff');
+  fs.writeFileSync(diffFile, opts.diffText || 'diff --git a/src/app.js b/src/app.js\n--- a/src/app.js\n+++ b/src/app.js\n+const token = "placeholder";\n');
   const legits = { gh: 1, codex: 1, loopx: 1, npm: 1, claude: 1 };
   if (opts.omitCodex) delete legits.codex;
   let {
@@ -98,10 +100,7 @@ case "$0" in
       exit 0
     fi
     if [[ "$args" == *"diff"* ]]; then
-      echo 'diff --git a/src/app.js b/src/app.js'
-      echo '--- a/src/app.js'
-      echo '+++ b/src/app.js'
-      echo '+const token = "placeholder";'
+      cat ${JSON.stringify(diffFile)}
       exit 0
     fi
     if [[ "$args" == *"comment"* ]]; then exit 0; fi
@@ -217,6 +216,7 @@ function run(sbx, args, envExtra) {
   delete env.REVIEW_UPSERT_PUBLISH;
   delete env.REVIEW_KEEP_PROMPT;
   delete env.REVIEW_TWO_STAGE_ALIGNMENT;
+  delete env.REVIEW_STDIN_BYTE_LIMIT;
   if (envExtra) Object.assign(env, envExtra);
   try {
     const out = execFileSync('node', [SCRIPT, ...args], { env, encoding: 'utf8', cwd: PROJECT_ROOT, timeout: 120000 });
@@ -234,8 +234,10 @@ describe('S1 invocation: codex exec with default model', () => {
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
     assert.strictEqual(r.code, 0, r.out);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
-    assert.match(calls, /codex exec/);
-    assert.match(calls, /codex exec -o .* -$/m);
+    assert.match(calls, /codex exec --sandbox read-only/);
+    assert.match(calls, /-C \S+/);
+    assert.match(calls, /-o \S+ -$/m);
+    assert.doesNotMatch(calls, /--add-dir/);
     assert.doesNotMatch(calls, /codex exec .*-m |codex exec .*--model /);
   });
 });
@@ -704,6 +706,13 @@ exit 0
     const runPath = path.join(sbx.tmpDir, runDirs[0]);
     assert.strictEqual(fs.existsSync(path.join(runPath, `review-prompt-7-${HEAD.slice(0, 10)}.md`)), true);
     assert.strictEqual(fs.existsSync(path.join(runPath, `review-prompt-7-${HEAD.slice(0, 10)}-stage2.md`)), true);
+    assert.match(fs.readFileSync(path.join(runPath, 'pr.diff'), 'utf8'), /const token = "placeholder"/);
+    assert.match(fs.readFileSync(path.join(runPath, 'evidence-output.md'), 'utf8'), /evidence-ok/);
+    assert.ok(fs.existsSync(path.join(runPath, 'packet.json')));
+    assert.ok(fs.existsSync(path.join(runPath, 'remote-checks.txt')));
+    assert.ok(fs.existsSync(path.join(runPath, 'stage1-review.md')));
+    const stage1Prompt = fs.readFileSync(path.join(runPath, `review-prompt-7-${HEAD.slice(0, 10)}.md`), 'utf8');
+    assert.doesNotMatch(stage1Prompt, /const token = "placeholder"/);
     const resultJson = JSON.parse(fs.readFileSync(path.join(runPath, 'result.json'), 'utf8'));
     assert.strictEqual(resultJson.evidence.e1.status, 'verified');
     fs.rmSync(path.join(PROJECT_ROOT, '.loopx', 'cache', 'reviews', `7@${HEAD}.json`), { force: true });
@@ -806,5 +815,46 @@ exit 0
     assert.ok(boundaryIdx > 0 && verdictIdx > boundaryIdx, 'boundary note must appear before English verdict');
     assert.deepStrictEqual(fs.readdirSync(sbx.tmpDir), [], '成功路径必须清理本次运行临时目录');
     fs.rmSync(cacheFile, { force: true });
+  });
+});
+
+describe('host truncation fail-closed guard', () => {
+  test('bracketed bytes-omitted marker exits nonzero, prints NOT_VERIFIED, and does not publish', () => {
+    const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-marker-'));
+    const file = path.join(pre, 'out.json');
+    fs.writeFileSync(file, nativeModelOut({ extra: '[... 44229 bytes omitted ...]' }));
+    const sbx = makeSandbox({ codexStdoutFile: file });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.notStrictEqual(r.code, 0);
+    assert.match(r.out, /\[NOT_VERIFIED\]/);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.doesNotMatch(calls, /pr comment/);
+    const runDirs = fs.readdirSync(sbx.tmpDir).filter((d) => d.startsWith('review-pr7-'));
+    assert.strictEqual(runDirs.length, 1, 'failed run must keep the sandbox');
+    fs.rmSync(pre, { recursive: true, force: true });
+  });
+
+  test('quoting a pr.diff truncation literal is not a host truncation', () => {
+    const marker = '[... 44229 bytes omitted ...]';
+    const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-literal-'));
+    const file = path.join(pre, 'out.json');
+    fs.writeFileSync(file, nativeModelOut({ extra: `fixture quotes ${marker}` }));
+    const sbx = makeSandbox({ codexStdoutFile: file, diffText: `+const fixture = "${marker}";\n` });
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/bin/sh\nout=""; p=""\nfor a in "$@"; do [ "\$p" = "-o" ] && out="\$a"; p="\$a"; done\ncat >/dev/null\ncat ${JSON.stringify(file)} > "\$out"\necho ${JSON.stringify(marker)} >&2\nexit 0\n`, { mode: 0o755 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    assert.match(fs.readFileSync(sbx.logs, 'utf8'), /pr comment/);
+    fs.rmSync(pre, { recursive: true, force: true });
+  });
+
+  test('prose that discusses bytes omitted does not trip the guard', () => {
+    const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-prose-'));
+    const file = path.join(pre, 'out.json');
+    fs.writeFileSync(file, nativeModelOut({ extra: 'This review discusses the bytes omitted mechanism without a host marker.' }));
+    const sbx = makeSandbox({ codexStdoutFile: file });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    assert.match(fs.readFileSync(sbx.logs, 'utf8'), /pr comment/);
+    fs.rmSync(pre, { recursive: true, force: true });
   });
 });
