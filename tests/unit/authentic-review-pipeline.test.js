@@ -208,7 +208,6 @@ function run(sbx, args, envExtra) {
     ...process.env,
     PATH: `${sbx.bin}:${process.env.PATH}`,
     AUTHENTIC_REVIEW_HEAD_OID: HEAD,
-    REVIEW_MODEL: 'codex',
     LOOPX_TMP_DIR: sbx.tmpDir,
   };
   delete env.REVIEW_SHORTCIRCUIT;
@@ -217,12 +216,9 @@ function run(sbx, args, envExtra) {
   delete env.REVIEW_KEEP_PROMPT;
   delete env.REVIEW_TWO_STAGE_ALIGNMENT;
   delete env.REVIEW_STDIN_BYTE_LIMIT;
-  if (envExtra) {
-    for (const [key, value] of Object.entries(envExtra)) {
-      if (value == null) delete env[key];
-      else env[key] = value;
-    }
-  }
+  delete env.REVIEW_MODEL;
+  delete env.REVIEW_REASONING_EFFORT;
+  if (envExtra) Object.assign(env, envExtra);
   try {
     const out = execFileSync('node', [SCRIPT, ...args], { env, encoding: 'utf8', cwd: PROJECT_ROOT, timeout: 120000 });
     return { code: 0, out };
@@ -236,7 +232,7 @@ const FEATURE = 'native-dispatch-deep-integration';
 describe('S1 invocation: codex exec with default model', () => {
   test('prompt carries head oid, remote diff and JSON protocol; no model flag', () => {
     const sbx = makeSandbox();
-    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { REVIEW_MODEL: null });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
     assert.strictEqual(r.code, 0, r.out);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
     assert.match(calls, /codex exec --sandbox read-only/);
@@ -268,7 +264,7 @@ describe('S1 invocation: codex exec with default model', () => {
     const sbx = makeSandbox({ omitCodex: true, claudeStdoutFile: f, verdict: 'request_changes' });
     const r = run(sbx, [
       '--pr', '7', '--repo', 'o/r', '--feature', FEATURE,
-      '--agent-bin', 'claude', '--model', 'magpie/claude-sonnet', '--reasoning-effort', 'high',
+      '--agent-bin=claude', '--model=magpie/claude-sonnet', '--reasoning-effort=high',
     ], { REVIEW_MODEL: 'env-model', REVIEW_REASONING_EFFORT: 'low' });
     assert.strictEqual(r.code, 0, r.out);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
@@ -530,6 +526,16 @@ describe('S5 cross validation', () => {
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--cross-validate']);
     assert.strictEqual(r.code, 0, r.out);
     assert.match(r.out, /DISPUTED|cross|CROSS/i);
+  });
+
+  test('--cross-validate secondary agent does not inherit --model or --reasoning-effort', () => {
+    const sbx = makeSandbox();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--cross-validate', '--model', 'magpie/only-primary', '--reasoning-effort', 'high']);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /\/codex .*-m magpie\/only-primary .*model_reasoning_effort=high/);
+    const secondary = calls.split('\n').find((line) => line.includes('/claude ') && line.includes('--add-dir'));
+    assert.ok(secondary && !/--model|--effort|only-primary/.test(secondary), secondary);
   });
 });
 describe('R3 carryover adjudication', () => {

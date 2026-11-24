@@ -1383,47 +1383,29 @@ HELPTXT
     fi
 
     local -a pass=()
-    local token cleaned
+    local flag token cleaned
     while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --cross-validate|--rebuild-body|--force-recheck)
-                pass+=("$1")
-                shift
-                ;;
-            --agent-bin)
-                if [[ -z "${2:-}" || "${2:-}" == --* ]]; then
-                    echo -e "${RED}[-] [FAIL-CLOSED] --agent-bin 需要 codex 或 claude${NC}" >&2
-                    exit 1
+        flag="$1"
+        case "$flag" in
+            --cross-validate|--rebuild-body|--force-recheck) pass+=("$flag"); shift ;;
+            --agent-bin|--agent-bin=*|--model|--model=*|--reasoning-effort|--reasoning-effort=*)
+                if [[ "$flag" == *=* ]]; then token="${flag#*=}"; flag="${flag%%=*}"; shift; else token="${2:-}"; shift 2; fi
+                if [[ "$flag" == "--agent-bin" ]]; then
+                    if [[ -z "$token" || "$token" == --* ]]; then echo -e "${RED}[-] [FAIL-CLOSED] --agent-bin 需要 codex 或 claude${NC}" >&2; exit 1; fi
+                    pass+=("--agent-bin" "$token")
+                    continue
                 fi
-                pass+=("$1" "$2")
-                shift 2
-                ;;
-            --model|--reasoning-effort)
-                token="${2:-}"
-                if [[ -z "$token" || "$token" == --* ]]; then
-                    echo -e "${RED}[-] [FAIL-CLOSED] $1 为空，拒绝执行${NC}" >&2
-                    exit 1
-                fi
+                if [[ -z "$token" || "$token" == --* ]]; then echo -e "${RED}[-] [FAIL-CLOSED] $flag 为空，拒绝执行${NC}" >&2; exit 1; fi
                 cleaned="$(printf '%s' "$token" | tr -d '[:cntrl:][:space:]')"
-                if [[ "$cleaned" != "$token" ]]; then
-                    echo -e "${RED}[-] [FAIL-CLOSED] $1 含换行、空白或控制字符，拒绝执行${NC}" >&2
-                    exit 1
-                fi
-                if [[ "$1" == "--reasoning-effort" ]]; then
+                if [[ "$cleaned" != "$token" ]]; then echo -e "${RED}[-] [FAIL-CLOSED] $flag 含换行、空白或控制字符，拒绝执行${NC}" >&2; exit 1; fi
+                if [[ "$flag" == "--reasoning-effort" ]]; then
                     case "$token" in
                         none|minimal|low|medium|high|xhigh|max|ultra) ;;
-                        *)
-                            echo -e "${RED}[-] [FAIL-CLOSED] --reasoning-effort 非法值 \"${token}\"，允许: none|minimal|low|medium|high|xhigh|max|ultra${NC}" >&2
-                            exit 1
-                            ;;
+                        *) echo -e "${RED}[-] [FAIL-CLOSED] --reasoning-effort 非法值 \"${token}\"，允许: none|minimal|low|medium|high|xhigh|max|ultra${NC}" >&2; exit 1 ;;
                     esac
                 fi
-                pass+=("$1" "$token")
-                shift 2
-                ;;
-            *)
-                shift
-                ;;
+                pass+=("$flag" "$token") ;;
+            *) shift ;;
         esac
     done
 

@@ -135,10 +135,11 @@ test('authentic-review --help and illegal CLI values fail closed before any revi
   for (const needle of ['--model', '--reasoning-effort', 'REVIEW_MODEL']) assert.match(help.stdout, new RegExp(needle));
   const bad = spawnSync(process.execPath, [SCRIPT, '--pr', '1', '--repo', 'o/r', '--reasoning-effort', 'turbo'], { encoding: 'utf8' });
   const empty = spawnSync(process.execPath, [SCRIPT, '--model'], { encoding: 'utf8' });
+  const eqBad = ['--reasoning-effort=turbo', '--model=', '--agent-bin='].map((flag) => spawnSync(process.execPath, [SCRIPT, flag], { encoding: 'utf8' }));
   const cliBeatsEnv = spawnSync(process.execPath, [SCRIPT, '--reasoning-effort', 'nope'], {
     encoding: 'utf8', env: { ...process.env, REVIEW_REASONING_EFFORT: 'low' },
   });
-  for (const result of [bad, empty]) {
+  for (const result of [bad, empty, ...eqBad]) {
     assert.notStrictEqual(result.status, 0);
     assert.match(result.stderr, /FAIL-CLOSED/);
   }
@@ -156,6 +157,9 @@ test('loopx-flow review help, fail-closed, and flag forwarding', () => {
     [['review', '12', '--reasoning-effort', 'turbo'], /FAIL-CLOSED/],
     [['review', '12', '--model', ''], /FAIL-CLOSED/],
     [['review', '12', '--model', 'bad\nid'], /控制字符/],
+    [['review', '12', '--reasoning-effort=turbo'], /FAIL-CLOSED/],
+    [['review', '12', '--model='], /FAIL-CLOSED/],
+    [['review', '12', '--agent-bin='], /FAIL-CLOSED/],
   ];
   for (const [argv, pattern] of cases) {
     const result = spawnSync('bash', [FLOW, ...argv], { encoding: 'utf8' });
@@ -167,7 +171,7 @@ test('loopx-flow review help, fail-closed, and flag forwarding', () => {
   fs.writeFileSync(path.join(dir, 'gh'), '#!/bin/sh\ncase "$*" in *repo*view*) echo owner/repo ;; *pr*view*) echo false ;; esac\nexit 0\n', { mode: 0o755 });
   fs.writeFileSync(path.join(dir, 'node'), `#!/bin/sh\nprintf '%s\\n' "$*" > ${JSON.stringify(capture)}\nexit 0\n`, { mode: 0o755 });
   const forwarded = spawnSync('bash', [
-    FLOW, 'review', '12', '--model', 'agy-cli/gemini-3.8-flash', '--reasoning-effort', 'high', '--agent-bin', 'claude',
+    FLOW, 'review', '12', '--model=agy-cli/gemini-3.8-flash', '--reasoning-effort=high', '--agent-bin=claude',
   ], { encoding: 'utf8', env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, LOOPX_TMP_DIR: dir, REVIEW_MODEL: 'env-model' } });
   try {
     assert.strictEqual(forwarded.status, 0, forwarded.stderr || forwarded.stdout);

@@ -235,15 +235,20 @@ function parseArgs(argv) {
     else if (a === '--pr') o.pr = argv[++i];
     else if (a === '--repo') o.repo = argv[++i];
     else if (a === '--feature') o.feature = argv[++i];
-    else if (a === '--agent-bin') o.agentBin = argv[++i];
+    else if (a === '--agent-bin' || a.startsWith('--agent-bin=')) {
+      if (!a.startsWith('--agent-bin=')) o.agentBin = argv[++i];
+      else o.agentBin = a.slice(a.indexOf('=') + 1);
+      if (!o.agentBin || String(o.agentBin).startsWith('--')) { console.error('[FAIL-CLOSED] --agent-bin 需要 codex 或 claude'); process.exit(1); }
+    }
     else if (a === '--packet-file') o.packetFile = argv[++i];
     else if (a === '--force-recheck') o.forceRecheck = true;
     else if (a === '--help' || a === '-h') o.help = true;
-    else if (a === '--model' || a === '--reasoning-effort') {
-      const key = a === '--model' ? 'model' : 'reasoningEffort';
-      const next = argv[i + 1];
-      if (next == null || String(next).startsWith('--')) o[key] = '';
-      else o[key] = argv[++i];
+    else if (/^--(model|reasoning-effort)(=|$)/.test(a)) {
+      const eq = a.indexOf('=');
+      const name = eq < 0 ? a : a.slice(0, eq);
+      const key = name === '--model' ? 'model' : 'reasoningEffort';
+      if (eq >= 0) o[key] = a.slice(eq + 1);
+      else o[key] = (argv[i + 1] == null || String(argv[i + 1]).startsWith('--')) ? '' : argv[++i];
     }
   }
   return o;
@@ -1812,7 +1817,7 @@ function main() {
   if (o.crossValidate) {
     const secondaryAgent = primaryAgent.includes('claude') ? 'codex' : 'claude';
     console.log(`==> [S5] Cross-validating with ${secondaryAgent} (default model)...`);
-    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir, diff, runtimeSelection);
+    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir, diff, { model: null, reasoningEffort: null });
     if (cv.truncated || cv.stdinRejected) {
       console.error(`[NOT_VERIFIED] 交叉核验命中截断或 stdin 超限，拒绝发布：${cv.error}`);
       process.exit(1);
