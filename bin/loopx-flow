@@ -9,6 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKFLOW_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 # shellcheck source=../lib/paths.sh
 source "$WORKFLOW_ROOT/lib/paths.sh"
+# 集中式三层能力探针（ADR-0010 决策 4 / ADR-0015 决策 4）：doctor 与各 L0 命令共用同一矩阵。
+CAPABILITY_PROBE_LIB="$WORKFLOW_ROOT/lib/capability-probe.js"
 
 # 路由前解析全局选项：支持 `loopx-flow --registry <path> <command> ...`（D1 / R15）
 CLI_REGISTRY=""
@@ -61,6 +63,39 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
+
+# 集中式三层能力探针（ADR-0010 决策 4 / ADR-0015 决策 4）。
+# 第 1 层：真实子命令 --help 的必填 Flag / 子命令签名；第 2 层：schema_version 白名单；
+# 第 3 层：loopx --version 软提示。全部逻辑集中在 lib/capability-probe.js，避免口径漂移。
+# 用法: probe_loopx_capabilities [--scope doctor|issue|integrate|todo|...] [--format text|json|quiet]
+probe_loopx_capabilities() {
+    local scope="doctor" format="text"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scope|--command)
+                scope="${2:-doctor}"; shift 2 ;;
+            --format)
+                format="${2:-text}"; shift 2 ;;
+            *)
+                shift ;;
+        esac
+    done
+    node "$CAPABILITY_PROBE_LIB" matrix --scope "$scope" --format "$format"
+}
+
+# L0 命令的 Fail-Closed 能力门：BLOCK 能力缺失或探测 UNKNOWN → 非 0 阻断并输出升级差异诊断卡。
+# 用法: require_loopx_capabilities <issue|integrate|todo|check|merge|review|...>
+require_loopx_capabilities() {
+    local scope="${1:-doctor}"
+    node "$CAPABILITY_PROBE_LIB" require --scope "$scope"
+}
+
+# 第 2 层：消费任何 LoopX --format json 载荷前校验 schema_version 白名单。
+# 用法: assert_loopx_schema_version <consumer> <raw-output>；不在白名单时非 0 并输出诊断卡。
+assert_loopx_schema_version() {
+    local consumer="$1" raw="${2:-}"
+    printf '%s' "$raw" | node "$CAPABILITY_PROBE_LIB" assert-schema --consumer "$consumer" >/dev/null
+}
 
 # 按仓库真实存在的远程默认基线解析：origin/HEAD → origin/main → origin/master（GitHub Issue #13）。
 # 单一事实源在 ingest-to-loopx-quality.js#discoverBaseRef；shell 侧只做委托与降级，避免两处逻辑漂移。
@@ -142,7 +177,9 @@ usage() {
   context <feature>       生成当前特性的长程上下文胶囊，供开发者与 AI Agent 快速穿透审阅
   archive <feature>       原子归档已合入特性的资产包 (specs/features/ -> specs/archive/)
   gate verify <stage> <f> 阶段流转物理熔断守卫 (decisions | contract)
-  doctor                  前置环境与 LoopX 就绪度全维评分 (preflight + loopx doctor)
+  doctor                  前置环境与 LoopX 就绪度全维评分 (preflight + loopx doctor + 能力矩阵)
+  capabilities [--scope s] [--format text|json]
+                          三层能力探针：--help 签名 / schema_version 白名单 / 版本软提示（doctor 视图不阻断）
   gc [--days N] [--force] 并发安全清理 .loopx/cache/reviews/ 与 .loopx/tmp/ 过期工件（默认 14 天，1h 活跃保护）
   init                    初始化项目工作流骨架、依赖及本地 LoopX 连接
   status                  查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
@@ -393,6 +430,12 @@ cmd_doctor() {
     if ! cmd_doctor_change_quality; then
         echo -e "\n${YELLOW}[i] change-quality 诊断存在告警：check 会在前置阶段 fail-closed，请按诊断卡修复。${NC}"
     fi
+
+    # Required Capability Set 能力矩阵（ADR-0010 决策 4 / ADR-0015 决策 4）：
+    # 三层探针共用同一矩阵，doctor 是诊断视图，始终 exit 0（不阻断体检汇总）。
+    echo -e "\n${BLUE}==> LoopX 能力矩阵 (Required Capability Set · PASS / WARN / BLOCK / UNKNOWN)${NC}"
+    probe_loopx_capabilities --scope doctor || true
+    echo -e "${YELLOW}[i] 缺失 BLOCK 能力或探测 UNKNOWN 的 L0 命令会 fail-closed 阻断；版本号变化仅软提示不阻断。${NC}"
 
     # Gate 授权配置 + 交付基础设施（配置非法 fail-closed；分支保护在 Gate1 只 WARN）
     doctor_authorization_config
@@ -2397,6 +2440,12 @@ cmd_issue() {
         exit 1
     fi
 
+    # 能力前置门：issue-fix.feasibility（BLOCK）缺失或探测 UNKNOWN → 直接非 0，不降级为静默成功。
+    require_loopx_capabilities issue || {
+        echo -e "${RED}[-] [FAIL-CLOSED] LoopX 能力探针未通过（issue-fix.feasibility），issue 命令已阻断。${NC}" >&2
+        exit 1
+    }
+
     # 解析 Agent 观察量 (reproduction / scope)
     local repro="missing" scope="uncertain"
     while [[ $# -gt 0 ]]; do
@@ -2496,6 +2545,12 @@ cmd_integrate() {
         echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，无法执行 LoopX 原生集成分支预演。${NC}" >&2
         exit 1
     fi
+
+    # 能力前置门：integration-branch（BLOCK）缺失或探测 UNKNOWN → 直接非 0。
+    require_loopx_capabilities integrate || {
+        echo -e "${RED}[-] [FAIL-CLOSED] LoopX 能力探针未通过（integration-branch），integrate 命令已阻断。${NC}" >&2
+        exit 1
+    }
 
     if [[ "$mode" == "status" ]]; then
         echo -e "${BLUE}==> 正在查询 LoopX 集成分支状态 (base/source/integration heads)...${NC}"
@@ -3130,6 +3185,12 @@ cmd_todo_lease() {
     local mode="$1"
     shift
 
+    # 能力前置门：todo.lease / todo.user_gate（BLOCK）缺失或探测 UNKNOWN → 直接非 0。
+    require_loopx_capabilities todo || {
+        echo -e "${RED}[-] [FAIL-CLOSED] LoopX 能力探针未通过（受管 todo 签名），todo $mode 已阻断。${NC}" >&2
+        exit 1
+    }
+
     local todo_id="" goal_id="" agent_id="" claim_operation_id="" evidence=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3191,6 +3252,12 @@ cmd_todo_lease() {
             echo -e "${RED}[-] [FAIL-CLOSED] 受管 Todo 认领失败: LoopX 拒绝了 todo claim，操作已阻断。${NC}" >&2
             exit 1
         fi
+        # 第 2 层：schema_version 白名单 Fail-Closed（未知版本输出升级差异诊断卡）。
+        assert_loopx_schema_version todo.claim "$claim_out" || {
+            printf '%s\n' "$claim_out" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] todo claim 载荷 schema_version 不在白名单，操作已阻断。${NC}" >&2
+            exit 1
+        }
         claim_meta="$(parse_todo_claim_result "$claim_out")"
         if [[ "$claim_meta" != ok$'\t'* ]]; then
             printf '%s\n' "$claim_out" >&2
@@ -3332,6 +3399,11 @@ cmd_todo_lease() {
             echo -e "${RED}[-] [FAIL-CLOSED] Q1 分流 A 自动补领失败: LoopX 拒绝了 todo claim。${NC}" >&2
             exit 1
         fi
+        assert_loopx_schema_version todo.claim "$reclaim_out" || {
+            printf '%s\n' "$reclaim_out" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] 自动补领载荷 schema_version 不在白名单，操作已阻断。${NC}" >&2
+            exit 1
+        }
         reclaim_meta="$(parse_todo_claim_result "$reclaim_out")"
         if [[ "$reclaim_meta" != ok$'\t'* ]]; then
             printf '%s\n' "$reclaim_out" >&2
@@ -3357,6 +3429,11 @@ cmd_todo_lease() {
         echo -e "${RED}[-] [FAIL-CLOSED] Todo 完成回写失败: ${todo_id}；LoopX 拒绝语义为唯一权威，未自动重新 claim。${NC}" >&2
         exit 1
     fi
+    assert_loopx_schema_version todo.complete "$complete_out" || {
+        printf '%s\n' "$complete_out" >&2
+        echo -e "${RED}[-] [FAIL-CLOSED] todo complete 载荷 schema_version 不在白名单，操作已阻断。${NC}" >&2
+        exit 1
+    }
     complete_meta="$(parse_todo_complete_result "$complete_out")"
     if [[ "$complete_meta" != "ok" ]]; then
         printf '%s\n' "$complete_out" >&2
@@ -3396,6 +3473,7 @@ case "$ACTION" in
     issue) cmd_issue "$@" ;;
     integrate) cmd_integrate "$@" ;;
     doctor) cmd_doctor "$@" ;;
+    capabilities) probe_loopx_capabilities "$@" ;;
     gc) cmd_gc "$@" ;;
     init) cmd_init "$@" ;;
     status)

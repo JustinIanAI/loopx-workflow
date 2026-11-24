@@ -21,8 +21,21 @@ function setupMocks() {
   fs.writeFileSync(TEST_REGISTRY, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
 
   fs.writeFileSync(path.join(MOCK_BIN_DIR, 'loopx'), `#!/usr/bin/env bash
-echo "$*" >> ${CALLS_LOG}
 args="$*"
+# 能力探针的第 1 层会真实调用 --version / --help：按 loopx 2.3.0 锚点帮助签名应答，再记录业务调用。
+if [[ "$args" == "--version" ]]; then echo "loopx 2.3.0"; exit 0; fi
+if [[ "$args" == *"--help"* ]]; then
+  case "$args" in
+    "todo claim --help") echo "usage: loopx todo claim --goal-id GOAL_ID [options]"; echo "  --goal-id GOAL_ID"; echo "  --todo-id TODO_ID"; echo "  --claim-operation-id CLAIM_OPERATION_ID"; echo "  --claimed-by CLAIMED_BY"; echo "  --agent-id AGENT_ID" ;;
+    "todo complete --help") echo "usage: loopx todo [--format {markdown,json}] --goal-id GOAL_ID"; echo "  --claim-operation-id CLAIM_OPERATION_ID"; echo "  --evidence EVIDENCE" ;;
+    "todo add --help") echo "usage: loopx todo [--format {markdown,json}] --goal-id GOAL_ID"; echo "  --required-write-scope REQUIRED_WRITE_SCOPES"; echo "  --task-domain TASK_DOMAIN"; echo "  --task-repository TASK_REPOSITORY"; echo "  --validation-command VALIDATION_COMMAND"; echo "  --operation-id OPERATION_ID"; echo "  --claim-operation-id CLAIM_OPERATION_ID"; echo "  --task-class {advancement_task,continuous_monitor,user_gate,user_action,blocker}"; echo "  --decision-scope DECISION_SCOPE"; echo "  --decision-outcome {approve,reject,cancel}"; echo "  --global-gate" ;;
+    "issue-fix --help") echo "usage: loopx issue-fix [-h] {repository-memory-sync,workflow-plan,feasibility,outcome,metrics} ..." ;;
+    "integration-branch --help") echo "usage: loopx integration-branch [-h] {configure,status,sync} ..." ;;
+    *) echo "usage: loopx" ;;
+  esac
+  exit 0
+fi
+echo "$*" >> ${CALLS_LOG}
 goal=""; todo=""
 for ((i=1; i<=$#; i++)); do
   case "\${!i}" in
