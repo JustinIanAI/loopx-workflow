@@ -82,9 +82,28 @@ test('declared_model strips router, gateway, and endpoint prefixes and stays sel
   assert.strictEqual(runtime.declared_reasoning_effort, 'high');
 });
 
-test('sanitized family passes loopx 2.3.0 reviewer declaration; the raw router id does not', () => {
+function hostLoopxPython() {
+  const bin = process.env.LOOPX_BIN || 'loopx';
+  const ver = spawnSync(bin, ['--version'], { encoding: 'utf8', env: { ...process.env, LOOPX_USAGE_PING: '0' } });
+  if (ver.status !== 0 || !/^loopx\s+2\.3\.\d+/.test(`${ver.stdout}${ver.stderr}`)) return '';
+  const script = (bin.includes('/') ? [bin] : (process.env.PATH || '').split(path.delimiter).map(dir => path.join(dir, bin))).find(file => {
+    try { return fs.statSync(file).isFile(); } catch (_) { return false; }
+  });
+  if (!script) return '';
+  let py = '';
+  try {
+    const parts = fs.readFileSync(script, 'utf8').split('\n', 1)[0].replace(/^#!/, '').trim().split(/\s+/);
+    py = path.basename(parts[0] || '') === 'env' ? parts.find((arg, i) => i > 0 && !arg.startsWith('-')) : parts[0];
+    if (py && !path.isAbsolute(py)) py = path.join(path.dirname(script), py);
+  } catch (_) { return ''; }
+  return py && spawnSync(py, ['-c', 'from loopx.capabilities.pr_review_queue.result_check import _reviewer_errors'], { encoding: 'utf8' }).status === 0 ? py : '';
+}
+
+test('sanitized family passes loopx 2.3.0 reviewer declaration; the raw router id does not', (t) => {
+  const py = hostLoopxPython();
+  if (!py) return t.skip('host loopx 2.3.x Python interpreter not available (set LOOPX_BIN or PATH)');
   const family = declaredModelFamily('agy-cli/gemini-3.8-flash');
-  const probe = spawnSync('python3', ['-c', `
+  const probe = spawnSync(py, ['-c', `
 from loopx.capabilities.pr_review_queue.result_check import _reviewer_errors
 family, raw = ${JSON.stringify(family)}, "agy-cli/gemini-3.8-flash"
 def packet(model):
