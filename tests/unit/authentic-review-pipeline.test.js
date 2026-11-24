@@ -19,7 +19,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const SCRIPT = path.join(PROJECT_ROOT, 'skills/code-review/scripts/authentic-review.js');
@@ -63,6 +63,8 @@ function makeSandbox(opts = {}) {
   const logs = path.join(dir, 'logs');
   fs.mkdirSync(logs, { recursive: true });
 
+  const diffFile = path.join(dir, 'fixture.diff');
+  fs.writeFileSync(diffFile, opts.diffText || 'diff --git a/src/app.js b/src/app.js\n--- a/src/app.js\n+++ b/src/app.js\n+const token = "placeholder";\n');
   const legits = { gh: 1, codex: 1, loopx: 1, npm: 1, claude: 1 };
   if (opts.omitCodex) delete legits.codex;
   let {
@@ -98,10 +100,7 @@ case "$0" in
       exit 0
     fi
     if [[ "$args" == *"diff"* ]]; then
-      echo 'diff --git a/src/app.js b/src/app.js'
-      echo '--- a/src/app.js'
-      echo '+++ b/src/app.js'
-      echo '+const token = "placeholder";'
+      cat ${JSON.stringify(diffFile)}
       exit 0
     fi
     if [[ "$args" == *"comment"* ]]; then exit 0; fi
@@ -209,7 +208,6 @@ function run(sbx, args, envExtra) {
     ...process.env,
     PATH: `${sbx.bin}:${process.env.PATH}`,
     AUTHENTIC_REVIEW_HEAD_OID: HEAD,
-    REVIEW_MODEL: 'codex',
     LOOPX_TMP_DIR: sbx.tmpDir,
   };
   delete env.REVIEW_SHORTCIRCUIT;
@@ -217,6 +215,9 @@ function run(sbx, args, envExtra) {
   delete env.REVIEW_UPSERT_PUBLISH;
   delete env.REVIEW_KEEP_PROMPT;
   delete env.REVIEW_TWO_STAGE_ALIGNMENT;
+  delete env.REVIEW_STDIN_BYTE_LIMIT;
+  delete env.REVIEW_MODEL;
+  delete env.REVIEW_REASONING_EFFORT;
   if (envExtra) Object.assign(env, envExtra);
   try {
     const out = execFileSync('node', [SCRIPT, ...args], { env, encoding: 'utf8', cwd: PROJECT_ROOT, timeout: 120000 });
@@ -234,9 +235,44 @@ describe('S1 invocation: codex exec with default model', () => {
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
     assert.strictEqual(r.code, 0, r.out);
     const calls = fs.readFileSync(sbx.logs, 'utf8');
-    assert.match(calls, /codex exec/);
-    assert.match(calls, /codex exec -o .* -$/m);
+    assert.match(calls, /codex exec --sandbox read-only/);
+    assert.match(calls, /-C \S+/);
+    assert.match(calls, /-o \S+ -$/m);
+    assert.doesNotMatch(calls, /--add-dir/);
     assert.doesNotMatch(calls, /codex exec .*-m |codex exec .*--model /);
+    assert.doesNotMatch(calls, /model_reasoning_effort=/);
+  });
+
+  test('REVIEW_MODEL and REVIEW_REASONING_EFFORT are forwarded, declared_model is the product family', () => {
+    const sbx = makeSandbox();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], {
+      REVIEW_MODEL: 'agy-cli/gemini-3.8-flash',
+      REVIEW_REASONING_EFFORT: 'low',
+    });
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /-m agy-cli\/gemini-3\.8-flash/);
+    assert.match(calls, /-c model_reasoning_effort=low/);
+    assert.match(r.out, /self_reported/);
+    assert.match(r.out, /model=gemini-3\.8-flash/);
+    assert.doesNotMatch(r.out, /model=agy-cli\//);
+  });
+
+  test('explicit CLI model and effort outrank env and map onto claude flags', () => {
+    const f = path.join(os.tmpdir(), 'claude-model-' + Date.now() + '.json');
+    fs.writeFileSync(f, nativeModelOut({ verdict: 'request_changes', findings: [] }));
+    const sbx = makeSandbox({ omitCodex: true, claudeStdoutFile: f, verdict: 'request_changes' });
+    const r = run(sbx, [
+      '--pr', '7', '--repo', 'o/r', '--feature', FEATURE,
+      '--agent-bin=claude', '--model=magpie/claude-sonnet', '--reasoning-effort=high',
+    ], { REVIEW_MODEL: 'env-model', REVIEW_REASONING_EFFORT: 'low' });
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /claude -p --tools Read --permission-mode dontAsk --add-dir \S+ --model magpie\/claude-sonnet --effort high/);
+    assert.doesNotMatch(calls, /--model env-model/);
+    assert.doesNotMatch(calls, /--effort low/);
+    assert.match(r.out, /model=claude-sonnet/);
+    assert.doesNotMatch(r.out, /model=magpie\//);
   });
 });
 
@@ -491,6 +527,16 @@ describe('S5 cross validation', () => {
     assert.strictEqual(r.code, 0, r.out);
     assert.match(r.out, /DISPUTED|cross|CROSS/i);
   });
+
+  test('--cross-validate secondary agent does not inherit --model or --reasoning-effort', () => {
+    const sbx = makeSandbox();
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--cross-validate', '--model', 'magpie/only-primary', '--reasoning-effort', 'high']);
+    assert.strictEqual(r.code, 0, r.out);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.match(calls, /\/codex .*-m magpie\/only-primary .*model_reasoning_effort=high/);
+    const secondary = calls.split('\n').find((line) => line.includes('/claude ') && line.includes('--add-dir'));
+    assert.ok(secondary && !/--model|--effort|only-primary/.test(secondary), secondary);
+  });
 });
 describe('R3 carryover adjudication', () => {
   test('fixed/obsolete carryover allows APPROVE and publishes per-item status', () => {
@@ -675,6 +721,52 @@ describe('P0-A1 gates env isolation', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test('isolatedGateEnv strips LOOPX_TMP_DIR and LOOPX_KEEP_TMP before issue-8 runs', () => {
+    const { isolatedGateEnv } = require(SCRIPT);
+    const clean = isolatedGateEnv({
+      LOOPX_TMP_DIR: '/tmp/leak',
+      LOOPX_KEEP_TMP: '1',
+      REVIEW_SHORTCIRCUIT: '1',
+      KEEP_ME: 'ok',
+    });
+    assert.strictEqual(clean.LOOPX_TMP_DIR, undefined);
+    assert.strictEqual(clean.LOOPX_KEEP_TMP, undefined);
+    assert.strictEqual(clean.REVIEW_SHORTCIRCUIT, undefined);
+    assert.strictEqual(clean.KEEP_ME, 'ok');
+
+    const leaked = path.join(os.tmpdir(), 'loopx-gate-env-leak');
+    const env = isolatedGateEnv({
+      ...process.env,
+      LOOPX_TMP_DIR: leaked,
+      LOOPX_KEEP_TMP: '1',
+      REVIEW_SHORTCIRCUIT: '1',
+    });
+    delete env.NODE_TEST_CONTEXT;
+    assert.strictEqual(env.LOOPX_TMP_DIR, undefined);
+    assert.strictEqual(env.LOOPX_KEEP_TMP, undefined);
+    assert.strictEqual(env.REVIEW_SHORTCIRCUIT, undefined);
+    const res = spawnSync(process.execPath, [
+      '--test',
+      '--test-concurrency=1',
+      'tests/unit/issues/issue-8.test.js',
+    ], {
+      cwd: PROJECT_ROOT,
+      env,
+      encoding: 'utf8',
+    });
+    assert.strictEqual(res.status, 0, `${res.stdout}\n${res.stderr}`);
+    assert.match(res.stdout, /D2 gc/);
+    assert.match(res.stdout, /# fail 0/);
+  });
+
+  test('stage2 manifest includes priorEntries with the sandbox and stage2 files', () => {
+    const src = fs.readFileSync(SCRIPT, 'utf8');
+    assert.match(
+      src,
+      /const stage2Manifest = formatArtifactManifest\(\[\.\.\.sandboxEntries, \.\.\.priorEntries, \.\.\.stage2Entries\]\);/,
+    );
+  });
 });
 
 describe('ADR-0013 stdin streaming, sandbox prompt artifact, two-stage alignment & PATCH arg fix', () => {
@@ -704,6 +796,13 @@ exit 0
     const runPath = path.join(sbx.tmpDir, runDirs[0]);
     assert.strictEqual(fs.existsSync(path.join(runPath, `review-prompt-7-${HEAD.slice(0, 10)}.md`)), true);
     assert.strictEqual(fs.existsSync(path.join(runPath, `review-prompt-7-${HEAD.slice(0, 10)}-stage2.md`)), true);
+    assert.match(fs.readFileSync(path.join(runPath, 'pr.diff'), 'utf8'), /const token = "placeholder"/);
+    assert.match(fs.readFileSync(path.join(runPath, 'evidence-output.md'), 'utf8'), /evidence-ok/);
+    assert.ok(fs.existsSync(path.join(runPath, 'packet.json')));
+    assert.ok(fs.existsSync(path.join(runPath, 'remote-checks.txt')));
+    assert.ok(fs.existsSync(path.join(runPath, 'stage1-review.md')));
+    const stage1Prompt = fs.readFileSync(path.join(runPath, `review-prompt-7-${HEAD.slice(0, 10)}.md`), 'utf8');
+    assert.doesNotMatch(stage1Prompt, /const token = "placeholder"/);
     const resultJson = JSON.parse(fs.readFileSync(path.join(runPath, 'result.json'), 'utf8'));
     assert.strictEqual(resultJson.evidence.e1.status, 'verified');
     fs.rmSync(path.join(PROJECT_ROOT, '.loopx', 'cache', 'reviews', `7@${HEAD}.json`), { force: true });
@@ -806,5 +905,46 @@ exit 0
     assert.ok(boundaryIdx > 0 && verdictIdx > boundaryIdx, 'boundary note must appear before English verdict');
     assert.deepStrictEqual(fs.readdirSync(sbx.tmpDir), [], '成功路径必须清理本次运行临时目录');
     fs.rmSync(cacheFile, { force: true });
+  });
+});
+
+describe('host truncation fail-closed guard', () => {
+  test('bracketed bytes-omitted marker exits nonzero, prints NOT_VERIFIED, and does not publish', () => {
+    const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-marker-'));
+    const file = path.join(pre, 'out.json');
+    fs.writeFileSync(file, nativeModelOut({ extra: '[... 44229 bytes omitted ...]' }));
+    const sbx = makeSandbox({ codexStdoutFile: file });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.notStrictEqual(r.code, 0);
+    assert.match(r.out, /\[NOT_VERIFIED\]/);
+    const calls = fs.readFileSync(sbx.logs, 'utf8');
+    assert.doesNotMatch(calls, /pr comment/);
+    const runDirs = fs.readdirSync(sbx.tmpDir).filter((d) => d.startsWith('review-pr7-'));
+    assert.strictEqual(runDirs.length, 1, 'failed run must keep the sandbox');
+    fs.rmSync(pre, { recursive: true, force: true });
+  });
+
+  test('quoting a pr.diff truncation literal is not a host truncation', () => {
+    const marker = '[... 44229 bytes omitted ...]';
+    const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-literal-'));
+    const file = path.join(pre, 'out.json');
+    fs.writeFileSync(file, nativeModelOut({ extra: `fixture quotes ${marker}` }));
+    const sbx = makeSandbox({ codexStdoutFile: file, diffText: `+const fixture = "${marker}";\n` });
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/bin/sh\nout=""; p=""\nfor a in "$@"; do [ "\$p" = "-o" ] && out="\$a"; p="\$a"; done\ncat >/dev/null\ncat ${JSON.stringify(file)} > "\$out"\necho ${JSON.stringify(marker)} >&2\nexit 0\n`, { mode: 0o755 });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    assert.match(fs.readFileSync(sbx.logs, 'utf8'), /pr comment/);
+    fs.rmSync(pre, { recursive: true, force: true });
+  });
+
+  test('prose that discusses bytes omitted does not trip the guard', () => {
+    const pre = fs.mkdtempSync(path.join(os.tmpdir(), 'trunc-prose-'));
+    const file = path.join(pre, 'out.json');
+    fs.writeFileSync(file, nativeModelOut({ extra: 'This review discusses the bytes omitted mechanism without a host marker.' }));
+    const sbx = makeSandbox({ codexStdoutFile: file });
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 0, r.out);
+    assert.match(fs.readFileSync(sbx.logs, 'utf8'), /pr comment/);
+    fs.rmSync(pre, { recursive: true, force: true });
   });
 });

@@ -235,12 +235,39 @@ function parseArgs(argv) {
     else if (a === '--pr') o.pr = argv[++i];
     else if (a === '--repo') o.repo = argv[++i];
     else if (a === '--feature') o.feature = argv[++i];
-    else if (a === '--agent-bin') o.agentBin = argv[++i];
+    else if (a === '--agent-bin' || a.startsWith('--agent-bin=')) {
+      if (!a.startsWith('--agent-bin=')) o.agentBin = argv[++i];
+      else o.agentBin = a.slice(a.indexOf('=') + 1);
+      if (!o.agentBin || String(o.agentBin).startsWith('--')) { console.error('[FAIL-CLOSED] --agent-bin 需要 codex 或 claude'); process.exit(1); }
+    }
     else if (a === '--packet-file') o.packetFile = argv[++i];
     else if (a === '--force-recheck') o.forceRecheck = true;
+    else if (a === '--help' || a === '-h') o.help = true;
+    else if (/^--(model|reasoning-effort)(=|$)/.test(a)) {
+      const eq = a.indexOf('=');
+      const name = eq < 0 ? a : a.slice(0, eq);
+      const key = name === '--model' ? 'model' : 'reasoningEffort';
+      if (eq >= 0) o[key] = a.slice(eq + 1);
+      else o[key] = (argv[i + 1] == null || String(argv[i + 1]).startsWith('--')) ? '' : argv[++i];
+    }
   }
   return o;
 }
+
+const REVIEW_CLI_HELP = [
+  '用法: node authentic-review.js --pr <id> --repo <owner/repo> [options]',
+  '',
+  '可选参数（default-off：未传且未设置对应环境变量时，不向 codex/claude 附加模型参数）:',
+  '  --model <id>                 透传模型。优先级: 该参数 > REVIEW_MODEL > runtime 默认',
+  '                               codex: -m <id>；claude: --model <id>',
+  '  --reasoning-effort <level>   透传推理强度。优先级: 该参数 > REVIEW_REASONING_EFFORT > runtime 默认',
+  '                               允许: none|minimal|low|medium|high|xhigh|max|ultra',
+  '                               codex: -c model_reasoning_effort=<level>；claude: --effort <level>',
+  '  --agent-bin <codex|claude>   审查执行器，默认 codex（或 REVIEW_AGENT_BIN）',
+  '',
+  '空值、换行/空白/控制字符、非法 reasoning-effort 一律 Fail-Closed。',
+  '传给 CLI 的是原始模型 ID；result.json 与 Reviewer 行的 declared_model 只保留产品家族名。',
+].join('\n');
 
 function sh(bin, args, timeoutMs, env, input) {
   return spawnSync(bin, args, {
@@ -521,6 +548,13 @@ function isolatedGateEnv(baseEnv = process.env) {
   delete clean.REVIEW_UPSERT_PUBLISH;
   delete clean.REVIEW_BACKOFF_BASE_MS;
   delete clean.REVIEW_MAX_RETRIES;
+  // bin/loopx-flow exports these for its own run directory. gates() spawns
+  // `npm test`; inheriting them points issue-8 at a foreign sandbox and caps
+  // the review verdict on a false failure.
+  delete clean.LOOPX_TMP_DIR;
+  delete clean.LOOPX_KEEP_TMP;
+  delete clean.REVIEW_MODEL;
+  delete clean.REVIEW_REASONING_EFFORT;
   return clean;
 }
 
@@ -598,13 +632,16 @@ function runEvidenceCommands(evidenceCommands) {
 }
 
 function readConfiguredReviewModel() {
-  const clean = (v) => String(v || '').replace(/[\r\n]+/g, '-').replace(/[\/:@`]/g, '-').trim();
-  if (process.env.REVIEW_MODEL) return clean(process.env.REVIEW_MODEL);
+  const raw = (v) => {
+    const s = String(v || '').trim();
+    return s || null;
+  };
+  if (process.env.REVIEW_MODEL) return raw(process.env.REVIEW_MODEL);
   try {
     const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     const text = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
     const m = text.match(/^model\s*=\s*"([^"]+)"/m);
-    return m ? clean(m[1]) : null;
+    return m ? raw(m[1]) : null;
   } catch (_) { return null; }
 }
 
@@ -742,10 +779,168 @@ function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
   return lines.join('\n');
 }
 
+// 宿主截断特征（如 `[... 44229 bytes omitted ...]`）。只匹配带字节数的方括号标记，
+// 避免误杀正文里讨论 “bytes omitted” 机制的正常审查。
+const HOST_TRUNCATION_RE = /\[\s*\.{3}\s*\d+\s*bytes\s+omitted\s*\.{3}\s*\]/i;
+const DEFAULT_STDIN_BYTE_LIMIT = 64 * 1024;
+
+function stdinByteLimit() {
+  const raw = process.env.REVIEW_STDIN_BYTE_LIMIT;
+  if (raw == null || String(raw).trim() === '') return DEFAULT_STDIN_BYTE_LIMIT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1024) return DEFAULT_STDIN_BYTE_LIMIT;
+  return Math.floor(n);
+}
+
+function assertCompactStdin(prompt) {
+  const bytes = Buffer.byteLength(String(prompt || ''));
+  const limit = stdinByteLimit();
+  return { ok: bytes <= limit, bytes, limit };
+}
+
+function truncationMarkers(text) {
+  return String(text || '').match(new RegExp(HOST_TRUNCATION_RE.source, 'gi')) || [];
+}
+function novelHostTruncation(diffText, ...parts) {
+  const diff = diffText == null ? null : String(diffText);
+  return parts.some((part) => truncationMarkers(part).some((marker) => diff == null || !diff.includes(marker)));
+}
+function hostOutputTruncated(...parts) { return novelHostTruncation(null, ...parts); }
+function formatPriorForStdin(priorFindings, hasManifest) {
+  const list = priorFindings || [];
+  if (!hasManifest) return list.map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
+  if (!list.length) return '(无上轮 findings)';
+  return `${list.length} 条，只读沙箱 \`prior-findings.md\`。` + list.map(f => `#${f.index}[${f.severity}]`).join(' ');
+}
+function formatRemoteChecksForStdin(remoteChecks, remoteChecksError, hasManifest) {
+  if (!hasManifest) return formatRemoteChecksText(remoteChecks, remoteChecksError);
+  const rows = Array.isArray(remoteChecks) ? remoteChecks : [];
+  const pass = rows.filter(c => c && (c.bucket === 'pass' || c.state === 'SUCCESS')).length;
+  return `${rows.length} 项（通过 ${pass}）${remoteChecksError ? '；获取失败见文件' : ''}。只读沙箱 \`remote-checks.txt\`。`;
+}
+
+function materializeReviewSandbox(runDir, files) {
+  const entries = [];
+  for (const [name, text] of Object.entries(files || {})) {
+    if (text == null) continue;
+    const body = typeof text === 'string' ? text : JSON.stringify(text, null, 2);
+    const file = runDir.file(name);
+    fs.writeFileSync(file, body, 'utf8');
+    entries.push({
+      name,
+      path: file,
+      bytes: Buffer.byteLength(body),
+      lines: body === '' ? 0 : body.split('\n').length,
+    });
+  }
+  return entries;
+}
+
+function formatArtifactManifest(entries) {
+  if (!entries || !entries.length) return '(无沙箱工件)';
+  return entries.map((e) => `- \`${e.name}\`: \`${e.path}\` (${e.bytes} bytes, ${e.lines} lines)`).join('\n');
+}
+
+function formatRemoteChecksText(remoteChecks, remoteChecksError) {
+  if (Array.isArray(remoteChecks) && remoteChecks.length) {
+    return remoteChecks.map((c) => `- \`${c.name || 'check'}\`: state=${c.state || 'unknown'}, bucket=${c.bucket || 'unknown'}${c.link ? ` (${c.link})` : ''}`).join('\n');
+  }
+  return remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)';
+}
+
+// loopx 2.3.0 reasoning_effort.REASONING_EFFORTS。非法值 Fail-Closed，不静默降级。
+const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const REASONING_EFFORT_SET = new Set(REASONING_EFFORTS);
+const DECLARED_MODEL_PREFIXES = [/^agy-cli\//i, /^auto\//i, /^magpie\//i, /^provider:/i];
+
+function failClosed(message) {
+  const err = new Error(`[FAIL-CLOSED] ${message}`);
+  err.failClosed = true;
+  return err;
+}
+
+function assertPlainToken(value, label) {
+  const s = String(value);
+  if (s.trim() === '') throw failClosed(`${label} 为空，拒绝执行`);
+  if (/[\u0000-\u001F\u007F]/.test(s) || /\s/.test(s)) {
+    throw failClosed(`${label} 含换行、空白或控制字符，拒绝执行`);
+  }
+  return s.trim();
+}
+
+// CLI 显式值优先于环境变量；两者都缺省时返回 null，调用方不得追加参数（default-off）。
+function resolveReviewRuntimeSelection(selection) {
+  const input = selection || {};
+  const env = input.env || process.env;
+  const modelSource = Object.prototype.hasOwnProperty.call(input, 'model')
+    ? input.model
+    : (Object.prototype.hasOwnProperty.call(env, 'REVIEW_MODEL') ? env.REVIEW_MODEL : null);
+  const effortSource = Object.prototype.hasOwnProperty.call(input, 'reasoningEffort')
+    ? input.reasoningEffort
+    : (Object.prototype.hasOwnProperty.call(env, 'REVIEW_REASONING_EFFORT') ? env.REVIEW_REASONING_EFFORT : null);
+  const model = modelSource == null ? null : assertPlainToken(modelSource, '--model / REVIEW_MODEL');
+  let reasoningEffort = null;
+  if (effortSource != null) {
+    reasoningEffort = assertPlainToken(effortSource, '--reasoning-effort / REVIEW_REASONING_EFFORT');
+    if (!REASONING_EFFORT_SET.has(reasoningEffort)) {
+      throw failClosed(`--reasoning-effort / REVIEW_REASONING_EFFORT 非法值 "${reasoningEffort}"，允许: ${REASONING_EFFORTS.join('|')}`);
+    }
+  }
+  return { model, reasoningEffort };
+}
+
+// 发布用产品家族名。原始模型 ID 仍原样传给 CLI。剥离 router/gateway/协议前缀与 URL，
+// 去掉 model@version 的版本限定，使 declared_model 通过 loopx REVIEWER_DECLARATION（禁止 / : @）。
+function declaredModelFamily(value, fallback) {
+  let s = String(value == null ? '' : value).trim();
+  if (!s) s = String(fallback == null ? '' : fallback).trim();
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  s = s.split(/[?#]/)[0].trim();
+  for (let i = 0; i < 8; i += 1) {
+    const next = DECLARED_MODEL_PREFIXES.reduce((acc, re) => acc.replace(re, ''), s).trim();
+    if (next === s) break;
+    s = next;
+  }
+  if (s.includes('/')) {
+    const parts = s.split('/').filter(Boolean);
+    s = parts.length ? parts[parts.length - 1] : s;
+  }
+  if (s.includes('@')) s = s.split('@')[0];
+  s = s.replace(/[\u0000-\u001F\u007F]/g, '').replace(/[\/:@`]/g, '').trim();
+  if (!s) {
+    const fb = String(fallback == null ? '' : fallback).replace(/[\/:@`]/g, '').trim();
+    return fb || 'codex';
+  }
+  return s;
+}
+
+// codex --add-dir 在 `codex exec --help` 中是可写附加目录，故不用它。
+// 只读边界：`--sandbox read-only` + `-C <runDir>`。claude 仅开放 Read，并用 --add-dir 访问沙箱。
+// selection 缺省时读取 REVIEW_MODEL / REVIEW_REASONING_EFFORT；都未设置则 argv 与历史默认完全一致。
+function reviewAgentArgs(agentBin, runDir, tmpMsg, selection) {
+  const { model, reasoningEffort } = resolveReviewRuntimeSelection(selection);
+  if (String(agentBin || '').includes('claude')) {
+    const args = ['-p', '--tools', 'Read', '--permission-mode', 'dontAsk'];
+    if (runDir && runDir.dir) args.push('--add-dir', runDir.dir);
+    if (model) args.push('--model', model);
+    if (reasoningEffort) args.push('--effort', reasoningEffort);
+    return args;
+  }
+  const args = ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral'];
+  if (runDir && runDir.dir) args.push('-C', runDir.dir);
+  if (model) args.push('-m', model);
+  if (reasoningEffort) args.push('-c', `model_reasoning_effort=${reasoningEffort}`);
+  if (tmpMsg) args.push('-o', tmpMsg);
+  args.push('-');
+  return args;
+}
+
 // 用原生 review_template（agent_instruction + 字数下限）+ evidence_commands + motivation 构建提示词。
 // 注意：这是"透传原生提示词约束"，不是手写版式。模型被要求严格按五段式产出。
-function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract, remoteChecks, remoteChecksError }) {
-  const prior = (priorFindings || []).map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n') || '(无上轮 findings)';
+// diff / evidence 正文落在沙箱文件，stdin 只带清单（artifactManifest）。
+function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, reviewPlan, evidenceCommands, evidenceText, diff, priorFindings, evidenceContract, remoteChecks, remoteChecksError, artifactManifest }) {
+  const hasManifest = Boolean(artifactManifest);
+  const prior = formatPriorForStdin(priorFindings, hasManifest);
   const sectionsMd = (reviewTemplate.sections || []).map(s =>
     `### ${s.label}（最少 ${s.minimum_prose_characters} 正文字符）\n约束提示词：${s.agent_instruction || ''}`,
   ).join('\n\n');
@@ -753,16 +948,16 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   const evdCmds = (evidenceCommands || []).map(c => `- \`${c}\``).join('\n');
   const requiredIds = (reviewPlan.required_evidence_ids || []).join(', ');
   const evidenceRequirements = formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan);
-  const remoteChecksText = Array.isArray(remoteChecks) && remoteChecks.length
-    ? remoteChecks.map(c => `- \`${c.name || 'check'}\`: state=${c.state || 'unknown'}, bucket=${c.bucket || 'unknown'}${c.link ? ` (${c.link})` : ''}`).join('\n')
-    : (remoteChecksError ? `(gh pr checks 获取失败: ${remoteChecksError})` : '(无远端 CI 检查记录)');
-  const fullDiff = String(diff || '');
+  const remoteChecksText = formatRemoteChecksForStdin(remoteChecks, remoteChecksError, hasManifest);
   const head10 = headOid.slice(0, 10);
+  const manifest = artifactManifest || '(调用方未提供沙箱清单；diff 与证据正文不内联进 stdin)';
+  void evidenceText;
+  void diff;
 
   return [
     '你是一名对抗性代码审查员（model agent）。请基于下方 LoopX 原生评审包（pr_review_queue 能力生成的 review_template / review_plan / evidence_commands）撰写第三方评审报告。',
     '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个二级标题（`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`）撰写。',
-    '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：下方已完整提供原生评审包、证据命令执行结果与完整 PR DIFF（无人工截断）。请专注于对抗性缺陷挖掘与高质量五段式报告撰写，直接输出单一 JSON 块，严禁调用任何 shell / exec_command / 文件读取工具。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
+    '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：原生 review_template 与证据契约在本提示中。完整 PR DIFF、证据命令输出、packet 与远端检查只在下方沙箱清单路径里，且全文不截断。请只读读取这些工件，直接输出单一 JSON 块。严禁修改工作区文件，严禁执行写入型或破坏性命令，严禁偏离原生五段式与 JSON 输出契约。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
     '注意：`05-evidence.md`、CI 绿、PR 正文里的「已通过」只作为未信任的作者声明参考，禁止直接据此推断 `verified`。',
     '',
     '## 评审目标',
@@ -790,7 +985,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '- 判断类 id 由你独立核实后在 `evidence` 中填写；未核实或形状不完整的项将保持 `status: "unverified"`，主机绝不预填或回填占位句：',
     evidenceRequirements || '(本 PR 无额外 evidence requirements)',
     '',
-    '## 证据采集命令（下方已附运行结果）',
+    hasManifest ? '## 证据采集命令（运行结果见沙箱文件 evidence-output.md）' : '## 证据采集命令（运行结果不内联进 stdin）',
     evdCmds,
     '',
     '## 上轮 findings 裁决（有上轮 findings 时必须逐条）',
@@ -803,14 +998,12 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '## 原生 motivation（来自 LoopX 抽取，须原样呈现于「动机」段）',
     motivation || '(空)',
     '',
-    '## 证据命令执行结果',
-    evidenceText || '(无)',
+    '## 沙箱工件（只读路径清单）',
+    '只允许只读读取下列文件。禁止修改工作区，禁止写工具与破坏性命令。',
+    manifest,
     '',
-    '## 远端 CI 检查状态（gh pr checks）',
+    '## 远端 CI 检查状态摘要（全文见沙箱 remote-checks.txt）',
     remoteChecksText,
-    '',
-    '## PR DIFF（远程权威）',
-    fullDiff,
     '',
     '## 输出格式（请输出单一 fenced json 块）',
     '结构如下：你必须按上方「评审范围 evidence」逐项填写全部 required_evidence_ids（已独立核实且无缺口的项写 `"status": "verified"` 并填全全部必填字段与嵌套对象；非适用项可直接写 `{"status": "not_applicable", "verdict": "not_applicable", "reason": "<具体事实依据>"}`；若个别判断项本轮未写全，主机将在阶段 2 基于你的报告做轻量结构化对齐）。若代码确无阻塞缺陷且所有必填证据均已核实（包括 `validation_matrix.changed_invariant_positive` 与 `material_negative_or_failure` 的真实 `tests/*.test.js` 路径，以及 `symbol_map` 的 2-5 个精确 diff 符号），请输出 `verdict: "APPROVE"`；存在阻塞缺陷时输出 `REQUEST_CHANGES`。其中 `evidence.problem_context` 必须提供 `affected_caller_or_operator`、`before_after_scenario`、`observable_outcome`、`non_goals`、`outcome_impact`（含 `user_experience.visual_review`）和 `spec_basis` 并写入「动机」段；`verdict` 为 `justified_increment` 时还必须提供 `remaining_gap` 并写入同一段：',
@@ -852,7 +1045,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   ].join('\n');
 }
 
-function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, missingIds, missingValidationCases, evidenceContract, reviewPlan, evidenceText, validation }) {
+function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, missingIds, missingValidationCases, evidenceContract, reviewPlan, evidenceText, validation, artifactManifest }) {
   const files = listFiles(diff || '');
   const st = diffStats(diff || '');
   const filteredPlan = {
@@ -875,7 +1068,7 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
     '1. 严禁输出空数组 `[]` 或空对象 `{}`（会被判定为缺失）：例如无未核实维度时 `unverified_dimensions` 写 `["none: all applicable dimensions verified"]`，无变更时 `intentional_deltas` / `normalization_rules` 写 `["none: ..."]` 或 `"none: ..."`。',
     '2. `problem_context` 的 `affected_caller_or_operator` / `before_after_scenario` / `observable_outcome` / `non_goals` / `remaining_gap` 以及 `architecture_assessment` 的 `reason` / `current_pr_boundary` / `validation_evidence` / `mechanisms[*].*` 必须是**字符串**（不得输出数组）。',
     '3. `observable_semantics` 顶层不允许 `not_applicable`（`verdict_values=equivalent|intentional_change_validated|unintended_drift|not_yet_proven`），请结合基准分支、精确 head、阶段 1 报告与下方校验实测填全全部 13 个 `fields`（仅其内部嵌套的 `scope_coverage` / `decision_text_assessment` 在确实无门控范围或决策文本语义变化时可使用 `not_applicable`）。',
-    '执行铁律：直接输出单一 fenced json 块 `{"evidence": { ... }}`，严禁调用任何 shell / 文件读取工具。',
+    '执行铁律：直接输出单一 fenced json 块 `{"evidence": { ... }}`。只允许只读读取本次沙箱清单中的工件（含 `stage1-review.md`）；严禁修改工作区或执行写操作。',
     '',
     `- PR: #${pr} · 基准 \`${effectiveBase}\` · 分支 \`${branch}\` · 精确 head \`${head10}\` (\`${headOid}\`)`,
     `- 改动文件列表（共 ${files.length} 个文件，+${st.additions}/-${st.deletions}）：${files.join(', ') || '(无)'}`,
@@ -883,7 +1076,8 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
     '## 主机本地校验与门禁摘要',
     validationSummary,
     '',
-    ...(evText ? ['## 证据采集命令输出摘要', evText, ''] : []),
+    ...(artifactManifest ? ['## 沙箱工件（只读路径清单）', artifactManifest, ''] : []),
+    ...(artifactManifest ? [] : (evText ? ['## 证据采集命令输出摘要', evText, ''] : [])),
     '## 待补齐的证据项契约',
     reqText || '(无)',
     '',
@@ -893,9 +1087,9 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
       '- 请根据下方阶段 1 评审报告及本次改动文件列表，在 `evidence.validation_matrix` 中补充仓库内已存在的 `tests/**/*.test.js` 文件路径（例如 `{"changed_invariant_positive":{"test_path":"tests/unit/xxx.test.js"}}`），主机将在阶段 2 后直接执行 `node --test <path>` 实测核验。',
       '',
     ] : []),
-    '## 阶段 1 已产出的评审报告正文',
-    String(reviewBody || ''),
-    '',
+    ...(artifactManifest
+      ? ['## 阶段 1 评审报告', '正文在沙箱 `stage1-review.md`，请只读该文件，本 stdin 不内联报告正文。', '']
+      : ['## 阶段 1 已产出的评审报告正文', String(reviewBody || ''), '']),
     '## 输出格式',
     '```json',
     JSON.stringify({
@@ -911,13 +1105,20 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
   ].join('\n');
 }
 
-function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
+function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, selection) {
   const resolvedBin = findOnPath(agentBin, process.env.PATH);
   if (!resolvedBin) return { unavailable: true };
-  // ADR-0013 / REQ-REVIEW-2: 通过 stdin 流式传输提示词，禁止用 CLI argv 传巨型字符串触碰 ARG_MAX。
-  const args = agentBin.includes('claude') ? ['-p'] : ['exec', '-'];
+  const compact = assertCompactStdin(prompt);
+  if (!compact.ok) {
+    return {
+      stdinRejected: true,
+      error: `inline stdin is ${compact.bytes} bytes, over the fail-closed limit ${compact.limit}`,
+    };
+  }
+  // ADR-0013 / REQ-REVIEW-2: stdin 只送紧凑引导。codex 用 --sandbox read-only 与 -C runDir；
+  // claude 只用 Read，并用 --add-dir 访问沙箱。禁止 --add-dir 加到 codex（该 flag 为可写目录）。
   let tmpMsg = null;
-  if (!agentBin.includes('claude')) {
+  if (!String(agentBin).includes('claude')) {
     if (runDir) {
       tmpMsg = runDir.file(`codex-review-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.txt`);
     } else {
@@ -925,7 +1126,12 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
       fs.mkdirSync(tmpRoot, { recursive: true });
       tmpMsg = path.join(tmpRoot, `codex-review-${process.pid}-${crypto.randomBytes(6).toString('hex')}.txt`);
     }
-    args.splice(1, 0, '-o', tmpMsg);
+  }
+  let args;
+  try {
+    args = reviewAgentArgs(agentBin, runDir, tmpMsg, selection);
+  } catch (err) {
+    return { error: err && err.message ? err.message : String(err) };
   }
   try {
     const r = spawnSync(resolvedBin, args, {
@@ -935,11 +1141,23 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir) {
       maxBuffer: 64 * 1024 * 1024,
       timeout: timeoutMs || TIMEOUT_MS,
     });
-    if (r.status !== 0) return { error: `exit ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 300)}` };
-    if (tmpMsg && fs.existsSync(tmpMsg)) {
-      return { stdout: fs.readFileSync(tmpMsg, 'utf8') };
+    const rawStdout = r.stdout || '';
+    const msgOut = (tmpMsg && fs.existsSync(tmpMsg)) ? fs.readFileSync(tmpMsg, 'utf8') : '';
+    const stderr = r.stderr || '';
+    const modelChannel = String(msgOut).trim() ? msgOut : rawStdout;
+    const codex = !String(agentBin).includes('claude');
+    const modelReady = r.status === 0 && String(modelChannel).trim().length > 0;
+    const truncParts = [modelChannel];
+    if (rawStdout && rawStdout !== modelChannel) truncParts.push(rawStdout);
+    if (!(codex && modelReady)) truncParts.push(stderr);
+    if (novelHostTruncation(diffText, ...truncParts)) {
+      return { truncated: true, stdout: modelChannel, stderr, rawStdout, error: 'host truncation marker in model output' };
     }
-    return { stdout: r.stdout };
+    if (r.status !== 0) {
+      const diag = String(stderr || rawStdout || msgOut || '');
+      return { error: `exit ${r.status}: ${diag.slice(0, 300)}`, stdout: modelChannel, stderr, rawStdout };
+    }
+    return { stdout: modelChannel, stderr, rawStdout };
   } finally {
     if (tmpMsg && !runDir) {
       try { fs.rmSync(tmpMsg, { force: true }); } catch (_) {}
@@ -1103,8 +1321,8 @@ function bodyFormatPasses(checkReport) {
 // 仅当 LoopX 运行时（packet.reviewer_execution.status === 'runtime_reported'）才声明
 // runtime_reported，并携带 model/provider/reasoning_effort/observation_id；
 // 第三方模型自报（无运行时绑定）一律 self_reported，禁止伪造运行时观测。
-function resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel) {
-  const sanitize = (value, fallback) => {
+function resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel, explicitRawModel) {
+  const sanitizeName = (value, fallback) => {
     const s = String(value || fallback || '').replace(/[\/:@\r\n`]/g, '-').trim();
     return s || String(fallback || '');
   };
@@ -1113,20 +1331,22 @@ function resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredMo
     return {
       actor_kind: 'model_agent',
       declaration_source: 'runtime_reported',
-      declared_model: sanitize(execution.model, configuredModel || primaryAgent),
-      declared_provider: sanitize(execution.provider, 'openai'),
-      declared_reasoning_effort: sanitize(execution.reasoning_effort, 'effort_unavailable'),
-      execution_observation_id: sanitize(execution.observation_id, 'observation-unavailable'),
+      declared_model: declaredModelFamily(execution.model, explicitRawModel || configuredModel || primaryAgent),
+      declared_provider: sanitizeName(execution.provider, 'openai'),
+      declared_reasoning_effort: sanitizeName(execution.reasoning_effort, 'effort_unavailable'),
+      execution_observation_id: sanitizeName(execution.observation_id, 'observation-unavailable'),
     };
   }
   const modelDecl = modelOut && modelOut.reviewer && typeof modelOut.reviewer === 'object'
     ? modelOut.reviewer
     : null;
+  const reported = modelDecl && modelDecl.declared_model;
+  const raw = explicitRawModel || reported || configuredModel || primaryAgent;
   return {
     actor_kind: 'model_agent',
     declaration_source: 'self_reported',
-    declared_model: sanitize(modelDecl && modelDecl.declared_model, configuredModel || primaryAgent),
-    declared_provider: sanitize(modelDecl && modelDecl.declared_provider, 'openai'),
+    declared_model: declaredModelFamily(raw, primaryAgent || 'codex'),
+    declared_provider: sanitizeName(modelDecl && modelDecl.declared_provider, 'openai'),
   };
 }
 
@@ -1218,6 +1438,20 @@ function acceptModelOutput(raw) {
 // ---------------------------------------------------------------------------
 function main() {
   const o = parseArgs(process.argv);
+  if (o.help) {
+    console.log(REVIEW_CLI_HELP);
+    process.exit(0);
+  }
+  let runtimeSelection;
+  try {
+    const cliSelection = {};
+    if (Object.prototype.hasOwnProperty.call(o, 'model')) cliSelection.model = o.model;
+    if (Object.prototype.hasOwnProperty.call(o, 'reasoningEffort')) cliSelection.reasoningEffort = o.reasoningEffort;
+    runtimeSelection = resolveReviewRuntimeSelection(cliSelection);
+  } catch (err) {
+    console.error(err && err.message ? err.message : err);
+    process.exit(1);
+  }
 
   // PR 提交版式预览（对齐 PR #7545 双语 4-Part）
   const repoRoot = resolveRepoRoot(process.cwd());
@@ -1387,6 +1621,13 @@ function main() {
   const remoteChecksRes = fetchPrChecks(o.repo, o.pr);
   const remoteChecks = remoteChecksRes.checks;
   const remoteChecksError = remoteChecksRes.error;
+  const remoteChecksText = formatRemoteChecksText(remoteChecks, remoteChecksError);
+  const sandboxEntries = materializeReviewSandbox(runDir, {
+    'packet.json': JSON.stringify(packet, null, 2),
+    'pr.diff': String(diff || ''),
+    'evidence-output.md': String(evidenceText || ''),
+    'remote-checks.txt': remoteChecksText,
+  });
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
     try { validation = buildValidationMatrix(gates(), { headOid, remoteChecks }); } catch (e) { validation = []; }
@@ -1399,6 +1640,10 @@ function main() {
     console.error('[NOT_VERIFIED] carryover 文件在本 PR 被修改，历史 findings 完整性不可信；请从私有 review artifact 提供。');
     process.exit(1);
   }
+  const priorEntries = priorFindings.length ? materializeReviewSandbox(runDir, {
+    'prior-findings.md': priorFindings.map(f => `- #${f.index} [${f.severity}] \`${f.file}\`:${f.line == null ? '-' : f.line} — ${f.summary}`).join('\n'),
+  }) : [];
+  const artifactManifest = formatArtifactManifest([...sandboxEntries, ...priorEntries]);
   const prompt = buildNativePrompt({
     pr: o.pr, headOid, branch: head.headRefName, motivation: pkt.motivation,
     reviewTemplate: pkt.reviewTemplate, reviewPlan: pkt.reviewPlan,
@@ -1406,13 +1651,14 @@ function main() {
     evidenceContract: pkt.evidenceContract || {},
     remoteChecks,
     remoteChecksError,
+    artifactManifest,
   });
 
-  // --- 4. 跑真实模型审查（默认模型；不传 -m/--model）---
+  // --- 4. 跑真实模型审查（default-off：仅显式 CLI/env 才附加 -m/--model 与 reasoning effort）---
   const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || 'codex';
   const stage1PromptFile = writePromptArtifact(runDir, o.pr, headOid, prompt, 'stage1');
   console.log(`[i] 阶段 1 评审提示词已写入沙箱文件: ${stage1PromptFile} (通过 stdin 流式传入 ${primaryAgent})`);
-  const agentRun = runReviewAgent(primaryAgent, prompt, undefined, runDir);
+  const agentRun = runReviewAgent(primaryAgent, prompt, undefined, runDir, diff, runtimeSelection);
   if (agentRun.unavailable) {
     console.error(`[NOT_VERIFIED] ${primaryAgent} CLI unavailable; refusing to publish an unreviewed report.`);
     process.exit(1);
@@ -1427,11 +1673,15 @@ function main() {
     console.error('[NOT_VERIFIED] model output missing review_body/verdict/declaration; refusing to publish.');
     process.exit(1);
   }
+  if (novelHostTruncation(diff, modelOut.review_body, JSON.stringify(modelOut.findings || []), agentRun.stdout)) {
+    console.error('[NOT_VERIFIED] 模型输出命中宿主截断特征，拒绝发布。');
+    process.exit(1);
+  }
   let verdict = modelOut.verdict;
   const findings = modelOut.findings;
   // 声明来源由宿主运行时裁决，不信任模型自报的 runtime_reported（原生 reviewer_declaration 契约）。
   const configuredModel = primaryAgent.includes('claude') ? null : readConfiguredReviewModel();
-  const reviewer = resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel);
+  const reviewer = resolveReviewerDeclaration(packet, modelOut, primaryAgent, configuredModel, runtimeSelection.model);
   console.log(`[i] Reviewer 声明: ${reviewer.declaration_source} · model=${reviewer.declared_model} · provider=${reviewer.declared_provider}`);
 
   // 模型若携带 headOid 且与当前 PR head 不一致 -> 视为 head 漂移，fail-closed（INV2）
@@ -1477,6 +1727,10 @@ function main() {
         .map(it => it.case_id)
     : [];
   if (verdict === 'APPROVE' && (unverifiedForStage2.length > 0 || unverifiedValidationCases.length > 0) && process.env.REVIEW_TWO_STAGE_ALIGNMENT !== '0') {
+    const stage2Entries = materializeReviewSandbox(runDir, {
+      'stage1-review.md': String(modelOut.review_body || ''),
+    });
+    const stage2Manifest = formatArtifactManifest([...sandboxEntries, ...priorEntries, ...stage2Entries]);
     const stage2Prompt = buildStage2Prompt({
       pr: o.pr,
       headOid,
@@ -1490,10 +1744,15 @@ function main() {
       reviewPlan: pkt.reviewPlan || {},
       evidenceText,
       validation,
+      artifactManifest: stage2Manifest,
     });
     const stage2PromptFile = writePromptArtifact(runDir, o.pr, headOid, stage2Prompt, 'stage2');
     console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length + unverifiedValidationCases.length} 项): ${stage2PromptFile}`);
-    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt, undefined, runDir);
+    const stage2Run = runReviewAgent(primaryAgent, stage2Prompt, undefined, runDir, diff, runtimeSelection);
+    if (stage2Run.truncated || stage2Run.stdinRejected) {
+      console.error(`[NOT_VERIFIED] 阶段 2 拒绝发布：${stage2Run.error}`);
+      process.exit(1);
+    }
     if (!stage2Run.unavailable && !stage2Run.error) {
       const parsedStage2 = extractJson(stage2Run.stdout || '');
       const stage2Evidence = parsedStage2 && parsedStage2.evidence && typeof parsedStage2.evidence === 'object'
@@ -1563,7 +1822,11 @@ function main() {
   if (o.crossValidate) {
     const secondaryAgent = primaryAgent.includes('claude') ? 'codex' : 'claude';
     console.log(`==> [S5] Cross-validating with ${secondaryAgent} (default model)...`);
-    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir);
+    const cv = runReviewAgent(secondaryAgent, prompt, undefined, runDir, diff, { model: null, reasoningEffort: null });
+    if (cv.truncated || cv.stdinRejected) {
+      console.error(`[NOT_VERIFIED] 交叉核验命中截断或 stdin 超限，拒绝发布：${cv.error}`);
+      process.exit(1);
+    }
     if (!cv.unavailable && !cv.error) {
       const sec = acceptModelOutput(extractJson(cv.stdout || ''));
       if (sec) {
@@ -1686,9 +1949,18 @@ module.exports = {
   formatEvidenceRequirementsForPrompt,
   capVerdictInBody,
   runReviewAgent,
+  reviewAgentArgs,
+  materializeReviewSandbox,
+  formatArtifactManifest,
+  assertCompactStdin,
+  hostOutputTruncated,
+  stdinByteLimit,
   parsePolicyRevision,
   resolveLoopxExecutable,
   resolveReviewPolicyRevision,
   isolatedGateEnv,
   gates,
+  resolveReviewRuntimeSelection,
+  declaredModelFamily,
+  resolveReviewerDeclaration,
 };
