@@ -23,6 +23,12 @@ function setupMocks() {
   fs.writeFileSync(path.join(MOCK_BIN_DIR, 'loopx'), `#!/usr/bin/env bash
 echo "$*" >> ${CALLS_LOG}
 args="$*"
+# ADR-0015 能力探针会先读取真实子命令帮助；fake CLI 必须提供完整签名。
+if [[ "$args" == *"--help"* ]]; then
+  echo "--goal-id --todo-id --agent-id --claimed-by --claim-operation-id --required-write-scope --task-domain --task-repository --validation-command --operation-id --task-class --decision-scope --decision-outcome --global-gate --result-json --execute --base-ref --strict --check-merge-readiness --check-result stop sync-global --state-file configure status sync feasibility verify --format"
+  exit 0
+fi
+if [[ "$args" == "--version" ]]; then echo "loopx 2.3.0"; exit 0; fi
 goal=""; todo=""
 for ((i=1; i<=$#; i++)); do
   case "\${!i}" in
@@ -243,7 +249,7 @@ test('5. Issue feasibility routing: must consult loopx issue-fix feasibility and
   setupMocks();
   try {
     const res = runFlow(['issue', '123', '--reproduction', 'confirmed', '--scope', 'bounded']);
-    assert.strictEqual(res.status, 0, `issue must succeed: ${res.stderr}`);
+    assert.strictEqual(res.status, 0, `issue must succeed: ${res.stdout}\n${res.stderr}`);
     const calls = callsText();
     assert.strictEqual(calls.includes('issue-fix feasibility'), true, 'must invoke issue-fix feasibility');
     assert.strictEqual(calls.includes('--reproduction-status confirmed'), true, 'must pass reproduction observation');
@@ -265,7 +271,7 @@ test('6. Integrate: preview by default, --execute only when explicit, --status p
   setupMocks();
   try {
     const preview = runFlow(['integrate']);
-    assert.strictEqual(preview.status, 0, `integrate preview must succeed: ${preview.stderr}`);
+    assert.strictEqual(preview.status, 0, `integrate preview must succeed: ${preview.stdout}\n${preview.stderr}`);
     let calls = callsText();
     assert.strictEqual(calls.includes('integration-branch sync'), true, 'must call integration-branch sync');
     assert.strictEqual(

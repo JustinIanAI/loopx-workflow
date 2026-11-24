@@ -55,6 +55,12 @@ run_loopx() {
     fi
 }
 
+# ADR-0015 三层能力探针唯一入口：--help 签名 + schema_version 白名单 + 版本软提示。
+# 返回 0 表示无 BLOCK；返回 1 表示关键能力缺失/UNKNOWN 或 schema 失配，诊断卡由探针输出。
+probe_loopx_capabilities() {
+    node "$WORKFLOW_ROOT/lib/loopx-capability-probe.js" "$@"
+}
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -139,7 +145,9 @@ usage() {
   context <feature>       生成当前特性的长程上下文胶囊，供开发者与 AI Agent 快速穿透审阅
   archive <feature>       原子归档已合入特性的资产包 (specs/features/ -> specs/archive/)
   gate verify <stage> <f> 阶段流转物理熔断守卫 (decisions | contract)
-  doctor                  前置环境与 LoopX 就绪度全维评分 (preflight + loopx doctor)
+  doctor                  前置环境与 LoopX 就绪度全维评分 (preflight + loopx doctor + 三层能力矩阵)
+  capabilities [--command issue|integrate|doctor] [--payload-file <path>] [--format text|json]
+                          ADR-0015 三层能力/schema_version Fail-Closed 探针（BLOCK 时非 0 + 升级差异诊断卡）
   gc [--days N] [--force] 并发安全清理 .loopx/cache/reviews/ 与 .loopx/tmp/ 过期工件（默认 14 天，1h 活跃保护）
   init                    初始化项目工作流骨架、依赖及本地 LoopX 连接
   status                  查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
@@ -361,7 +369,18 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2) + "\n");
     echo -e "${GREEN}[✓] 已写入授权配置: $f (authorization_mode=$mode)${NC}"
 }
 
+cmd_capabilities() {
+    probe_loopx_capabilities "$@"
+}
+
 cmd_doctor() {
+    local probe_rc=0
+    echo -e "${BLUE}==> [0/3] LoopX 三层能力探针 / 能力矩阵 (ADR-0015)...${NC}"
+    probe_loopx_capabilities --command doctor --format text || probe_rc=$?
+    if [[ "$probe_rc" -ne 0 ]]; then
+        echo -e "\n${YELLOW}[i] 能力矩阵存在 BLOCK 项：相关 L0 命令已 fail-closed；doctor 仅作阶段 0 体检。${NC}"
+    fi
+
     echo -e "${BLUE}==> [1/3] 运行流水线前置哨兵体检 (Preflight Sentinel)...${NC}"
     "$WORKFLOW_ROOT/scripts/preflight-check.sh"
 
@@ -2359,6 +2378,9 @@ cmd_issue() {
         exit 1
     fi
 
+    # ADR-0010 T2 / ADR-0015：issue-fix.feasibility 为 BLOCK 能力，缺失或 UNKNOWN 直接阻断。
+    probe_loopx_capabilities --command issue --format text || exit 1
+
     # 解析 Agent 观察量 (reproduction / scope)
     local repro="missing" scope="uncertain"
     while [[ $# -gt 0 ]]; do
@@ -2458,6 +2480,9 @@ cmd_integrate() {
         echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，无法执行 LoopX 原生集成分支预演。${NC}" >&2
         exit 1
     fi
+
+    # ADR-0010 T2 / ADR-0015：integration-branch 为 BLOCK 能力，缺失或 UNKNOWN 直接阻断。
+    probe_loopx_capabilities --command integrate --format text || exit 1
 
     if [[ "$mode" == "status" ]]; then
         echo -e "${BLUE}==> 正在查询 LoopX 集成分支状态 (base/source/integration heads)...${NC}"
@@ -3357,6 +3382,7 @@ case "$ACTION" in
     archive) cmd_archive "$@" ;;
     issue) cmd_issue "$@" ;;
     integrate) cmd_integrate "$@" ;;
+    capabilities) cmd_capabilities "$@" ;;
     doctor) cmd_doctor "$@" ;;
     gc) cmd_gc "$@" ;;
     init) cmd_init "$@" ;;
