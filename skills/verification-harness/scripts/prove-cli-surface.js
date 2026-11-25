@@ -32,6 +32,37 @@ const HELP_TEXT = [
   '  -h, --help           Print this help message.',
 ].join('\n');
 
+// Golden Gate 1 fixtures: the expected post-`approve contract` bytes and their
+// SHA-256 are literals (computed outside the implementation), so the Prove acts
+// as an independent Oracle instead of re-running the same `Contract-Status`
+// transform that `bin/loopx-flow` uses internally.
+const DEMO_DRAFT_CONTRACT_TEXT = [
+  '# Contract: demo-slice',
+  '',
+  '- **Contract-Status**: DRAFT (Pending Approval)',
+  '- **AC**: AC-1 (Story-1) CLI surface verified with real state assertions',
+  '- **Scope**: skills/verification-harness/**',
+  '- **Verification Plan**: node skills/verification-harness/scripts/prove-cli-surface.js',
+  '- **依赖顺序**: Story-1',
+  '- **引用**: ADR-0011, REQ-EVIDENCE-1',
+  '',
+].join('\n');
+
+const GOLDEN_LOCKED_CONTRACT_TEXT = [
+  '# Contract: demo-slice',
+  '',
+  '- **Contract-Status**: FROZEN & APPROVED',
+  '- **AC**: AC-1 (Story-1) CLI surface verified with real state assertions',
+  '- **Scope**: skills/verification-harness/**',
+  '- **Verification Plan**: node skills/verification-harness/scripts/prove-cli-surface.js',
+  '- **依赖顺序**: Story-1',
+  '- **引用**: ADR-0011, REQ-EVIDENCE-1',
+  '',
+].join('\n');
+
+// sha256(GOLDEN_LOCKED_CONTRACT_TEXT) — golden constant, never derived at runtime.
+const GOLDEN_LOCKED_CONTRACT_SHA256 = 'c251991ee4103d85ca130e84f2714daad31676252aa7a726612296d06b0b9110';
+
 function parseArgs(argv) {
   let outputDir = '';
   let help = false;
@@ -64,12 +95,106 @@ function digestOrNull(filePath) {
   return sha256Buffer(fs.readFileSync(filePath));
 }
 
-function lockedContractText(text) {
-  const line = '- **Contract-Status**: FROZEN & APPROVED';
-  if (/Contract-Status/i.test(text)) {
-    return text.replace(/.*Contract-Status.*$/m, line);
+function gitText(root, args) {
+  return spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 30000 });
+}
+
+// ADR-0011 decision 5: bind the Proof to an exact `source_head` + scope diff
+// fingerprint + contract revision, and refuse to run on a dirty workspace.
+function readSourceBinding(root) {
+  const headRes = gitText(root, ['rev-parse', 'HEAD']);
+  if (headRes.status !== 0 || !headRes.stdout.trim()) {
+    return {
+      error: `source workspace ${root} is not a resolvable Git commit; Proof cannot be bound to an exact head.`,
+    };
   }
-  return `${line}\n${text}`;
+  const dirtyRes = gitText(root, ['status', '--porcelain', '--untracked-files=all']);
+  if (dirtyRes.status !== 0) {
+    return { error: `git status failed in source workspace ${root}: ${dirtyRes.stderr.trim()}` };
+  }
+  const dirtyLines = dirtyRes.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean);
+  if (dirtyLines.length > 0) {
+    return {
+      error: `source workspace is dirty (${dirtyLines.length} change(s)); commit or clean the workspace before running Prove.`,
+      dirty: true,
+    };
+  }
+
+  let base = null;
+  for (const ref of ['origin/main', 'origin/HEAD']) {
+    const res = gitText(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+    if (res.status === 0 && res.stdout.trim()) {
+      base = res.stdout.trim();
+      break;
+    }
+  }
+  // Empty tree object: a Git repo without an origin still yields a stable,
+  // content-addressed fingerprint of the whole tracked tree.
+  const emptyTree = gitText(root, ['hash-object', '-t', 'tree', '/dev/null']);
+  const diffBase = base || (emptyTree.status === 0 ? emptyTree.stdout.trim() : null);
+  if (!diffBase) {
+    return { error: 'unable to resolve a diff baseline (origin/main, origin/HEAD or empty tree) for diff_fingerprint.' };
+  }
+  const diffRes = gitText(root, ['diff', '--no-color', '--binary', diffBase, 'HEAD']);
+  if (diffRes.status !== 0) {
+    return { error: `git diff failed while computing diff_fingerprint: ${diffRes.stderr.trim()}` };
+  }
+
+  const contractPath = path.join(root, 'specs/features/verification-harness/04-contract.md');
+  return {
+    source_head: headRes.stdout.trim(),
+    source_dirty: false,
+    source_base: base || '<empty-tree>',
+    diff_fingerprint: sha256Text(diffRes.stdout),
+    contract_revision: digestOrNull(contractPath),
+  };
+}
+
+const LOOPX_RUNTIME_DIRS = new Set(['tmp', 'cache']);
+
+function listFilesRecursive(root, dir, out) {
+  if (!fs.existsSync(dir)) return;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    const rel = path.relative(root, full).split(path.sep).join('/');
+    if (entry.isDirectory()) {
+      if (dir === path.join(root, '.loopx') && LOOPX_RUNTIME_DIRS.has(entry.name)) continue;
+      listFilesRecursive(root, full, out);
+    } else if (entry.isFile()) {
+      out.push(`${rel}:${sha256Buffer(fs.readFileSync(full))}`);
+    }
+  }
+}
+
+// Observable isolation snapshot: `git status` for the caller repo plus a digest
+// manifest of persisted `.loopx/**` files (runtime scratch dirs excluded), so the
+// Prove can prove it did not mutate the repo it runs from — not just two registries.
+function snapshotIsolation(root, outputDir) {
+  const statusRes = gitText(root, ['status', '--porcelain', '--untracked-files=all']);
+  if (statusRes.status !== 0) return null;
+  const relOutput = path.relative(root, outputDir);
+  const outputRel = relOutput && !relOutput.startsWith('..') && !path.isAbsolute(relOutput)
+    ? relOutput.split(path.sep).join('/')
+    : null;
+  const statusLines = statusRes.stdout
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .filter((line) => {
+      if (!outputRel) return true;
+      const raw = line.slice(3).replace(/^"|"$/g, '');
+      const target = raw.includes(' -> ') ? raw.split(' -> ')[1] : raw;
+      return !(target === outputRel || target.startsWith(`${outputRel}/`));
+    })
+    .sort();
+  const loopxManifest = [];
+  listFilesRecursive(root, path.join(root, '.loopx'), loopxManifest);
+  loopxManifest.sort();
+  return {
+    git_status: statusLines,
+    loopx_manifest_count: loopxManifest.length,
+    digest: sha256Text(JSON.stringify({ status: statusLines, loopx: loopxManifest })),
+  };
 }
 
 function extractFirstJson(text) {
@@ -326,12 +451,18 @@ function renderMarkdownReport(proof) {
     `- **Schema Version**: \`${proof.schema_version}\``,
     `- **Feature Map**: \`${proof.feature_map}\``,
     `- **Upstream Baseline**: \`${proof.upstream_baseline}\``,
+    `- **Source Head**: \`${proof.source_head}\``,
+    `- **Source Dirty**: \`${proof.source_dirty}\``,
+    `- **Diff Fingerprint**: \`${proof.diff_fingerprint}\``,
+    `- **Contract Revision**: \`${proof.contract_revision === null ? 'null' : proof.contract_revision}\``,
     `- **Overall Status**: \`${proof.overall_status}\``,
     `- **Generated At**: \`${proof.generated_at}\``,
     `- **Sandbox Removed**: \`${proof.cleanup.sandbox_removed}\``,
     `- **Proof Survived Cleanup**: \`${proof.cleanup.proof_survived_cleanup}\``,
     `- **Main Repo Registry Unchanged**: \`${proof.isolation.main_repo_registry_unchanged}\``,
     `- **Host Global Registry Unchanged**: \`${proof.isolation.host_global_registry_unchanged}\``,
+    `- **Caller Repo Git Status Unchanged**: \`${proof.isolation.caller_repo_git_status_unchanged}\``,
+    `- **Caller Repo \`.loopx\` Manifest Unchanged**: \`${proof.isolation.caller_repo_loopx_manifest_unchanged}\``,
     '',
     '## Sub-feature Verification Results',
     '',
@@ -378,16 +509,34 @@ function main() {
   const outputDir = path.resolve(parsed.outputDir);
   const mainRepoRegistry = path.join(callerRepoRoot, '.loopx', 'registry.json');
   const hostGlobalRegistry = path.join(os.homedir(), '.loopx', 'registry.global.json');
+
+  const sourceBinding = readSourceBinding(WORKFLOW_ROOT);
+  if (sourceBinding.error) {
+    process.stderr.write(`[FAIL-CLOSED] ${sourceBinding.error}\n`);
+    process.exit(2);
+  }
+
   const beforeMainRegistryDigest = digestOrNull(mainRepoRegistry);
   const beforeHostRegistryDigest = digestOrNull(hostGlobalRegistry);
+  const beforeIsolation = snapshotIsolation(callerRepoRoot, outputDir);
+  if (!beforeIsolation) {
+    process.stderr.write(`[FAIL-CLOSED] Unable to snapshot caller repo isolation state: ${callerRepoRoot}\n`);
+    process.exit(2);
+  }
 
   const runHandle = createRunDir('prove-cli-surface', callerRepoRoot);
   const sandboxDir = runHandle.dir;
+  const tmpRoot = path.dirname(sandboxDir);
 
-  if (outputDir === sandboxDir || outputDir.startsWith(`${sandboxDir}${path.sep}`)) {
+  if (
+    outputDir === sandboxDir
+    || outputDir.startsWith(`${sandboxDir}${path.sep}`)
+    || outputDir === tmpRoot
+    || outputDir.startsWith(`${tmpRoot}${path.sep}`)
+  ) {
     runHandle.cleanup(0);
     fs.rmSync(sandboxDir, { recursive: true, force: true });
-    process.stderr.write('[FAIL-CLOSED] --output-dir must point outside the disposable sandbox so Proof survives cleanup.\n');
+    process.stderr.write('[FAIL-CLOSED] --output-dir must point outside the disposable sandbox (LOOPX_TMP_DIR) so Proof survives cleanup.\n');
     process.exit(2);
   }
 
@@ -524,25 +673,17 @@ function main() {
         '  - AC: CLI commands enforce fail-closed invariants',
         '',
       ].join('\n'));
-      const draftContract = [
-        '# Contract: demo-slice',
-        '',
-        '- **Contract-Status**: DRAFT (Pending Approval)',
-        '- **AC**: AC-1 (Story-1) CLI surface verified with real state assertions',
-        '- **Scope**: skills/verification-harness/**',
-        '- **Verification Plan**: node skills/verification-harness/scripts/prove-cli-surface.js',
-        '- **依赖顺序**: Story-1',
-        '- **引用**: ADR-0011, REQ-EVIDENCE-1',
-        '',
-      ].join('\n');
       const contractPath = path.join(capsuleDir, '04-contract.md');
-      fs.writeFileSync(contractPath, draftContract);
+      fs.writeFileSync(contractPath, DEMO_DRAFT_CONTRACT_TEXT);
 
       execFileSync('git', ['add', '-A'], { cwd: ws.repoDir });
       execFileSync('git', ['commit', '-qm', 'feat(demo-slice): freeze candidate stage 1-4 capsule'], { cwd: ws.repoDir });
       const specCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ws.repoDir, encoding: 'utf8' }).trim();
 
-      const expectedLockedSha = sha256Text(lockedContractText(draftContract));
+      // Pre-seed the second-principal gate=1 comment with the golden (offline
+      // computed) SHA; after `approve contract` we assert the on-disk bytes and
+      // the registry-locked revision both equal that golden constant.
+      const expectedLockedSha = GOLDEN_LOCKED_CONTRACT_SHA256;
       const gate1CommentBody = [
         `<!-- loopx-flow:gate1-authorization:demo-slice@${expectedLockedSha} -->`,
         `gate=1;mode=independent;contract_sha=${expectedLockedSha};spec_commit=${specCommit};approver=reviewer-bot`,
@@ -557,8 +698,25 @@ function main() {
         `approve contract failed (${approveRes.status}):\nSTDOUT:\n${approveRes.stdout}\nSTDERR:\n${approveRes.stderr}`
       );
 
+      const lockedBytes = fs.readFileSync(contractPath, 'utf8');
+      assertCondition(
+        lockedBytes === GOLDEN_LOCKED_CONTRACT_TEXT,
+        'Locked 04-contract.md bytes differ from the golden fixture (independent Oracle mismatch)'
+      );
       const postLockSha = sha256Buffer(fs.readFileSync(contractPath));
       assertCondition(postLockSha === expectedLockedSha, `Locked SHA mismatch: ${postLockSha} !== ${expectedLockedSha}`);
+
+      const registryLockedRevision = extractFirstJson(fs.readFileSync(ws.registryPath, 'utf8').replace(/\s+/g, ' '));
+      assertCondition(Boolean(registryLockedRevision), 'Registry must be readable after approve contract');
+      const registryGoal = (registryLockedRevision.goals || []).find((g) => g.id === 'demo-slice-goal');
+      const registryRevision = registryGoal
+        && registryGoal.control_plane
+        && registryGoal.control_plane.progress_review
+        && registryGoal.control_plane.progress_review.contract_revision;
+      assertCondition(
+        registryRevision === expectedLockedSha,
+        `Registry locked contract_revision (${registryRevision}) must equal on-disk golden SHA (${expectedLockedSha})`
+      );
 
       const verifyPass = runCli(ws, ['gate', 'verify', 'contract', 'demo-slice']);
       assertCondition(verifyPass.status === 0, `gate verify contract failed (${verifyPass.status}): ${verifyPass.stderr}`);
@@ -581,7 +739,7 @@ function main() {
         status: 'passed',
         real_vs_mock: 'real+contract_fake',
         observations: [
-          `locked SHA-256 ${expectedLockedSha.slice(0, 16)}... in registry & user_gate (exit=0)`,
+          `locked bytes === golden fixture; registry contract_revision === on-disk SHA-256 ${expectedLockedSha.slice(0, 16)}... (exit=0)`,
           'gate verify contract passed (exit=0) when intact and blocked with CONTRACT_TAMPERED (exit!=0) after 1-line edit',
           `audited ${ghCallLines.length} cross-process gh CLI invocations`,
         ],
@@ -714,12 +872,19 @@ function main() {
   const sandboxRemoved = !fs.existsSync(sandboxDir);
   const afterMainRegistryDigest = digestOrNull(mainRepoRegistry);
   const afterHostRegistryDigest = digestOrNull(hostGlobalRegistry);
+  const afterIsolation = snapshotIsolation(callerRepoRoot, outputDir);
   const mainRepoUnchanged = beforeMainRegistryDigest === afterMainRegistryDigest;
   const hostGlobalUnchanged = beforeHostRegistryDigest === afterHostRegistryDigest;
+  const callerRepoUnchanged = Boolean(afterIsolation) && beforeIsolation.digest === afterIsolation.digest;
+  const callerRepoStatusUnchanged = Boolean(afterIsolation)
+    && JSON.stringify(beforeIsolation.git_status) === JSON.stringify(afterIsolation.git_status);
+  const callerRepoLoopxUnchanged = Boolean(afterIsolation)
+    && beforeIsolation.loopx_manifest_count === afterIsolation.loopx_manifest_count
+    && beforeIsolation.digest === afterIsolation.digest;
 
-  if (!sandboxRemoved || !mainRepoUnchanged || !hostGlobalUnchanged) {
+  if (!sandboxRemoved || !mainRepoUnchanged || !hostGlobalUnchanged || !callerRepoUnchanged) {
     process.stderr.write(
-      `[FAIL-CLOSED] Post-cleanup isolation check failed: sandboxRemoved=${sandboxRemoved}, mainRepoUnchanged=${mainRepoUnchanged}, hostGlobalUnchanged=${hostGlobalUnchanged}\n`
+      `[FAIL-CLOSED] Post-cleanup isolation check failed: sandboxRemoved=${sandboxRemoved}, mainRepoUnchanged=${mainRepoUnchanged}, hostGlobalUnchanged=${hostGlobalUnchanged}, callerRepoUnchanged=${callerRepoUnchanged}\n`
     );
     process.exit(1);
   }
@@ -728,28 +893,53 @@ function main() {
   const proofJsonPath = path.join(outputDir, 'cli-surface-proof.json');
   const proofMdPath = path.join(outputDir, 'cli-surface-proof.md');
 
+  const unreachableSteps = steps.filter((step) => step.status === 'verified_unreachable');
+  const failedSteps = steps.filter((step) => step.status === 'failed');
+  let overallStatus = 'passed';
+  if (failedSteps.length > 0) {
+    overallStatus = 'failed';
+  } else if (unreachableSteps.length > 0) {
+    overallStatus = 'partial';
+  } else if (steps.length < 5) {
+    overallStatus = 'incomplete';
+  }
+  const harnessGaps = unreachableSteps.map(
+    (step) => `${step.id}: ${step.observations[0] || 'verified_unreachable'}`
+  );
+  const triageOutcome = overallStatus === 'passed' ? 'clean' : (overallStatus === 'failed' ? 'blocked' : 'changed');
+  const sandboxRelative = path.relative(callerRepoRoot, sandboxDir);
+  const sandboxDirReversible = !sandboxRelative.startsWith('..') && !path.isAbsolute(sandboxRelative);
+
   const proof = {
     schema_version: 'loopx_verification_harness_proof_v1',
     feature_map: 'skills/verification-harness/features/cli-surface.md',
     upstream_baseline: 'cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)',
     generated_at: new Date().toISOString(),
-    overall_status: 'passed',
+    source_head: sourceBinding.source_head,
+    source_dirty: sourceBinding.source_dirty,
+    diff_fingerprint: sourceBinding.diff_fingerprint,
+    contract_revision: sourceBinding.contract_revision,
+    overall_status: overallStatus,
     steps,
     cleanup: {
-      sandbox_dir: path.relative(callerRepoRoot, sandboxDir).startsWith('..')
-        ? '<isolated-loopx-tmp>/prove-cli-surface'
-        : path.relative(callerRepoRoot, sandboxDir),
+      sandbox_dir: sandboxDirReversible
+        ? sandboxRelative.split(path.sep).join('/')
+        : '<isolated-loopx-tmp>/prove-cli-surface',
+      sandbox_dir_kind: sandboxDirReversible ? 'relative_to_caller_repo' : 'sanitized_placeholder',
       sandbox_removed: sandboxRemoved,
       proof_survived_cleanup: true,
     },
     isolation: {
       main_repo_registry_unchanged: mainRepoUnchanged,
       host_global_registry_unchanged: hostGlobalUnchanged,
+      caller_repo_git_status_unchanged: callerRepoStatusUnchanged,
+      caller_repo_loopx_manifest_unchanged: callerRepoLoopxUnchanged,
+      caller_repo_loopx_file_count: beforeIsolation.loopx_manifest_count,
     },
     triage: {
-      outcome: 'clean',
+      outcome: triageOutcome,
       doc_drift: [],
-      harness_gap: [],
+      harness_gap: harnessGaps,
       product_bug: [],
     },
   };
@@ -763,7 +953,13 @@ function main() {
     process.exit(1);
   }
 
-  process.stdout.write(`[✓] Cold-start Prove passed (${steps.length} sub-features). Proof saved to ${outputDir}\n`);
+  if (overallStatus === 'passed') {
+    process.stdout.write(`[✓] Cold-start Prove passed (${steps.length} sub-features). Proof saved to ${outputDir}\n`);
+  } else {
+    process.stdout.write(
+      `[!] Cold-start Prove recorded overall_status=${overallStatus} (${steps.length} sub-features, ${harnessGaps.length} harness gap(s)). Proof saved to ${outputDir}\n`
+    );
+  }
 }
 
 if (require.main === module) {
@@ -772,5 +968,7 @@ if (require.main === module) {
 
 module.exports = {
   parseArgs,
-  lockedContractText,
+  DEMO_DRAFT_CONTRACT_TEXT,
+  GOLDEN_LOCKED_CONTRACT_TEXT,
+  GOLDEN_LOCKED_CONTRACT_SHA256,
 };

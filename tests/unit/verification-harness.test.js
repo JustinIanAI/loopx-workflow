@@ -15,8 +15,12 @@
  *      isolated Proof output path succeeds, destroys all temporary sandboxes,
  *      keeps Proof artifacts intact after cleanup, and leaves main repo / host
  *      `~/.loopx` completely untouched.
- *   4. Negative fail-closed behavior: missing `--output-dir` or broken CLI
- *      surface fails with non-zero exit code without leaving sandbox residue.
+ *   4. Negative fail-closed behavior: missing `--output-dir`, unknown arguments,
+ *      `--output-dir` inside the disposable sandbox, and a dirty source workspace
+ *      all exit non-zero without leaving sandbox residue.
+ *   5. Proof binding (ADR-0011 decision 5): `source_head` / `source_dirty` /
+ *      `diff_fingerprint` / `contract_revision` are present, and `overall_status`
+ *      is derived from steps (missing `loopx 2.3.x` can never report `passed`).
  */
 const { test, after } = require('node:test');
 const assert = require('node:assert');
@@ -54,6 +58,42 @@ function sha256File(filePath) {
 function fileDigestOrNull(filePath) {
   if (!fs.existsSync(filePath)) return null;
   return sha256File(filePath);
+}
+
+function isHex64(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+function makeScratch(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function git(root, args) {
+  const res = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  assert.strictEqual(res.status, 0, `git ${args.join(' ')} failed: ${res.stderr}`);
+  return res.stdout.trim();
+}
+
+// Copy the harness source into a disposable Git repo so dirty-workspace
+// fail-closed behavior can be driven black-box without dirtying PROJECT_ROOT.
+function prepareSourceCopy(scratchRoot) {
+  const root = path.join(scratchRoot, 'source-repo');
+  fs.mkdirSync(root, { recursive: true });
+  for (const dir of ['bin', 'lib', 'scripts', 'skills', 'specs']) {
+    fs.cpSync(path.join(PROJECT_ROOT, dir), path.join(root, dir), { recursive: true });
+  }
+  for (const file of ['package.json', '.gitignore']) {
+    fs.copyFileSync(path.join(PROJECT_ROOT, file), path.join(root, file));
+  }
+  git(root, ['init', '-q', '-b', 'main']);
+  git(root, ['config', 'user.email', 'prove-test@example.com']);
+  git(root, ['config', 'user.name', 'prove-test']);
+  git(root, ['config', 'commit.gpgsign', 'false']);
+  git(root, ['add', '-A']);
+  git(root, ['commit', '-qm', 'chore: source copy baseline']);
+  return root;
 }
 
 test('1. Upstream pstack@0.15.46 R0 files & MIT LICENSE match verbatim SHA-256 with zero git/cache residue', () => {
@@ -132,12 +172,13 @@ test('2. SKILL.md, loopx-adaptation.md & Feature Map enforce 5-dim model, 4 H2s,
 });
 
 test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and host/repo have zero residue', () => {
-  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vh-prove-test-'));
-  tempDirs.push(scratchRoot);
+  const scratchRoot = makeScratch('vh-prove-test-');
 
-  const tmpSandboxRoot = path.join(scratchRoot, 'loopx-tmp');
+  // Sandbox root inside the caller repo (gitignored `.loopx/tmp`) so the recorded
+  // `sandbox_dir` is a reversible relative path that can be re-checked on disk.
+  const tmpSandboxRoot = path.join(PROJECT_ROOT, '.loopx', 'tmp', `vh-prove-test-${process.pid}-${Date.now()}`);
   const proofOutDir = path.join(scratchRoot, 'proof-artifacts');
-  fs.mkdirSync(tmpSandboxRoot, { recursive: true });
+  tempDirs.push(tmpSandboxRoot);
 
   const repoRegistryPath = path.join(PROJECT_ROOT, '.loopx/registry.json');
   const hostRegistryPath = path.join(os.homedir(), '.loopx/registry.global.json');
@@ -169,10 +210,27 @@ test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and h
   const proof = JSON.parse(fs.readFileSync(proofJsonPath, 'utf8'));
   assert.strictEqual(proof.schema_version, 'loopx_verification_harness_proof_v1');
   assert.strictEqual(proof.feature_map, 'skills/verification-harness/features/cli-surface.md');
+  assert.match(proof.source_head, /^[0-9a-f]{40}$/, 'Proof must bind an exact source_head commit');
+  assert.strictEqual(proof.source_head, git(PROJECT_ROOT, ['rev-parse', 'HEAD']), 'source_head must be the real source commit');
+  assert.strictEqual(proof.source_dirty, false, 'Proof must record a clean source workspace');
+  assert.ok(isHex64(proof.diff_fingerprint), 'diff_fingerprint must be a SHA-256 digest');
+  assert.ok(isHex64(proof.contract_revision), 'contract_revision must bind 04-contract.md SHA-256');
   assert.strictEqual(proof.overall_status, 'passed');
+  assert.strictEqual(proof.triage.outcome, 'clean');
+  assert.deepStrictEqual(proof.triage.harness_gap, []);
   assert.strictEqual(proof.cleanup.sandbox_removed, true, 'Prove must verify temporary sandbox was removed');
   assert.strictEqual(proof.cleanup.proof_survived_cleanup, true, 'Prove must confirm proof survived cleanup');
-  assert.strictEqual(fs.existsSync(proof.cleanup.sandbox_dir), false, 'Recorded sandbox_dir must not exist on disk after cleanup');
+  assert.strictEqual(proof.cleanup.sandbox_dir_kind, 'relative_to_caller_repo');
+  assert.match(proof.cleanup.sandbox_dir, /^\.loopx\/tmp\/.*\/prove-cli-surface-/, 'sandbox_dir must be a reversible repo-relative path');
+  assert.strictEqual(
+    fs.existsSync(path.resolve(PROJECT_ROOT, proof.cleanup.sandbox_dir)),
+    false,
+    'Recorded sandbox_dir must not exist on disk after cleanup'
+  );
+  assert.strictEqual(proof.isolation.main_repo_registry_unchanged, true);
+  assert.strictEqual(proof.isolation.host_global_registry_unchanged, true);
+  assert.strictEqual(proof.isolation.caller_repo_git_status_unchanged, true);
+  assert.strictEqual(proof.isolation.caller_repo_loopx_manifest_unchanged, true);
 
   // Verify tmpSandboxRoot contains zero leftover prove-* directories
   const remainingTmpEntries = fs.readdirSync(tmpSandboxRoot);
@@ -200,11 +258,10 @@ test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and h
   assert.strictEqual(fileDigestOrNull(hostRegistryPath), beforeHostRegistry, 'Host ~/.loopx/registry.global.json must not be mutated');
 });
 
-test('4. Negative fail-closed: missing --output-dir or invalid arguments exits non-zero cleanly', () => {
-  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vh-prove-neg-'));
-  tempDirs.push(scratchRoot);
+test('4. Negative fail-closed: missing --output-dir, unknown flags, and sandbox-internal --output-dir all exit non-zero', () => {
+  const scratchRoot = makeScratch('vh-prove-neg-');
 
-  const res = spawnSync(process.execPath, [PROVE_SCRIPT], {
+  const missing = spawnSync(process.execPath, [PROVE_SCRIPT], {
     cwd: PROJECT_ROOT,
     encoding: 'utf8',
     env: {
@@ -212,8 +269,96 @@ test('4. Negative fail-closed: missing --output-dir or invalid arguments exits n
       LOOPX_TMP_DIR: scratchRoot,
     },
   });
+  assert.notStrictEqual(missing.status, 0, 'Missing --output-dir must fail closed with non-zero exit status');
+  assert.match(missing.stderr, /--output-dir/, 'Error message must explain required --output-dir flag');
 
-  assert.notStrictEqual(res.status, 0, 'Missing --output-dir must fail closed with non-zero exit status');
-  assert.match(res.stderr, /--output-dir/, 'Error message must explain required --output-dir flag');
+  const unknown = spawnSync(process.execPath, [PROVE_SCRIPT, '--output-dir', path.join(scratchRoot, 'proof'), '--bogus-flag'], {
+    cwd: PROJECT_ROOT,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      LOOPX_TMP_DIR: scratchRoot,
+    },
+  });
+  assert.strictEqual(unknown.status, 2, 'Unknown argument must fail closed with exit code 2');
+  assert.match(unknown.stderr, /Unknown argument: --bogus-flag/, 'Unknown argument must be reported by name');
+
+  const insideSandbox = spawnSync(
+    process.execPath,
+    [PROVE_SCRIPT, '--output-dir', path.join(scratchRoot, 'proof-inside-sandbox')],
+    {
+      cwd: PROJECT_ROOT,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        LOOPX_TMP_DIR: scratchRoot,
+      },
+    }
+  );
+  assert.strictEqual(insideSandbox.status, 2, '--output-dir inside the sandbox root must fail closed with exit code 2');
+  assert.match(insideSandbox.stderr, /must point outside the disposable sandbox/, 'Sandbox-internal output dir must be explained');
+
   assert.deepStrictEqual(fs.readdirSync(scratchRoot), [], 'Failed argument check must leave zero temp directories');
+});
+
+test('5. Missing loopx 2.3.x can never report overall_status=passed (harness gap is recorded)', () => {
+  const scratchRoot = makeScratch('vh-prove-noloopx-');
+  const proofOutDir = path.join(scratchRoot, 'proof-artifacts');
+
+  const res = spawnSync(process.execPath, [PROVE_SCRIPT, '--output-dir', proofOutDir], {
+    cwd: PROJECT_ROOT,
+    encoding: 'utf8',
+    timeout: 60000,
+    env: {
+      ...process.env,
+      LOOPX_BIN: path.join(scratchRoot, 'missing-loopx'),
+      LOOPX_TMP_DIR: path.join(scratchRoot, 'loopx-tmp'),
+      LOOPX_USAGE_PING: '0',
+    },
+  });
+
+  assert.strictEqual(res.status, 0, `Prove with missing loopx must still emit Proof (status=${res.status}):\n${res.stderr}`);
+  const proof = JSON.parse(fs.readFileSync(path.join(proofOutDir, 'cli-surface-proof.json'), 'utf8'));
+  assert.notStrictEqual(proof.overall_status, 'passed', 'Missing loopx 2.3.x must degrade overall_status away from passed');
+  assert.strictEqual(proof.overall_status, 'partial');
+  const canary = proof.steps.find((step) => step.id === 'cli-todo-managed-canary');
+  assert.strictEqual(canary.status, 'verified_unreachable');
+  assert.ok(proof.triage.harness_gap.length >= 1, 'verified_unreachable must be recorded as a harness_gap');
+  assert.ok(proof.triage.harness_gap.some((gap) => gap.includes('cli-todo-managed-canary')));
+  assert.strictEqual(proof.triage.outcome, 'changed', 'A harness gap must not be triaged as clean');
+});
+
+test('6. Dirty source workspace fails closed; source binding matches the exact committed head', () => {
+  const scratchRoot = makeScratch('vh-prove-dirty-');
+  const sourceRoot = prepareSourceCopy(scratchRoot);
+  const sourceScript = path.join(sourceRoot, 'skills/verification-harness/scripts/prove-cli-surface.js');
+  const tmpSandboxRoot = path.join(scratchRoot, 'loopx-tmp');
+  const env = { ...process.env, LOOPX_TMP_DIR: tmpSandboxRoot, LOOPX_USAGE_PING: '0' };
+
+  const cleanOut = path.join(scratchRoot, 'clean-proof');
+  const clean = spawnSync(process.execPath, [sourceScript, '--output-dir', cleanOut], {
+    cwd: sourceRoot,
+    encoding: 'utf8',
+    timeout: 60000,
+    env,
+  });
+  assert.strictEqual(clean.status, 0, `Clean source copy Prove must run (status=${clean.status}):\n${clean.stderr}`);
+  const proof = JSON.parse(fs.readFileSync(path.join(cleanOut, 'cli-surface-proof.json'), 'utf8'));
+  assert.strictEqual(proof.source_head, git(sourceRoot, ['rev-parse', 'HEAD']));
+  assert.strictEqual(proof.source_dirty, false);
+
+  const loopxFlowPath = path.join(sourceRoot, 'bin/loopx-flow');
+  fs.appendFileSync(loopxFlowPath, '\n# tampered byte for dirty-workspace guard\n');
+  const dirtyOut = path.join(scratchRoot, 'dirty-proof');
+  const dirty = spawnSync(process.execPath, [sourceScript, '--output-dir', dirtyOut], {
+    cwd: sourceRoot,
+    encoding: 'utf8',
+    timeout: 60000,
+    env,
+  });
+  assert.notStrictEqual(dirty.status, 0, 'A dirty source workspace must fail closed');
+  assert.match(dirty.stderr, /\[FAIL-CLOSED\].*dirty/i, 'Dirty workspace rejection must be explicit');
+  assert.strictEqual(fs.existsSync(path.join(dirtyOut, 'cli-surface-proof.json')), false, 'Dirty workspace must not emit a Proof');
+  const residue = fs.existsSync(tmpSandboxRoot) ? fs.readdirSync(tmpSandboxRoot) : [];
+  assert.deepStrictEqual(residue, [], 'Dirty workspace rejection must not create sandbox residue');
 });

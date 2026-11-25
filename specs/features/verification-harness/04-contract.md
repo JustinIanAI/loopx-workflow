@@ -10,9 +10,10 @@
 ## 1. 契约冻结 (TypeScript Interfaces & Invariants)
 
 ```typescript
-export type ProofStepStatus = 'passed' | 'verified_unreachable';
+export type ProofStepStatus = 'passed' | 'failed' | 'verified_unreachable';
 export type ProofRealVsMock = 'real' | 'real+contract_fake';
 export type TriageOutcome = 'clean' | 'changed' | 'blocked';
+export type ProofOverallStatus = 'passed' | 'partial' | 'incomplete' | 'failed';
 
 export interface ProofStepRecord {
   id:
@@ -32,21 +33,32 @@ export interface VerificationHarnessProofV1 {
   feature_map: 'skills/verification-harness/features/cli-surface.md';
   upstream_baseline: 'cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)';
   generated_at: string;
-  overall_status: 'passed';
+  // ADR-0011 决策 5：Proof 必须锚定精确源码与契约，dirty 工作区 fail-closed
+  source_head: string;          // `git rev-parse HEAD` of the harness source
+  source_dirty: false;          // dirty workspaces never emit a Proof
+  diff_fingerprint: string;     // SHA-256 of `git diff <base>..source_head`
+  contract_revision: string | null; // SHA-256 of `specs/features/verification-harness/04-contract.md`
+  // 由 steps 派生：全部 passed → passed；含 verified_unreachable → partial；
+  // 子特性不足 5 条 → incomplete；含 failed → failed
+  overall_status: ProofOverallStatus;
   steps: ProofStepRecord[];
   cleanup: {
     sandbox_dir: string;
+    sandbox_dir_kind: 'relative_to_caller_repo' | 'sanitized_placeholder';
     sandbox_removed: true;
     proof_survived_cleanup: true;
   };
   isolation: {
     main_repo_registry_unchanged: true;
     host_global_registry_unchanged: true;
+    caller_repo_git_status_unchanged: true;
+    caller_repo_loopx_manifest_unchanged: true;
+    caller_repo_loopx_file_count: number;
   };
   triage: {
     outcome: TriageOutcome;
     doc_drift: string[];
-    harness_gap: string[];
+    harness_gap: string[];      // verified_unreachable 步骤必须在此登记
     product_bug: string[];
   };
 }
@@ -65,10 +77,10 @@ export interface VerificationHarnessProofV1 {
 
 | 维度 | 本胶囊验证方案 |
 |---|---|
-| **Surface** | `node skills/verification-harness/scripts/prove-cli-surface.js` + 子进程驱动真实 `bin/loopx-flow` / `scripts/preflight-check.sh` |
+| **Surface** | `node skills/verification-harness/scripts/prove-cli-surface.js` + 子进程驱动真实 `bin/loopx-flow`（`scripts/preflight-check.sh` 属阶段 0 环境前置条件，由 CI/Stage 0 执行，本 Prove 不驱动） |
 | **Run / Drive** | `lib/paths.js#createRunDir` 创建隔离 Git 仓库，真实子进程运行 `help`/`init`/`status --next`/`feature`/`approve`/`gate verify`/`todo claim`/`todo done` |
 | **Observe** | 校验 `cli-surface-proof.{json,md}`、6 个胶囊文件、SHA-256 篡改拦截（`CONTRACT_TAMPERED`）、5 元组 claim 缓存生成与删除、`gh` 跨进程 `argv` 审计 |
-| **Negative Invariant** | 非 TTY 无配置 `init` 阻断、`main` 直提 `pre-commit` 阻断、未批准 `approve`/`gate verify` 阻断、契约篡改阻断、缺 `--output-dir` 阻断 |
+| **Negative Invariant** | 非 TTY 无配置 `init` 阻断、`main` 直提 `pre-commit` 阻断、未批准 `approve`/`gate verify` 阻断、契约篡改阻断、缺 `--output-dir` / 未知参数 / `--output-dir` 落在沙箱内阻断、源码工作区 dirty 阻断 |
 | **Real-vs-Mock** | `bin/loopx-flow` 与 `loopx 2.3.0` 受管 Todo 为 `real`；离线 `gh`/Gate1 控制面桩为 `real+contract_fake` |
 
 ## 4. 任务清单 (Tasks)
