@@ -1,0 +1,77 @@
+{
+  "schema_version": "loopx_verification_harness_proof_v1",
+  "feature_map": "skills/verification-harness/features/cli-surface.md",
+  "upstream_baseline": "cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)",
+  "generated_at": "2026-11-25T06:36:57.417Z",
+  "overall_status": "passed",
+  "steps": [
+    {
+      "id": "cli-help-surface",
+      "surface": "bin/loopx-flow --help",
+      "status": "passed",
+      "real_vs_mock": "real",
+      "observations": [
+        "exit_code === 0",
+        "stdout contains orchestrator banner + core subcommand signatures (approve contract / gate verify / todo claim / todo done)"
+      ]
+    },
+    {
+      "id": "cli-init-and-subdir-anchor",
+      "surface": "bin/loopx-flow init + bin/loopx-flow status --next (from subdir/nested)",
+      "status": "passed",
+      "real_vs_mock": "real+contract_fake",
+      "observations": [
+        "non-TTY init without config rejected fail-closed (exit=1)",
+        "init with explicit config created repo-root .loopx tmp sandbox and .git/hooks/pre-commit (exit=0)",
+        "status --next from subdir/nested anchored REPO_ROOT cleanly with zero subdir/nested/.loopx leak"
+      ]
+    },
+    {
+      "id": "cli-feature-and-gate1-negative",
+      "surface": "bin/loopx-flow feature + pre-commit main guard + gate verify/approve (negative)",
+      "status": "passed",
+      "real_vs_mock": "real+contract_fake",
+      "observations": [
+        "pre-commit hook blocked direct main commit (exit=1)",
+        "switched to branch feature/demo-slice and generated all 6 capsule files",
+        "premature gate verify contract exited 1 and approve contract exited 1 with zero FROZEN & APPROVED leak"
+      ]
+    },
+    {
+      "id": "cli-gate1-approve-and-tamper-detect",
+      "surface": "bin/loopx-flow approve contract + gate verify contract (lock & tamper detect)",
+      "status": "passed",
+      "real_vs_mock": "real+contract_fake",
+      "observations": [
+        "locked SHA-256 c251991ee4103d85... in registry & user_gate (exit=0)",
+        "gate verify contract passed (exit=0) when intact and blocked with CONTRACT_TAMPERED (exit!=0) after 1-line edit",
+        "audited 5 cross-process gh CLI invocations"
+      ]
+    },
+    {
+      "id": "cli-todo-managed-canary",
+      "surface": "bin/loopx-flow todo claim + todo done (real loopx 2.3.0)",
+      "status": "passed",
+      "real_vs_mock": "real",
+      "observations": [
+        "real loopx 2.3.0 bootstrap/register-agent/todo add succeeded in isolated runtime",
+        "todo claim wrote 5-tuple receipt (hard_lease) and todo done completed + removed cache (exit=0)"
+      ]
+    }
+  ],
+  "cleanup": {
+    "sandbox_dir": ".loopx/tmp/prove-cli-surface-G43D4p",
+    "sandbox_removed": true,
+    "proof_survived_cleanup": true
+  },
+  "isolation": {
+    "main_repo_registry_unchanged": true,
+    "host_global_registry_unchanged": true
+  },
+  "triage": {
+    "outcome": "clean",
+    "doc_drift": [],
+    "harness_gap": [],
+    "product_bug": []
+  }
+}

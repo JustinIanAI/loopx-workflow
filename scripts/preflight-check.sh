@@ -205,6 +205,7 @@ CORE_SKILLS=(
     "open-code-review"
     "systematic-debugging"
     "anti-entropy-governance"
+    "verification-harness"
 )
 for s in "${CORE_SKILLS[@]}"; do
     if [[ ! -f "$TARGET_ROOT/skills/$s/SKILL.md" && ! -f "$WORKFLOW_ROOT/skills/$s/SKILL.md" ]]; then
