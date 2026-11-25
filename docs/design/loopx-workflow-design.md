@@ -293,6 +293,12 @@ PR 正文的逐文件说明来自真实 diff hunk/符号或模型输出；无法
 
 LoopX `validation.status` 只映射 `passed/failed/skipped`：`not_run/blocked/deferred → skipped + required:true`（check 非 0）；`not_applicable` 只留 05-evidence。Freshness 只对齐 `scope_fingerprint` / `headRefOid` / `contract_revision`；纯 docs（全部在 `docs/**` 与非契约 `*.md`）不使代码证据失效；`package.json`/`package-lock.json` blob 变化使全部 Test 行失效。
 
+#### 8.2.1 证据核验清单投影与 Stage 2 Fail-Closed（ADR-0013 2026-11-25 增补）
+
+`authentic-review.js` 的 Stage 2 在 `capVerdictInBody` 触发封顶时，将 LoopX `pr-review --check-result` 的 `approval_blockers` 完整明细**机械投影**为第 5 段 `### 证据核验清单（LoopX 契约投影）`（位于 `## 我的整体评价` 之前），列示"应审 N / 通过 X / 未通过 Y + 逐项原因"；数据 100% 来自 `check-result.json`/`result.json`，编排层不改写 LoopX 结论，注入清单后二次过 `check-result` 且必须 `ok === true` 才允许发布。
+
+Stage 2 的超时、非 0、截断标记、JSON 不可解析一律 `[NOT_VERIFIED]`、非 0 退出、保留 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 留证，且禁止调用 `gh` 发布；补证由 `check-result` 报错驱动按内聚域分批（≤3 域、≤2 轮有界收敛）。`gates()` 与 `buildEvidenceGraph` 锚定 `runDir/repo/` 的精确 `headRefOid` 只读代码树；本机 HEAD 不匹配时跳过本地实测并将对应 validation 行标 `unverified`。INV2/INV4/INV5 不变量分别挂靠 `REQ-RESPOND-1`/`REQ-EVIDENCE-1`/`REQ-REVIEW-2`（见 ADR-0013 增补决策 4），不新开编号体系。
+
 ### 8.1 纯文档 PR 的审查豁免与静态三项自检 (ADR-0006)
 
 当 PR 为纯 Markdown 变动（如全局架构规范治理、docs-only 决策批）时，触发双轨流转中的纯文档路径：
