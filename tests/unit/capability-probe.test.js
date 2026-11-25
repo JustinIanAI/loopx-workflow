@@ -241,6 +241,38 @@ test('extractSignature keeps long flags and brace choices apart', () => {
   assert.ok(signature.words.has('stop'));
   assert.ok(signature.words.has('resume'));
   assert.ok(!signature.words.has('--operation'), 'flags must not leak into the word set');
+  // P2：选择集必须绑定到同一行内它前面的 Flag，而不是整段帮助的全局词表。
+  assert.deepStrictEqual([...signature.choices.get('--operation')].sort(), ['resume', 'stop']);
+});
+
+test('P2 回归：同一行归错 Flag 的 choices 不得冒充目标 Flag 的取值（false pass）', () => {
+  // 旧实现把 `{stop,resume}` 塞进全局词表，`signatureHas` 不绑定 Flag，
+  // 于是 `--operation` 的取值校验只要「全文出现过 stop」就通过。
+  const help = [
+    'usage: loopx goal-lifecycle [-h] --goal-id GOAL_ID --operation OPERATION',
+    '                            --reason {stop,resume}'
+  ].join('\n');
+  assert.ok(probe.extractSignature(help).words.has('stop'), '前置：旧实现据以误判的全局词确实存在');
+  assert.deepStrictEqual([...probe.extractSignature(help).choices.get('--operation') || []], [], 'choices 不得从 --reason 借用');
+
+  const bin = makeFakeCli({ help: withHelp({ 'goal-lifecycle --help': help }) });
+  const r = runModule(['require', '--scope', 'merge', '--loopx-bin', bin]);
+  assert.strictEqual(r.status, 1, '归错 Flag 的 choices 必须让 merge 阻断');
+  assert.match(r.stderr, /--operation 缺少取值 stop/);
+  assert.match(r.stderr, /--operation 缺少取值 resume/);
+  assert.match(r.stderr, /LoopX 升级契约差异诊断卡/);
+});
+
+test('P2 回归：帮助里出现选择词但 Flag 完全缺失时不得放行（false pass）', () => {
+  // 更极端的旧实现误判：`--operation` 根本不在帮助里，但正文出现过 stop/resume。
+  const help = [
+    'usage: loopx goal-lifecycle [-h] --goal-id GOAL_ID',
+    '  --reason {stop,resume}   Accepted reason tags (not an operation).'
+  ].join('\n');
+  const bin = makeFakeCli({ help: withHelp({ 'goal-lifecycle --help': help }) });
+  const r = runModule(['require', '--scope', 'merge', '--loopx-bin', bin]);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /缺少 Flag --operation/);
 });
 
 test('real CLI canary: loopx 2.3.x satisfies every BLOCK capability', { skip: (() => {

@@ -107,6 +107,7 @@ function setupMockLoopx() {
 
   const mockLoopxPath = path.join(MOCK_BIN_DIR, 'loopx');
   const mockLoopxScript = `#!/usr/bin/env bash
+${require('./helpers/capability-stub').HELP_PRELUDE}
 args="$*"
 
 if [[ "$args" == *"--check-merge-readiness"* ]]; then
@@ -131,8 +132,13 @@ JSON
   exit 0
 fi
 
+if [[ "$args" == *"change-quality prepare"* ]]; then
+  echo '{"schema_version":"change_quality_prepare_packet_v2","ok": true, "status": "review_required", "policy": {"enabled": true, "safe_fix": false, "strict_receipt": true}, "scope": {"scope_fingerprint": "abcdef123456", "base_commit": "HEAD", "base_ref": "origin/HEAD"}}'
+  exit 0
+fi
+
 if [[ "$args" == *"change-quality verify"* ]]; then
-  echo '{"ok": true, "enabled": false, "status": "receipt_valid", "receipt_state": "recorded"}'
+  echo '{"schema_version":"change_quality_receipt_verification_v2","ok": true, "enabled": false, "status": "receipt_valid", "receipt_state": "recorded"}'
   exit 0
 fi
 

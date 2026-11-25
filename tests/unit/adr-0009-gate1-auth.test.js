@@ -15,8 +15,8 @@ function approveLoopxMock(dir, override = '') {
   h.mockLoopx(dir, `args="$*"
 if [[ "$args" == *"configure-goal"* ]]; then exit 0; fi
 if [[ "$args" == *"register-agent"* ]]; then exit 0; fi
-if [[ "$args" == *"todo add"* ]]; then echo '{"todo_id":"todo_gate1"}'; exit 0; fi
-if [[ "$args" == *"todo complete"* ]]; then exit 0; fi
+if [[ "$args" == *"todo add"* ]]; then echo '{"schema_version":"loopx_coordination_todo_create_result_v0","todo_id":"todo_gate1"}'; exit 0; fi
+if [[ "$args" == *"todo complete"* ]]; then echo '{"schema_version":"loopx_coordination_todo_terminal_lifecycle_result_v0"}'; exit 0; fi
 if [[ "$args" == *"sync-global"* ]]; then exit 0; fi
 ` + override);
 }
