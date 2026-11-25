@@ -59,6 +59,7 @@ These are instruction arguments, not shell flags.
 - Reviewing changes means following dependencies *beyond* the changed lines, and distinguishing
   defects the change **introduced** from defects it merely **revealed**.
 - Review and report. Apply fixes only when asked.
+- **PR Admission Calibration (LoopX Native)**: Never grade quality or reject a valid PR based on LOC or diff line count, and never ask authors to split coherent changes solely to reduce PR size. Anchor review on LoopX's three admission criteria: **Outcome Anchoring** (observable `before -> after`), **Spec Alignment** (`implemented` / `deferred` / `out_of_scope` / `not_met` with zero `not_met` and verifiable evidence), and **Boundary Declaration** (incremental PRs must state remaining gap, next owner, and independent testability). Any >500-line test file note is strictly a human Review Prompt, never an automated blocking gate.
 
 ## Shared engine
 

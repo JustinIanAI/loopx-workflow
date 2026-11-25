@@ -1001,6 +1001,7 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '- 必须在 JSON 输出的 carryover 数组中逐条给出 \`finding_index\`、\`status\`（fixed / reproducible / obsolete）与 \`evidence\`；缺一条或状态非法将触发 NOT_VERIFIED。',
     '- 任一 \`reproducible\` 未闭环时，verdict 必须是 REQUEST_CHANGES；不得在正文中写成 APPROVE。',
     '- 「我的整体评价」必须显式覆盖 ' + THREE_D_EVAL.join(' / ') + ' 三维。',
+    '- PR 准入遵循 LoopX「结果锚定 + 证据核验 + 边界声明」范式：禁止按代码行数（LOC）或 diff 大小评判质量或拒绝有效 PR，禁止要求仅为减小行数而切碎代码；逐条核对规格状态（implemented / deferred / out_of_scope，杜绝 not_met）与增量 PR 边界（剩余 gap、下一 owner、独立可测性）；测试文件超过 500 行的提示仅作人工 Review Prompt，绝非自动阻断门禁。',
     '',
     '## 原生 motivation（来自 LoopX 抽取，须原样呈现于「动机」段）',
     motivation || '(空)',

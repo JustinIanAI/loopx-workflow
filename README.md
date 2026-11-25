@@ -94,7 +94,7 @@ README 不再重复管线细则。`docs/guides/loopx-workflow-architecture.html`
 | `00-INDEX.md` | **特性审阅总览看板** | 特性全貌、阶段流转状态、各文档直达链接 | 状态混乱、未经审批擅自开工 |
 | `01-decisions.md` | **本胶囊的实现取舍** | 指向了哪份 ADR，没有未决的 “it depends” | 把产品决策写在这里而不写进 `docs/adr/` |
 | `02-prd.md` | **需求切片** | 覆盖哪些 `REQ-*` 或 ADR，以及本切片的验收 | 另写一份产品级 PRD |
-| `03-stories.md` | **故事拆解与排期** | Job Stories 拆解，单 PR Diff ≤ 500 行 | 任务粒度过大、边界模糊 |
+| `03-stories.md` | **故事拆解与排期** | 按可独立验证的业务结果与边界拆解 Job Stories（不设行数上限，禁止为减小行数切碎代码；增量 PR 须声明剩余 gap、下一 owner 与独立可测性） | 结果未锚定、边界模糊或为凑行数强行切碎 |
 | `04-contract.md` | **不可变契约规范** | 顶部 TypeScript 接口与断言不变量 | 缺失接口类型直接开始编码 |
 | `05-evidence.md` | **质量凭据与门禁收据** | 四大门禁实测输出、LoopX Quality Receipt | 门禁带报错、Receipt 与 Diff 不匹配 |
 
