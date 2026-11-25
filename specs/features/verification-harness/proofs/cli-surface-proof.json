@@ -2,7 +2,11 @@
   "schema_version": "loopx_verification_harness_proof_v1",
   "feature_map": "skills/verification-harness/features/cli-surface.md",
   "upstream_baseline": "cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)",
-  "generated_at": "2026-11-25T06:36:57.417Z",
+  "generated_at": "2026-11-25T09:28:27.373Z",
+  "source_head": "2bf9e94af740dce96a990fee5adeaf04707f27a4",
+  "source_dirty": false,
+  "diff_fingerprint": "94996f4a59e994dda9e6958d1877a8d8441d9865afd363ca9fb06dcdf6b49fcd",
+  "contract_revision": "2b6e7756c965bd513d224ee52c4f7d458a7d9920da16458350fbe95f4a3f70eb",
   "overall_status": "passed",
   "steps": [
     {
@@ -43,7 +47,7 @@
       "status": "passed",
       "real_vs_mock": "real+contract_fake",
       "observations": [
-        "locked SHA-256 c251991ee4103d85... in registry & user_gate (exit=0)",
+        "locked bytes === golden fixture; registry contract_revision === on-disk SHA-256 c251991ee4103d85... (exit=0)",
         "gate verify contract passed (exit=0) when intact and blocked with CONTRACT_TAMPERED (exit!=0) after 1-line edit",
         "audited 5 cross-process gh CLI invocations"
       ]
@@ -60,13 +64,17 @@
     }
   ],
   "cleanup": {
-    "sandbox_dir": ".loopx/tmp/prove-cli-surface-G43D4p",
+    "sandbox_dir": ".loopx/tmp/prove-cli-surface-qnbicZ",
+    "sandbox_dir_kind": "relative_to_caller_repo",
     "sandbox_removed": true,
     "proof_survived_cleanup": true
   },
   "isolation": {
     "main_repo_registry_unchanged": true,
-    "host_global_registry_unchanged": true
+    "host_global_registry_unchanged": true,
+    "caller_repo_git_status_unchanged": true,
+    "caller_repo_loopx_manifest_unchanged": true,
+    "caller_repo_loopx_file_count": 0
   },
   "triage": {
     "outcome": "clean",
