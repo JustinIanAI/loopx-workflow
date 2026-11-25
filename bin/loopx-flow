@@ -97,6 +97,42 @@ assert_loopx_schema_version() {
     printf '%s' "$raw" | node "$CAPABILITY_PROBE_LIB" assert-schema --consumer "$consumer" >/dev/null
 }
 
+# 唯一的 LoopX JSON 读取入口：所有消费 `--format json` 载荷的位置都必须经过这里，
+# 第 2 层 schema_version 白名单校验只在这一个 wrapper 里执行（不得在调用点各抄一份）。
+# 用法: read_loopx_json <consumer> <loopx 参数...>
+# 语义：命令本身非 0 → stdout 原样返回、状态码原样透出（由调用方决定是否 fail-closed）；
+#       命令成功但载荷 schema 不在白名单 → **不输出载荷**到 stdout（防止上层把旧契约当成功解析），
+#       诊断卡与载荷都写 stderr，并返回 1。
+read_loopx_json() {
+    local consumer="$1"; shift
+    local raw rc=0
+    raw="$(run_loopx "$@")" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        printf '%s' "$raw"
+        return "$rc"
+    fi
+    if ! assert_loopx_schema_version "$consumer" "$raw"; then
+        printf '%s\n' "$raw" >&2
+        echo -e "${RED}[-] [FAIL-CLOSED] LoopX ${consumer} 载荷 schema_version 不在白名单，禁止按成功解析。${NC}" >&2
+        return 1
+    fi
+    printf '%s' "$raw"
+}
+
+# L0 命令 → 能力 scope 的单一映射：能力门只在 dispatch 边界按这里声明的 scope 执行一次，
+# 命令实现内不再各抄一份手工门（review #73 P0）。
+dispatch_capability_scope() {
+    case "${1:-}" in
+        feature|start) printf 'feature' ;;
+        check) printf 'check' ;;
+        pr) printf 'pr' ;;
+        review) printf 'review' ;;
+        merge) printf 'merge' ;;
+        release-approve) printf 'release-approve' ;;
+        *) return 1 ;;
+    esac
+}
+
 # 按仓库真实存在的远程默认基线解析：origin/HEAD → origin/main → origin/master（GitHub Issue #13）。
 # 单一事实源在 ingest-to-loopx-quality.js#discoverBaseRef；shell 侧只做委托与降级，避免两处逻辑漂移。
 resolve_change_quality_base_ref() {
@@ -119,7 +155,7 @@ preflight_change_quality_qualification() {
     # 分离捕获退出码与 JSON 输出：严禁用 `|| echo '{}'` 拼接，否则 prepare 失败时双 JSON
     # 会让 JSON.parse 失败并回落空对象，UNKNOWN 被误判为 OK，跳过前置阻断空跑四大门禁。
     prepare_rc=0
-    payload="$(run_loopx change-quality prepare --goal-id "$goal_id" --repo-path "$PROJECT_ROOT" --base-ref "$base_ref" --format json 2>/dev/null)" || prepare_rc=$?
+    payload="$(read_loopx_json change-quality.prepare change-quality prepare --goal-id "$goal_id" --repo-path "$PROJECT_ROOT" --base-ref "$base_ref" --format json)" || prepare_rc=$?
     verdict="$(node -e '
 let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
 let p={};try{p=JSON.parse(d)}catch(_){}
@@ -202,8 +238,10 @@ cmd_doctor_control_plane() {
     echo -e "\n${BLUE}==> [2/3] 控制面一致性检查 (runtime route / registry / 运行时工件)...${NC}"
 
     # 1. runtime root 路由与项目 registry 声明是否一致
+    # 统一 JSON wrapper：schema_version 白名单校验在此生效；doctor 属诊断视图，
+    # 校验失败时降级为 WARN（下方 runtime_root 为空即告警），不硬阻断体检。
     local route_json runtime_root declared_root
-    route_json="$(run_loopx --format json status 2>/dev/null || echo '{}')"
+    route_json="$(read_loopx_json status --format json status || echo '{}')"
     runtime_root="$(node -e '
 const firstJson=(s)=>{let depth=0,inStr=false,esc=false;for(let i=0;i<s.length;i++){const c=s[i];if(inStr){if(esc){esc=false}else if(c==="\\"){esc=true}else if(c==="\""){inStr=false}continue}if(c==="\""){inStr=true;continue}if(c==="{"){depth++}else if(c==="}"){depth--;if(depth===0)return s.slice(0,i+1)}}return null};
 let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{let out="";try{out=JSON.parse(d).runtime_root||""}catch(_){const j=firstJson(d);if(j){try{out=JSON.parse(j).runtime_root||""}catch(__){}}}process.stdout.write(out)})' <<< "$route_json")"
@@ -1206,13 +1244,13 @@ fs.writeFileSync(dst, text);
         evidence="authorization_mode=independent;contract_sha=$contract_sha;spec_commit=$spec_commit;feature=$feature;principal=$principal"
     fi
     local add_out todo_id
-    if ! add_out="$(run_loopx --format json todo add --goal-id "$goal_id" --role user --task-class user_gate --text "Gate1 specification authorization: $feature" --decision-scope "other:goal:$contract_sha" --global-gate 2>&1)"; then
+    if ! add_out="$(read_loopx_json todo.add --format json todo add --goal-id "$goal_id" --role user --task-class user_gate --text "Gate1 specification authorization: $feature" --decision-scope "other:goal:$contract_sha" --global-gate)"; then
         rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] 写 user_gate 授权记录失败: $add_out" >&2; exit 1
     fi
     todo_id="$(node -e 'const fs=require("fs");let d={};try{d=JSON.parse(fs.readFileSync(0,"utf8"))}catch(_){};process.stdout.write(String(d.todo_id||""))' <<< "$add_out")"
     [[ -n "$todo_id" ]] || { rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] user_gate 未返回 todo_id" >&2; exit 1; }
     local complete_out
-    if ! complete_out="$(run_loopx --format json todo complete --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent" --decision-outcome approve --evidence "$evidence" 2>&1)"; then
+    if ! complete_out="$(read_loopx_json todo.complete --format json todo complete --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent" --decision-outcome approve --evidence "$evidence")"; then
         rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] 完成 user_gate 授权记录失败: $complete_out" >&2; exit 1
     fi
 
@@ -1374,7 +1412,7 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
         exit 1
     fi
     local cq_json cq_ok
-    cq_json="$(run_loopx change-quality verify --goal-id "$resolved_goal" --repo-path "$PROJECT_ROOT" --base-ref "$cq_base_ref" --format json 2>/dev/null || echo '{}')"
+    cq_json="$(read_loopx_json change-quality.verify change-quality verify --goal-id "$resolved_goal" --repo-path "$PROJECT_ROOT" --base-ref "$cq_base_ref" --format json || echo '{}')"
     cq_ok="$(node -e '
 const fs = require("fs");
 let d = {};
@@ -3246,18 +3284,13 @@ cmd_todo_lease() {
         else
             owner="$(resolve_claim_owner "$goal_id")" || exit 1
         fi
-        claim_out="$(run_loopx --format json todo claim --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$owner" --claimed-by "$owner" 2>&1)" || claim_rc=$?
+        # 统一 JSON wrapper：第 2 层 schema_version 白名单在这里唯一执行（未知版本输出升级差异诊断卡）。
+        claim_out="$(read_loopx_json todo.claim --format json todo claim --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$owner" --claimed-by "$owner")" || claim_rc=$?
         if [[ "$claim_rc" -ne 0 ]]; then
             printf '%s\n' "$claim_out" >&2
-            echo -e "${RED}[-] [FAIL-CLOSED] 受管 Todo 认领失败: LoopX 拒绝了 todo claim，操作已阻断。${NC}" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] 受管 Todo 认领失败: LoopX 拒绝了 todo claim（或载荷 schema_version 不在白名单），操作已阻断。${NC}" >&2
             exit 1
         fi
-        # 第 2 层：schema_version 白名单 Fail-Closed（未知版本输出升级差异诊断卡）。
-        assert_loopx_schema_version todo.claim "$claim_out" || {
-            printf '%s\n' "$claim_out" >&2
-            echo -e "${RED}[-] [FAIL-CLOSED] todo claim 载荷 schema_version 不在白名单，操作已阻断。${NC}" >&2
-            exit 1
-        }
         claim_meta="$(parse_todo_claim_result "$claim_out")"
         if [[ "$claim_meta" != ok$'\t'* ]]; then
             printf '%s\n' "$claim_out" >&2
@@ -3393,17 +3426,12 @@ cmd_todo_lease() {
 
         echo -e "${YELLOW}[i] ${cache_reason:-凭证缓存不可用}；租约有效且同 Owner，按 Q1 分流 A 自动补领 receipt。${NC}" >&2
         local reclaim_out="" reclaim_rc=0 reclaim_meta reclaim_op reclaim_mode
-        reclaim_out="$(run_loopx --format json todo claim --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent_id" --claimed-by "$agent_id" 2>&1)" || reclaim_rc=$?
+        reclaim_out="$(read_loopx_json todo.claim --format json todo claim --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent_id" --claimed-by "$agent_id")" || reclaim_rc=$?
         if [[ "$reclaim_rc" -ne 0 ]]; then
             printf '%s\n' "$reclaim_out" >&2
-            echo -e "${RED}[-] [FAIL-CLOSED] Q1 分流 A 自动补领失败: LoopX 拒绝了 todo claim。${NC}" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] Q1 分流 A 自动补领失败: LoopX 拒绝了 todo claim（或载荷 schema_version 不在白名单）。${NC}" >&2
             exit 1
         fi
-        assert_loopx_schema_version todo.claim "$reclaim_out" || {
-            printf '%s\n' "$reclaim_out" >&2
-            echo -e "${RED}[-] [FAIL-CLOSED] 自动补领载荷 schema_version 不在白名单，操作已阻断。${NC}" >&2
-            exit 1
-        }
         reclaim_meta="$(parse_todo_claim_result "$reclaim_out")"
         if [[ "$reclaim_meta" != ok$'\t'* ]]; then
             printf '%s\n' "$reclaim_out" >&2
@@ -3423,17 +3451,12 @@ cmd_todo_lease() {
     local complete_out="" complete_rc=0 complete_meta
     local -a complete_args=(--format json todo complete --goal-id "$goal_id" --todo-id "$todo_id" --agent-id "$agent_id" --claim-operation-id "$claim_op")
     [[ -n "$evidence" ]] && complete_args+=(--evidence "$evidence")
-    complete_out="$(run_loopx "${complete_args[@]}" 2>&1)" || complete_rc=$?
+    complete_out="$(read_loopx_json todo.complete "${complete_args[@]}")" || complete_rc=$?
     if [[ "$complete_rc" -ne 0 ]]; then
         printf '%s\n' "$complete_out" >&2
         echo -e "${RED}[-] [FAIL-CLOSED] Todo 完成回写失败: ${todo_id}；LoopX 拒绝语义为唯一权威，未自动重新 claim。${NC}" >&2
         exit 1
     fi
-    assert_loopx_schema_version todo.complete "$complete_out" || {
-        printf '%s\n' "$complete_out" >&2
-        echo -e "${RED}[-] [FAIL-CLOSED] todo complete 载荷 schema_version 不在白名单，操作已阻断。${NC}" >&2
-        exit 1
-    }
     complete_meta="$(parse_todo_complete_result "$complete_out")"
     if [[ "$complete_meta" != "ok" ]]; then
         printf '%s\n' "$complete_out" >&2
@@ -3448,6 +3471,19 @@ cmd_todo_lease() {
 # 命令路由
 ACTION="${1:-help}"
 shift || true
+
+# 能力门（单一入口，review #73 P0）：feature / check / pr / review / merge / release-approve
+# 六条 L0 命令在 dispatch 边界统一执行一次 BLOCK 能力探针，BLOCK/UNKNOWN 时在**任何**
+# 不可逆动作（gh pr merge、git 写、loopx 写）之前非 0 退出并输出升级差异诊断卡。
+# 命令实现内不再各自重复这道门；--help/-h 与无参调用放行（只打印用法，无副作用）。
+if cap_scope="$(dispatch_capability_scope "$ACTION")"; then
+    if [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
+        require_loopx_capabilities "$cap_scope" || {
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 能力探针未通过（scope=$cap_scope），$ACTION 命令在第一个不可逆动作之前已阻断。${NC}" >&2
+            exit 1
+        }
+    fi
+fi
 
 # D1 全量命令分类矩阵：仅需要 LoopX 权威状态的命令入口 fail-closed 校验 registry（含附属 worktree）。
 case "$ACTION" in
