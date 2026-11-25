@@ -32,7 +32,7 @@ LC_ALL=en_US.UTF-8 ./scripts/preflight-check.sh
 What Doctor confirms before a drive is trusted:
 - `git`, `gh`, `node` (`>= 22.22.3`), and `npm` are reachable on `PATH`.
 - Four Gate scripts (`typecheck`, `lint`, `build`, `test`) and `bin/loopx-flow` are executable and syntactically intact.
-- When `loopx` (`2.3.x`) is installed locally, required skills, routes, and TypeScript control-plane runtime report ready. If `loopx` is absent (for example on minimal CI runners), real-`loopx` canary steps record `verified_unreachable` with the exact missing binary prerequisite rather than faking `passed`.
+- When `loopx` (`2.3.x`) is installed locally, required skills, routes, and TypeScript control-plane runtime report ready. If `loopx` is absent (for example on minimal CI runners), real-`loopx` canary steps record `verified_unreachable` with the exact missing binary prerequisite rather than faking `passed`; the Proof's `overall_status` then degrades to `partial` and the step is listed under `triage.harness_gap`.
 
 ## Drive
 
