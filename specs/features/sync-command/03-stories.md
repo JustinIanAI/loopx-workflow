@@ -6,7 +6,7 @@
 
 Conversation：设计见 01-decisions，规格见 04-contract。单个可独立验证的交付，不按层拆 issue/PR。
 
-Confirmation：无参同步全部；显式 Goal 精确透传；参数错误不调用底层；缺环境与持续失败非零；重试后成功才输出成功；文档与 usage 一致。
+Confirmation / AC（对应契约 AC-1 至 AC-6）：无参同步全部；显式 Goal 精确透传；参数错误不调用底层；缺环境与持续失败非零；重试后成功才输出成功；文档与 usage 一致。
 
 顺序：人类确认方案 → 正式 Gate1 → todo claim → 行为测试先红 → 薄入口实现与文档 → 测试变绿及四门禁 → check/审查/后续 Gate2。
 
