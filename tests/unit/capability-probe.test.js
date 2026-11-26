@@ -234,6 +234,33 @@ test('T3: unknown schema_version fails closed with the diagnostic card', () => {
   assert.match(unknownConsumer.stderr, /未登记/);
 });
 
+test('T3: 第 2 层覆盖 todo.list / agent-directory / task-lease.inspect 真实读取点（review #73 P1）', () => {
+  const cases = [
+    ['todo.list', { projection_envelope: { schema_version: 'loopx_projection_envelope_v0' } }, 'loopx_projection_envelope_v0'],
+    ['agent-directory', { schema_version: 'peer_agent_directory_v0' }, 'peer_agent_directory_v0'],
+    ['task-lease.inspect', { schema_version: 'task_lease_v0' }, 'task_lease_v0'],
+  ];
+  for (const [consumer, payload, expected] of cases) {
+    const ok = runModule(['assert-schema', '--consumer', consumer], JSON.stringify({ ok: true, ...payload }));
+    assert.strictEqual(ok.status, 0, `${consumer}: ${ok.stderr}`);
+    assert.strictEqual(ok.stdout.trim(), expected);
+  }
+  // `todo list` 的 schema 只在 projection_envelope 内；顶层出现同名字段不得算通过。
+  const misplaced = runModule(['assert-schema', '--consumer', 'todo.list'],
+    JSON.stringify({ ok: true, schema_version: 'loopx_projection_envelope_v0' }));
+  assert.strictEqual(misplaced.status, 1);
+  assert.match(misplaced.stderr, /missing/);
+  for (const [consumer, drift] of [
+    ['todo.list', { projection_envelope: { schema_version: 'loopx_projection_envelope_v9' } }],
+    ['agent-directory', { schema_version: 'peer_agent_directory_v9' }],
+    ['task-lease.inspect', { schema_version: 'task_lease_v9' }],
+  ]) {
+    const bad = runModule(['assert-schema', '--consumer', consumer], JSON.stringify({ ok: true, ...drift }));
+    assert.strictEqual(bad.status, 1, `${consumer} 未知版本必须阻断`);
+    assert.match(bad.stderr, /不在白名单/);
+  }
+});
+
 test('extractSignature keeps long flags and brace choices apart', () => {
   const signature = probe.extractSignature(ANCHOR_HELP['goal-lifecycle --help']);
   assert.ok(signature.flags.has('--goal-id'));

@@ -853,14 +853,24 @@ process.exit(1);
 }
 
 gate1_user_gate_evidence() {
-    local feature="$1" sha="$2" goal="$1-goal" json
-    json="$(run_loopx --format json todo list --goal-id "$goal" --role user 2>/dev/null || true)"
-    [[ -n "$json" ]] || return 1
+    # 返回码约定：0=取到 evidence；1=载荷可读但没有匹配的 user_gate approve 记录；
+    # 2=载荷不可读（命令失败或 schema_version 漂移）。调用方据此给出不同诊断。
+    local feature="$1" sha="$2" goal="$1-goal" json err_file
+    wf_run_dir gate1
+    err_file="$WF_RUN_DIR/gate1-todo-list.err"
+    # stderr 单独落文件：不能与 stdout 合并，否则 loopx 镜像里的无害 warning
+    # 会让合法载荷 JSON.parse 失败（review #73 P0 复审 finding）。
+    if ! json="$(read_loopx_json todo.list --format json todo list --goal-id "$goal" --role user 2>"$err_file")"; then
+        # 本函数在 $(...) 子 shell 中执行，全局变量传不出去，诊断直接写 stderr（外层继承）。
+        echo "[-] 诊断: $(sed $'s/\033\\[[0-9;]*m//g' "$err_file" 2>/dev/null | tr '\n' ' ')" >&2
+        return 2
+    fi
+    [[ -n "$json" ]] || return 2
     node -e '
 const fs = require("fs");
 const sha = process.argv[1];
 let data = {};
-try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(1); }
+try { data = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
 const rows = (data.todos || []).filter((t) => t.task_class === "user_gate" && t.decision_outcome === "approve" && t.decision_scope && t.decision_scope.scope_key === sha && !t.superseded_by);
 if (!rows.length) process.exit(1);
 process.stdout.write(String(rows[rows.length - 1].evidence || ""));
@@ -870,9 +880,13 @@ process.stdout.write(String(rows[rows.length - 1].evidence || ""));
 gate1_verify_authorization() {
     # Gate1 强制启用授权配置校验：缺失或非法配置即 fail-closed（P1-1 / ADR-0009）
     auth_require_config
-    local feature="$1" sha="$2" mode evidence accepted_by accepted_at risk
+    local feature="$1" sha="$2" mode evidence accepted_by accepted_at risk evidence_rc=0
     mode="$(auth_mode)"
-    evidence="$(gate1_user_gate_evidence "$feature" "$sha" || true)"
+    evidence="$(gate1_user_gate_evidence "$feature" "$sha")" || evidence_rc=$?
+    if [[ "$evidence_rc" -eq 2 ]]; then
+        echo "[-] [FAIL-CLOSED] 读取 user_gate 授权记录失败（LoopX todo list 载荷不可用或 schema_version 漂移），见上方诊断。" >&2
+        exit 1
+    fi
     if [[ -z "$evidence" ]]; then
         echo "[-] [FAIL-CLOSED] 缺少当前 SHA 对应的 user_gate approve 授权记录。" >&2
         exit 1
@@ -1435,6 +1449,58 @@ process.stdout.write(d.ok === true ? "true" : "false");
     fi
     echo -e "${GREEN}======================================================================${NC}"
 }
+# review 的本地参数校验（唯一实现，review #73 P0）：
+# 只判定不依赖外部 CLI 的非法输入（缺 PR 号；--model / --reasoning-effort / --agent-bin
+# 的缺失值、空值、换行/空白/控制字符与非法 reasoning-effort 枚举）。
+# dispatch 能力门之前调用一次（只校验），cmd_review 在能力门之后调用一次并填充
+# REVIEW_PASS_ARGS 透传给审查管线；两处共用同一判据与文案，避免口径漂移。
+# 返回值刻意全部写成 `return 1` 而非 `exit 1`：能力门之前的调用点自行决定退出。
+review_parse_local_args() {
+    REVIEW_PASS_ARGS=()
+    local pr_id="${1:-}"
+    [[ "$pr_id" == "--help" || "$pr_id" == "-h" ]] && return 0
+    # 位置参数必须是 PR 编号；flag 前置（如 `review --model gpt`）不得被当成 PR 号，
+    # 否则参数诊断会被后续 gh/能力探针掩盖（review #73 P0 复审 finding）。
+    if [[ -z "$pr_id" || "$pr_id" == -* ]]; then
+        echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow review 12${NC}" >&2
+        return 1
+    fi
+    shift || true
+    local flag token cleaned
+    while [[ $# -gt 0 ]]; do
+        flag="$1"
+        case "$flag" in
+            --cross-validate|--rebuild-body|--force-recheck) REVIEW_PASS_ARGS+=("$flag"); shift ;;
+            --agent-bin|--agent-bin=*|--model|--model=*|--reasoning-effort|--reasoning-effort=*)
+                if [[ "$flag" == *=* ]]; then
+                    token="${flag#*=}"; flag="${flag%%=*}"; shift
+                else
+                    # 末位缺值时必须显式报「为空」，不能 `shift 2` 让 set -e 静默退出。
+                    token="${2:-}"
+                    if [[ $# -ge 2 ]]; then shift 2; else shift; fi
+                fi
+                if [[ "$flag" == "--agent-bin" ]]; then
+                    if [[ -z "$token" || "$token" == --* ]]; then echo -e "${RED}[-] [FAIL-CLOSED] --agent-bin 需要 codex 或 claude${NC}" >&2; return 1; fi
+                    cleaned="$(printf '%s' "$token" | tr -d '[:cntrl:][:space:]')"
+                    if [[ "$cleaned" != "$token" ]]; then echo -e "${RED}[-] [FAIL-CLOSED] --agent-bin 含换行、空白或控制字符，拒绝执行${NC}" >&2; return 1; fi
+                    REVIEW_PASS_ARGS+=("--agent-bin" "$token")
+                    continue
+                fi
+                if [[ -z "$token" || "$token" == --* ]]; then echo -e "${RED}[-] [FAIL-CLOSED] $flag 为空，拒绝执行${NC}" >&2; return 1; fi
+                cleaned="$(printf '%s' "$token" | tr -d '[:cntrl:][:space:]')"
+                if [[ "$cleaned" != "$token" ]]; then echo -e "${RED}[-] [FAIL-CLOSED] $flag 含换行、空白或控制字符，拒绝执行${NC}" >&2; return 1; fi
+                if [[ "$flag" == "--reasoning-effort" ]]; then
+                    case "$token" in
+                        none|minimal|low|medium|high|xhigh|max|ultra) ;;
+                        *) echo -e "${RED}[-] [FAIL-CLOSED] --reasoning-effort 非法值 \"${token}\"，允许: none|minimal|low|medium|high|xhigh|max|ultra${NC}" >&2; return 1 ;;
+                    esac
+                fi
+                REVIEW_PASS_ARGS+=("$flag" "$token") ;;
+            *) shift ;;
+        esac
+    done
+}
+
 cmd_review() {
     local pr_id="${1:-}"
     if [[ "$pr_id" == "--help" || "$pr_id" == "-h" ]]; then
@@ -1457,38 +1523,11 @@ cmd_review() {
 HELPTXT
         exit 0
     fi
-    shift || true
-    if [[ -z "$pr_id" ]]; then
-        echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow review 12${NC}" >&2
-        exit 1
-    fi
-
+    # 与 dispatch 前的本地校验复用同一实现（review #73 P0），此处只负责填充透传参数；
+    # 判定失败时以同一诊断信息退出。
+    review_parse_local_args "$@" || exit 1
     local -a pass=()
-    local flag token cleaned
-    while [[ $# -gt 0 ]]; do
-        flag="$1"
-        case "$flag" in
-            --cross-validate|--rebuild-body|--force-recheck) pass+=("$flag"); shift ;;
-            --agent-bin|--agent-bin=*|--model|--model=*|--reasoning-effort|--reasoning-effort=*)
-                if [[ "$flag" == *=* ]]; then token="${flag#*=}"; flag="${flag%%=*}"; shift; else token="${2:-}"; shift 2; fi
-                if [[ "$flag" == "--agent-bin" ]]; then
-                    if [[ -z "$token" || "$token" == --* ]]; then echo -e "${RED}[-] [FAIL-CLOSED] --agent-bin 需要 codex 或 claude${NC}" >&2; exit 1; fi
-                    pass+=("--agent-bin" "$token")
-                    continue
-                fi
-                if [[ -z "$token" || "$token" == --* ]]; then echo -e "${RED}[-] [FAIL-CLOSED] $flag 为空，拒绝执行${NC}" >&2; exit 1; fi
-                cleaned="$(printf '%s' "$token" | tr -d '[:cntrl:][:space:]')"
-                if [[ "$cleaned" != "$token" ]]; then echo -e "${RED}[-] [FAIL-CLOSED] $flag 含换行、空白或控制字符，拒绝执行${NC}" >&2; exit 1; fi
-                if [[ "$flag" == "--reasoning-effort" ]]; then
-                    case "$token" in
-                        none|minimal|low|medium|high|xhigh|max|ultra) ;;
-                        *) echo -e "${RED}[-] [FAIL-CLOSED] --reasoning-effort 非法值 \"${token}\"，允许: none|minimal|low|medium|high|xhigh|max|ultra${NC}" >&2; exit 1 ;;
-                    esac
-                fi
-                pass+=("$flag" "$token") ;;
-            *) shift ;;
-        esac
-    done
+    [[ ${#REVIEW_PASS_ARGS[@]} -gt 0 ]] && pass=("${REVIEW_PASS_ARGS[@]}")
 
     if ! command -v gh >/dev/null 2>&1; then
         echo -e "${RED}[-] 错误: 未安装 gh CLI，无法执行交付审查。${NC}" >&2
@@ -2657,10 +2696,11 @@ resolve_claim_owner() {
             return 1
         fi
         local page_file="$page_dir/$(printf 'page-%03d.json' "$page_index")"
+        local page_err="$page_dir/$(printf 'page-%03d.err' "$page_index")"
         if [[ -z "$cursor" ]]; then
-            run_loopx --format json agent-directory --goal-id "$goal_id" >"$page_file" 2>/dev/null || true
+            read_loopx_json agent-directory --format json agent-directory --goal-id "$goal_id" >"$page_file" 2>"$page_err" || true
         else
-            run_loopx --format json agent-directory --goal-id "$goal_id" --cursor "$cursor" >"$page_file" 2>/dev/null || true
+            read_loopx_json agent-directory --format json agent-directory --goal-id "$goal_id" --cursor "$cursor" >"$page_file" 2>"$page_err" || true
         fi
         meta="$(node - "$page_file" <<'NODE'
 const fs = require("fs");
@@ -2715,6 +2755,11 @@ NODE
                 ;;
             BAD|"")
                 echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Goal ${goal_id} 的已注册 Agent 身份，已阻断租约申领。${NC}" >&2
+                # schema_version 漂移时 read_loopx_json 的升级诊断卡落在 page_err：原样透出，
+                # 否则操作者无法区分「Goal 未注册」与「LoopX 契约漂移」。
+                if [[ -s "$page_err" ]]; then
+                    sed $'s/\033\\[[0-9;]*m//g' "$page_err" >&2 || true
+                fi
                 local goal_q
                 printf -v goal_q '%q' "$goal_id"
                 echo -e "${YELLOW}    修复: loopx ${REGISTRY_FLAG} --format json agent-directory --goal-id ${goal_q}${NC}" >&2
@@ -3326,13 +3371,13 @@ cmd_todo_lease() {
     fi
 
     local inspect_out="" inspect_rc=0 todo_out="" todo_rc=0 observation=""
-    inspect_out="$(run_loopx --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || inspect_rc=$?
+    inspect_out="$(read_loopx_json task-lease.inspect --format json task-lease inspect --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || inspect_rc=$?
     if [[ "$inspect_rc" -ne 0 ]]; then
         printf '%s\n' "$inspect_out" >&2
         echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的租约状态，拒绝变更 Todo 状态。${NC}" >&2
         exit 1
     fi
-    todo_out="$(run_loopx --format json todo list --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || todo_rc=$?
+    todo_out="$(read_loopx_json todo.list --format json todo list --goal-id "$goal_id" --todo-id "$todo_id" 2>&1)" || todo_rc=$?
     if [[ "$todo_rc" -ne 0 ]]; then
         printf '%s\n' "$todo_out" >&2
         echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Todo ${todo_id} 的当前状态，拒绝变更。${NC}" >&2
@@ -3471,6 +3516,35 @@ cmd_todo_lease() {
 # 命令路由
 ACTION="${1:-help}"
 shift || true
+
+# 本地可判定非法输入先于外部能力探针（review #73 P0）：
+# 命令位置参数缺失、review 的 --model/--reasoning-effort/--agent-bin 空值与控制字符、
+# 非法 reasoning-effort 枚举，都不依赖 loopx / gh 是否可用。把它们放在 dispatch 能力门
+# 之前，避免 CI 无 loopx 时能力探针 UNKNOWN 掩盖真正的参数诊断（ADR-0015 决策 4）。
+# 命令实现内的同名校验保留为纵深防御，判据与文案以 review_parse_local_args 为唯一实现。
+if [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
+    case "$ACTION" in
+        feature|start)
+            if [[ -z "${1:-}" ]]; then
+                echo -e "${RED}[-] 错误: 请指定特性名称，例如: loopx-flow feature user-auth${NC}" >&2
+                exit 1
+            fi
+            ;;
+        review) review_parse_local_args "$@" || exit 1 ;;
+        merge)
+            if [[ -z "${1:-}" ]]; then
+                echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow merge 12${NC}" >&2
+                exit 1
+            fi
+            ;;
+        release-approve)
+            if [[ -z "${1:-}" ]]; then
+                echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow release-approve 12${NC}" >&2
+                exit 1
+            fi
+            ;;
+    esac
+fi
 
 # 能力门（单一入口，review #73 P0）：feature / check / pr / review / merge / release-approve
 # 六条 L0 命令在 dispatch 边界统一执行一次 BLOCK 能力探针，BLOCK/UNKNOWN 时在**任何**

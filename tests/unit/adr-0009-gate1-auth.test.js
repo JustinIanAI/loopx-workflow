@@ -169,6 +169,39 @@ test('T6 gate verify：evidence 缺键必须失败', () => {
   } finally { h.cleanup(dir); }
 });
 
+test('T6 gate verify：载荷合法但没有 matching user_gate 时必须仍报「缺少授权记录」', () => {
+  // 与 schema 漂移区分：schema 合法、todos=[] 只是没批准过，诊断必须是「缺少授权记录」。
+  const { dir } = gateVerifySandbox({});
+  const todosFile = path.join(dir, 'todos.json');
+  fs.writeFileSync(todosFile, JSON.stringify({
+    projection_envelope: { schema_version: 'loopx_projection_envelope_v0' },
+    todos: [],
+  }));
+  try {
+    const r = h.run(dir, ['gate', 'verify', 'contract', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /缺少当前 SHA 对应的 user_gate approve 授权记录/);
+    assert.doesNotMatch(r.stderr, /读取 user_gate 授权记录失败/);
+  } finally { h.cleanup(dir); }
+});
+
+test('T6 gate verify：todo list schema_version 漂移必须报读取失败，而不是「缺少授权记录」', () => {
+  // 授权记录真实存在，只是 LoopX 契约漂移（projection_envelope.schema_version 未知）。
+  const { dir, sha } = gateVerifySandbox({});
+  const todosFile = path.join(dir, 'todos.json');
+  const payload = JSON.parse(fs.readFileSync(todosFile, 'utf8'));
+  payload.projection_envelope = { schema_version: 'loopx_projection_envelope_v9' };
+  fs.writeFileSync(todosFile, JSON.stringify(payload));
+  try {
+    const r = h.run(dir, ['gate', 'verify', 'contract', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /读取 user_gate 授权记录失败/);
+    assert.match(r.stderr, /loopx_projection_envelope_v9/);
+    assert.doesNotMatch(r.stderr, /缺少当前 SHA 对应的 user_gate approve 授权记录/);
+    assert.ok(sha);
+  } finally { h.cleanup(dir); }
+});
+
 test('T7 gate verify：decision_outcome=reject 必须失败', () => {
   const { dir } = gateVerifySandbox({ outcome: 'reject' });
   try {

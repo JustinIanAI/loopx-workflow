@@ -45,7 +45,7 @@ for ((i=1; i<=$#; i++)); do
 done
 
 if [[ "$args" == *"agent-directory"* ]]; then
-  echo '{"ok":true,"registered_agent_count":1,"rows":[{"agent_id":"native-dispatch-agent","registered":true}]}'
+  echo '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":1,"rows":[{"agent_id":"native-dispatch-agent","registered":true}]}'
   exit 0
 fi
 
@@ -77,7 +77,7 @@ if [[ "$args" == *"task-lease inspect"* ]]; then
 fi
 
 if [[ "$args" == *"todo list"* ]]; then
-  echo "{\\"ok\\":true,\\"todo\\":{\\"todo_id\\":\\"\${todo}\\",\\"status\\":\\"\${MOCK_TODO_STATUS:-open}\\",\\"claimed_by\\":\\"native-dispatch-agent\\",\\"done\\":false}}"
+  echo "{\\"ok\\":true,\\"projection_envelope\\":{\\"schema_version\\":\\"loopx_projection_envelope_v0\\"},\\"todo\\":{\\"todo_id\\":\\"\${todo}\\",\\"status\\":\\"\${MOCK_TODO_STATUS:-open}\\",\\"claimed_by\\":\\"native-dispatch-agent\\",\\"done\\":false}}"
   exit 0
 fi
 

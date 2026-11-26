@@ -78,6 +78,7 @@ test('2. ADR-002: Double-anchored Contract Gate: passes on matching SHA256', () 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-hardening-mock-'));
   const todosFile = path.join(tmpDir, 'todos.json');
   fs.writeFileSync(todosFile, JSON.stringify({
+    projection_envelope: { schema_version: 'loopx_projection_envelope_v0' },
     todos: [{
       task_class: 'user_gate',
       decision_outcome: 'approve',

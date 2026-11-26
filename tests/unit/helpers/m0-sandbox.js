@@ -125,6 +125,7 @@ function registryWithGoal(dir, goalId, contractSha) {
 
 function userGateTodos(sha, evidence, outcome = 'approve') {
   return JSON.stringify({
+    projection_envelope: { schema_version: 'loopx_projection_envelope_v0' },
     todos: [{
       task_class: 'user_gate',
       decision_outcome: outcome,

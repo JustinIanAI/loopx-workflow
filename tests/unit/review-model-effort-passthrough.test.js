@@ -186,6 +186,34 @@ test('loopx-flow review help, fail-closed, and flag forwarding', () => {
   }
 });
 
+test('本地参数非法必须先于能力探针失败（CI 无 loopx 也返回参数诊断）', () => {
+  // 复现默认 CI 环境：PATH 里没有 loopx。若 dispatch 能力门抢在参数校验之前，
+  // `--model` 的控制字符诊断会被能力探针的 UNKNOWN 诊断卡掩盖（review #73 P0）。
+  const noLoopxPath = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(path.delimiter);
+  const cases = [
+    [['review', '12', '--model', 'bad\nid'], /控制字符/],
+    [['review', '12', '--reasoning-effort', 'turbo'], /非法值/],
+    [['review', '12', '--agent-bin='], /FAIL-CLOSED/],
+    // 末位缺值：必须给出「为空」诊断，而不是被 set -e 的 `shift 2` 静默吃掉。
+    [['review', '12', '--model'], /--model 为空/],
+    [['review', '12', '--reasoning-effort'], /--reasoning-effort 为空/],
+    [['review', '12', '--agent-bin'], /--agent-bin 需要 codex 或 claude/],
+    // flag 前置不得被当成 PR 编号。
+    [['review', '--model', 'gpt'], /请指定 PR 编号/],
+    // --agent-bin 与 --model 同口径拒绝控制字符。
+    [['review', '12', '--agent-bin', 'codex\n--yolo'], /--agent-bin 含换行/],
+  ];
+  for (const [argv, pattern] of cases) {
+    const result = spawnSync('bash', [FLOW, ...argv], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: noLoopxPath },
+    });
+    assert.notStrictEqual(result.status, 0, `${argv.join(' ')} 必须非 0`);
+    assert.match(result.stderr, pattern, `${argv.join(' ')} 应先给出本地参数诊断`);
+    assert.doesNotMatch(result.stderr, /升级契约差异诊断卡/, `${argv.join(' ')} 不得被能力探针抢先阻断`);
+  }
+});
+
 test('#70 isolatedGateEnv normalizes C.UTF-8 locale on darwin only', () => {
   const base = { LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8', LC_CTYPE: 'C.UTF-8', KEEP: 'x' };
   const mac = isolatedGateEnv(base, { platform: 'darwin' });

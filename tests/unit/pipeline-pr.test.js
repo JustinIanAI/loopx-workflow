@@ -242,6 +242,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
       ? `authorization_mode=single_owner;contract_sha=${contractSha};spec_commit=${currentHeadSha};feature=${featureName};principal=${acc.accepted_by};risk_acceptance=${acc.accepted_by}@${acc.accepted_at}`
       : `authorization_mode=${cfg.authorization_mode};contract_sha=${contractSha};spec_commit=${currentHeadSha};feature=${featureName};principal=reviewer`;
     fs.writeFileSync(path.join(MOCK_BIN_DIR, 'user-gate-todos.json'), JSON.stringify({
+      projection_envelope: { schema_version: 'loopx_projection_envelope_v0' },
       todos: [{
         task_class: 'user_gate',
         decision_outcome: 'approve',
