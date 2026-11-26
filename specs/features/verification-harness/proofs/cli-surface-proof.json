@@ -2,10 +2,10 @@
   "schema_version": "loopx_verification_harness_proof_v1",
   "feature_map": "skills/verification-harness/features/cli-surface.md",
   "upstream_baseline": "cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)",
-  "generated_at": "2026-11-26T06:42:08.734Z",
-  "source_head": "6509b2bf6e351470af2e18f7fb3f0c6f9db7bd36",
+  "generated_at": "2026-11-26T07:12:15.445Z",
+  "source_head": "e4fa307238b66ab89f409f65df8636a436bd9296",
   "source_dirty": false,
-  "diff_fingerprint": "94033744c0639d83b52492e948ad9db43329210fc743c0d96326cbb76fb89300",
+  "diff_fingerprint": "53ba2c2c90af4e3d2702c6e990f950f3f7ae26533f5687f09d0e47e4bb375f4d",
   "contract_revision": "43c434152297966b7a91616a44d755d66f6ab66fa6cebfaf615532cfd67d8a1b",
   "overall_status": "passed",
   "steps": [
@@ -64,7 +64,7 @@
     }
   ],
   "cleanup": {
-    "sandbox_dir": ".loopx/tmp/prove-cli-surface-LpMjDP",
+    "sandbox_dir": ".loopx/tmp/prove-cli-surface-EJFfny",
     "sandbox_dir_kind": "relative_to_caller_repo",
     "sandbox_removed": true,
     "proof_survived_cleanup": true
