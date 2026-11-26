@@ -85,6 +85,16 @@ README 不再重复管线细则。`docs/guides/loopx-workflow-architecture.html`
 
 ---
 
+## 独立同步全局 registry
+
+```bash
+./bin/loopx-flow sync                       # 同步所选源 registry 的全部 Goal
+./bin/loopx-flow sync --goal-id order-pay-goal
+./bin/loopx-flow --registry "path with spaces/registry.json" sync
+```
+
+未指定 Goal 时不从当前分支推断。入口复用现有 `sync-global` 同步与三次尝试；成功退出 0，缺少 LoopX/registry 或持续同步失败退出 1，并给出修复与重跑指引。参数缺值、重复或未知参数退出 2，不发起同步。`sync --help` 无需 LoopX 或 registry。此命令不执行 feature、审批或合入流程。
+
 ## 📂 Feature 资产胶囊结构与审阅看板
 
 每个特性的执行资产仍在 `specs/features/<feature-name>/`。产品需求不在这些文件里。

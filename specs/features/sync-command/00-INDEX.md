@@ -1,6 +1,6 @@
 # TRE-143 / sync-command — Gate1 审阅包
 
-- 状态：方案已获 TRE-143 评论批准；正式 Gate1 因当前 GitHub 登录与配置审批人不一致而 BLOCKED；尚未进入实现。
+- 状态：依 TRE-143 最新明确指令完成实现与本地验证，交付代码差异待人类查看；正式 Gate1/质量收据仍未通过，不创建 PR。
 - Feature：`sync-command`；分支：`feature/sync-command`；Goal：`sync-command-goal`。
 - 范围：[GitHub Issue #6 第 4 项](https://github.com/JustinIanAI/loopx-workflow/issues/6)，仅新增独立 sync 命令。
 - 基线：`origin/main@e17200a38c12ddf65926b99747455da90c79f9f0`（2026-11-26 核对远端 main）。
@@ -33,3 +33,9 @@
 6. 执行 `bin/loopx-flow gate verify contract sync-command`，将结果回复 TRE-143，并提交/推送审批后的胶囊。只有正式校验通过才进入 claim/TDD。
 
 方案批准已记录于 01-decisions；正式 Gate1 实测因账号不匹配阻断，详情见证据页。工具实际报错与未执行的账号检查分开记录在证据页；本包不伪造批准标记。
+
+## 本轮实现审阅（2026-11-26）
+
+用户在评论 `01a2171c-b50b-71ba-97ab-f58cecfd8b72` 明确要求开始开发、交付差异和实际测试结果，并在其查看前停止 PR 操作。本轮据此实现 GitHub #6 第 4 项；未修改授权模式或伪造契约冻结/Receipt。
+
+代码、行为测试和文档的差异以本分支相对 `dbbb820` 为准。当前 `gate verify contract sync-command` 实测非 0，`check sync-command` 在资格检查即停止；具体命令、报错和测试结果见 [实现验证记录](implementation-validation.md)。

@@ -139,6 +139,7 @@ usage() {
   release-approve <pr>    【断点 2 / Mode B】single_owner 发布授权：TTY 确认 + principal==accepted_by，写结构化 PR 评论
   issue <issue_id>        GitHub Issue 缺陷智能分流 (LoopX issue-fix feasibility 因果路由: fix_pr | comment_only | triage_only)
   integrate [--execute|--status]  LoopX 集成分支本地预集成 (默认 preview 不落盘)
+  sync [--goal-id <gid>]  同步全部或指定 Goal 到全局 registry（复用既有有限重试）
   context <feature>       生成当前特性的长程上下文胶囊，供开发者与 AI Agent 快速穿透审阅
   archive <feature>       原子归档已合入特性的资产包 (specs/features/ -> specs/archive/)
   gate verify <stage> <f> 阶段流转物理熔断守卫 (decisions | contract)
@@ -458,6 +459,52 @@ sync_global_required() {
     echo -e "    实际输出: ${out}" >&2
     echo -e "🛠️ 修复指令: loopx sync-global${goal_id:+ --goal-id $goal_id}" >&2
     return 1
+}
+
+# 独立同步入口：同步算法与有限重试仍由既有 helper / LoopX 所有。
+cmd_sync() {
+    local usage_line="用法: loopx-flow [--registry <path>] sync [--goal-id <gid>]"
+    if [[ $# -eq 1 && ( "$1" == "--help" || "$1" == "-h" ) ]]; then
+        printf '%s\n' "$usage_line"
+        return 0
+    fi
+
+    local goal_id="" goal_seen=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --goal-id)
+                if [[ "$goal_seen" == true || $# -lt 2 || -z "${2//[[:space:]]/}" || "$2" == -* ]]; then
+                    printf '%s\n' "[-] --goal-id 需提供一个非空 Goal ID，且只能指定一次。" "$usage_line" >&2
+                    return 2
+                fi
+                goal_id="$2"
+                goal_seen=true
+                shift 2
+                ;;
+            *)
+                printf '%s\n' "[-] 未知或多余参数: $1" "$usage_line" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    if ! command -v loopx >/dev/null 2>&1; then
+        printf '%s\n' "[-] [FAIL-CLOSED] 未安装 loopx CLI，无法同步。请安装 loopx 后重跑。" >&2
+        return 1
+    fi
+    # 在参数解析后校验，保证错参 exit 2、help 无需 registry。
+    wf_require_registry
+    if ! sync_global_required "$goal_id"; then
+        printf '修复后重跑: loopx-flow' >&2
+        if [[ ${#REGISTRY_ARGS[@]} -gt 0 ]]; then
+            printf ' %q' "${REGISTRY_ARGS[@]}" >&2
+        fi
+        printf ' sync' >&2
+        [[ -z "$goal_id" ]] || printf ' --goal-id %q' "$goal_id" >&2
+        printf '\n' >&2
+        return 1
+    fi
+    printf '%s\n' "[✓] 全局 registry 同步完成${goal_id:+: $goal_id}"
 }
 
 cmd_feature() {
@@ -3395,6 +3442,7 @@ case "$ACTION" in
     archive) cmd_archive "$@" ;;
     issue) cmd_issue "$@" ;;
     integrate) cmd_integrate "$@" ;;
+    sync) cmd_sync "$@" ;;
     doctor) cmd_doctor "$@" ;;
     gc) cmd_gc "$@" ;;
     init) cmd_init "$@" ;;
