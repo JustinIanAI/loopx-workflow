@@ -33,6 +33,7 @@ const { spawnSync } = require('node:child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const HARNESS_DIR = path.join(PROJECT_ROOT, 'skills/verification-harness');
 const PROVE_SCRIPT = path.join(HARNESS_DIR, 'scripts/prove-cli-surface.js');
+const PROVE_MODULE = require(PROVE_SCRIPT);
 
 const UPSTREAM_EXPECTED_SHA256 = {
   'LICENSE': 'bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e',
@@ -173,8 +174,10 @@ test('2. SKILL.md, loopx-adaptation.md & Feature Map enforce 5-dim model, 4 H2s,
 
 // Environment-adaptive end-to-end: the same code must pass both on a host with
 // `loopx 2.3.x` (overall_status=passed) and on a minimal CI runner without it
-// (overall_status=partial + one verified_unreachable harness gap). Expectations
-// are derived from `proof.steps`, never hard-coded to one environment.
+// (overall_status=partial + one verified_unreachable harness gap). This test is
+// an INTERNAL-CONSISTENCY check whose expectations are derived from
+// `proof.steps`, never hard-coded to one environment. The regression oracle for
+// `overall_status` being derived from steps (not a hard-coded literal) is test 5.
 test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and host/repo have zero residue', () => {
   const scratchRoot = makeScratch('vh-prove-test-');
 
@@ -215,14 +218,19 @@ test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and h
   assert.strictEqual(proof.schema_version, 'loopx_verification_harness_proof_v1');
   assert.strictEqual(proof.feature_map, 'skills/verification-harness/features/cli-surface.md');
   assert.match(proof.source_head, /^[0-9a-f]{40}$/, 'Proof must bind an exact source_head commit');
-  assert.strictEqual(proof.source_head, git(PROJECT_ROOT, ['rev-parse', 'HEAD']), 'source_head must be the real source commit');
+  const expectedScopeHead = PROVE_MODULE.sourceScopeHead(PROJECT_ROOT);
+  assert.ok(expectedScopeHead, 'sourceScopeHead must resolve on a clean committed repo');
+  assert.strictEqual(proof.source_head, expectedScopeHead, 'source_head must bind the exact source-scope head (proof artifacts excluded)');
   assert.strictEqual(proof.source_dirty, false, 'Proof must record a clean source workspace');
   assert.ok(isHex64(proof.diff_fingerprint), 'diff_fingerprint must be a SHA-256 digest');
+  const diffBaseInfo = PROVE_MODULE.resolveDiffBase(PROJECT_ROOT);
+  assert.ok(diffBaseInfo, 'resolveDiffBase must resolve on a clean committed repo');
+  const expectedFingerprint = PROVE_MODULE.sourceDiffFingerprint(PROJECT_ROOT, diffBaseInfo.base);
+  assert.ok(expectedFingerprint, 'sourceDiffFingerprint must resolve on a clean committed repo');
+  assert.strictEqual(proof.diff_fingerprint, expectedFingerprint, 'diff_fingerprint must bind the exact source-scope diff (proof artifacts excluded)');
   assert.ok(isHex64(proof.contract_revision), 'contract_revision must bind 04-contract.md SHA-256');
   const unreachableSteps = proof.steps.filter((step) => step.status === 'verified_unreachable');
-  const expectedOverall = unreachableSteps.length === 0
-    ? 'passed'
-    : (unreachableSteps.length === proof.steps.length ? 'incomplete' : 'partial');
+  const expectedOverall = unreachableSteps.length === 0 ? 'passed' : 'partial';
   assert.strictEqual(
     proof.overall_status,
     expectedOverall,
@@ -352,6 +360,8 @@ test('5. Missing loopx 2.3.x can never report overall_status=passed (harness gap
   assert.strictEqual(proof.overall_status, 'partial');
   const canary = proof.steps.find((step) => step.id === 'cli-todo-managed-canary');
   assert.strictEqual(canary.status, 'verified_unreachable');
+  assert.match(canary.observations.join(' '), /absent/i, 'missing loopx binary must be reported as absent');
+  assert.doesNotMatch(canary.observations.join(' '), /unsupported/i, 'missing loopx binary must not be misreported as unsupported version');
   assert.ok(proof.triage.harness_gap.length >= 1, 'verified_unreachable must be recorded as a harness_gap');
   assert.ok(proof.triage.harness_gap.some((gap) => gap.includes('cli-todo-managed-canary')));
   assert.strictEqual(proof.triage.outcome, 'changed', 'A harness gap must not be triaged as clean');
@@ -390,4 +400,57 @@ test('6. Dirty source workspace fails closed; source binding matches the exact c
   assert.strictEqual(fs.existsSync(path.join(dirtyOut, 'cli-surface-proof.json')), false, 'Dirty workspace must not emit a Proof');
   const residue = fs.existsSync(tmpSandboxRoot) ? fs.readdirSync(tmpSandboxRoot) : [];
   assert.deepStrictEqual(residue, [], 'Dirty workspace rejection must not create sandbox residue');
+});
+
+test('7. Freshness guard: committed Proof binds to the exact source-scope head & fingerprint', () => {
+  const proofPath = path.join(PROJECT_ROOT, 'specs/features/verification-harness/proofs/cli-surface-proof.json');
+  assert.strictEqual(fs.existsSync(proofPath), true, 'Committed Proof JSON must exist');
+
+  // The guard is meaningful only on a clean workspace (as in CI). Compute the
+  // live source binding with the SAME proof-artifact exclusion the runner uses,
+  // then require the committed artifact to match it exactly.
+  const statusRes = spawnSync('git', ['-C', PROJECT_ROOT, 'status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' });
+  assert.strictEqual(statusRes.status, 0, 'git status must succeed');
+  const dirtyLines = statusRes.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean);
+  assert.strictEqual(dirtyLines.length, 0, `freshness guard requires a clean workspace (${dirtyLines.length} dirty line(s)); commit and regenerate the Proof`);
+
+  const committed = JSON.parse(fs.readFileSync(proofPath, 'utf8'));
+  const scopeHead = PROVE_MODULE.sourceScopeHead(PROJECT_ROOT);
+  assert.ok(scopeHead, 'sourceScopeHead must resolve');
+  const diffBaseInfo = PROVE_MODULE.resolveDiffBase(PROJECT_ROOT);
+  assert.ok(diffBaseInfo, 'resolveDiffBase must resolve');
+  const fingerprint = PROVE_MODULE.sourceDiffFingerprint(PROJECT_ROOT, diffBaseInfo.base);
+  assert.ok(fingerprint, 'sourceDiffFingerprint must resolve');
+
+  assert.strictEqual(committed.source_head, scopeHead, 'committed Proof source_head is stale; rerun prove-cli-surface and commit the new artifact');
+  assert.strictEqual(committed.diff_fingerprint, fingerprint, 'committed Proof diff_fingerprint is stale; rerun prove-cli-surface and commit the new artifact');
+});
+
+test('8. Installed-but-unsupported loopx version reports verified_unreachable (never "not installed")', () => {
+  const scratchRoot = makeScratch('vh-prove-unsup-');
+  const proofOutDir = path.join(scratchRoot, 'proof-artifacts');
+  const fakeLoopx = path.join(scratchRoot, 'loopx-2.4');
+  fs.writeFileSync(fakeLoopx, '#!/usr/bin/env bash\necho "loopx 2.4.0"\n', { mode: 0o755 });
+
+  const res = spawnSync(process.execPath, [PROVE_SCRIPT, '--output-dir', proofOutDir], {
+    cwd: PROJECT_ROOT,
+    encoding: 'utf8',
+    timeout: 60000,
+    env: {
+      ...process.env,
+      LOOPX_BIN: fakeLoopx,
+      LOOPX_TMP_DIR: path.join(scratchRoot, 'loopx-tmp'),
+      LOOPX_USAGE_PING: '0',
+    },
+  });
+
+  assert.strictEqual(res.status, 0, `Prove with unsupported loopx version must still emit Proof (status=${res.status}):\n${res.stderr}`);
+  const proof = JSON.parse(fs.readFileSync(path.join(proofOutDir, 'cli-surface-proof.json'), 'utf8'));
+  assert.strictEqual(proof.overall_status, 'partial', 'unsupported loopx version must degrade overall_status away from passed');
+  const canary = proof.steps.find((step) => step.id === 'cli-todo-managed-canary');
+  assert.strictEqual(canary.status, 'verified_unreachable');
+  const obs = canary.observations.join(' ');
+  assert.match(obs, /unsupported/i, 'unsupported version must be reported as unsupported');
+  assert.match(obs, /2\.4\.0/, 'unsupported version must name the detected version');
+  assert.doesNotMatch(obs, /not installed/i, 'unsupported version must not be misreported as not installed');
 });

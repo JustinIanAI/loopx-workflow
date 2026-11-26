@@ -34,12 +34,12 @@ export interface VerificationHarnessProofV1 {
   upstream_baseline: 'cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)';
   generated_at: string;
   // ADR-0011 决策 5：Proof 必须锚定精确源码与契约，dirty 工作区 fail-closed
-  source_head: string;          // `git rev-parse HEAD` of the harness source
+  source_head: string;          // 最近一个触及 proof 工件目录以外任意路径的提交（`git rev-list -1 HEAD -- . ':(exclude)specs/features/verification-harness/proofs'`）
   source_dirty: false;          // dirty workspaces never emit a Proof
-  diff_fingerprint: string;     // SHA-256 of `git diff <base>..source_head`
+  diff_fingerprint: string;     // SHA-256 of `git diff <base>..HEAD`（同一 pathspec 排除 proof 工件目录）
   contract_revision: string | null; // SHA-256 of `specs/features/verification-harness/04-contract.md`
   // 由 steps 派生：全部 passed → passed；含 verified_unreachable → partial；
-  // 子特性不足 5 条 → incomplete；含 failed → failed
+  // 含 failed → failed（incomplete 保留为未来子特性不足时的降级态，当前 runner 恒产出 5 步）
   overall_status: ProofOverallStatus;
   steps: ProofStepRecord[];
   cleanup: {

@@ -99,11 +99,54 @@ function gitText(root, args) {
   return spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 30000 });
 }
 
+// The Proof is a projection of the source tree; its own artifacts must never
+// participate in their own binding, otherwise committing a freshly generated
+// Proof would always invalidate the one already committed (self-defeating).
+// ADR-0011 decision 5 freshness invariant: `source_head` is the most recent
+// commit reachable from HEAD that touches any path OUTSIDE the proof artifacts
+// directory, and `diff_fingerprint` is the SHA-256 of the same scope diff
+// (origin/main..HEAD) with that directory excluded. Committing a regenerated
+// Proof therefore never advances `source_head` nor changes `diff_fingerprint`,
+// so a freshness guard can recompute the exact same values from HEAD forever.
+const PROOF_ARTIFACTS_REL = 'specs/features/verification-harness/proofs';
+
+function sourceScopePaths() {
+  return ['.', `:(exclude)${PROOF_ARTIFACTS_REL}`];
+}
+
+function sourceScopeHead(root) {
+  const res = gitText(root, ['rev-list', '-1', 'HEAD', '--', ...sourceScopePaths()]);
+  if (res.status !== 0 || !res.stdout.trim()) return null;
+  return res.stdout.trim();
+}
+
+function resolveDiffBase(root) {
+  for (const ref of ['origin/main', 'origin/HEAD']) {
+    const res = gitText(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+    if (res.status === 0 && res.stdout.trim()) {
+      return { base: res.stdout.trim(), kind: 'origin' };
+    }
+  }
+  // Empty tree object: a Git repo without an origin still yields a stable,
+  // content-addressed fingerprint of the whole tracked tree.
+  const emptyTree = gitText(root, ['hash-object', '-t', 'tree', '/dev/null']);
+  if (emptyTree.status === 0 && emptyTree.stdout.trim()) {
+    return { base: emptyTree.stdout.trim(), kind: 'empty-tree' };
+  }
+  return null;
+}
+
+function sourceDiffFingerprint(root, base) {
+  const res = gitText(root, ['diff', '--no-color', '--binary', base, 'HEAD', '--', ...sourceScopePaths()]);
+  if (res.status !== 0) return null;
+  return sha256Text(res.stdout);
+}
+
 // ADR-0011 decision 5: bind the Proof to an exact `source_head` + scope diff
 // fingerprint + contract revision, and refuse to run on a dirty workspace.
 function readSourceBinding(root) {
-  const headRes = gitText(root, ['rev-parse', 'HEAD']);
-  if (headRes.status !== 0 || !headRes.stdout.trim()) {
+  const scopeHead = sourceScopeHead(root);
+  if (!scopeHead) {
     return {
       error: `source workspace ${root} is not a resolvable Git commit; Proof cannot be bound to an exact head.`,
     };
@@ -120,32 +163,21 @@ function readSourceBinding(root) {
     };
   }
 
-  let base = null;
-  for (const ref of ['origin/main', 'origin/HEAD']) {
-    const res = gitText(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
-    if (res.status === 0 && res.stdout.trim()) {
-      base = res.stdout.trim();
-      break;
-    }
-  }
-  // Empty tree object: a Git repo without an origin still yields a stable,
-  // content-addressed fingerprint of the whole tracked tree.
-  const emptyTree = gitText(root, ['hash-object', '-t', 'tree', '/dev/null']);
-  const diffBase = base || (emptyTree.status === 0 ? emptyTree.stdout.trim() : null);
-  if (!diffBase) {
+  const diffBaseInfo = resolveDiffBase(root);
+  if (!diffBaseInfo) {
     return { error: 'unable to resolve a diff baseline (origin/main, origin/HEAD or empty tree) for diff_fingerprint.' };
   }
-  const diffRes = gitText(root, ['diff', '--no-color', '--binary', diffBase, 'HEAD']);
-  if (diffRes.status !== 0) {
-    return { error: `git diff failed while computing diff_fingerprint: ${diffRes.stderr.trim()}` };
+  const fingerprint = sourceDiffFingerprint(root, diffBaseInfo.base);
+  if (!fingerprint) {
+    return { error: 'git diff failed while computing diff_fingerprint.' };
   }
 
   const contractPath = path.join(root, 'specs/features/verification-harness/04-contract.md');
   return {
-    source_head: headRes.stdout.trim(),
+    source_head: scopeHead,
     source_dirty: false,
-    source_base: base || '<empty-tree>',
-    diff_fingerprint: sha256Text(diffRes.stdout),
+    source_base: diffBaseInfo.kind === 'origin' ? diffBaseInfo.base : '<empty-tree>',
+    diff_fingerprint: fingerprint,
     contract_revision: digestOrNull(contractPath),
   };
 }
@@ -193,6 +225,8 @@ function snapshotIsolation(root, outputDir) {
   return {
     git_status: statusLines,
     loopx_manifest_count: loopxManifest.length,
+    git_status_digest: sha256Text(JSON.stringify(statusLines)),
+    loopx_manifest_digest: sha256Text(JSON.stringify(loopxManifest)),
     digest: sha256Text(JSON.stringify({ status: statusLines, loopx: loopxManifest })),
   };
 }
@@ -442,6 +476,36 @@ function assertCondition(cond, message) {
   if (!cond) {
     throw new Error(message);
   }
+}
+
+// Classify real `loopx` readiness for the managed-todo canary into three
+// disjoint states: `ready` (2.3.x), `absent` (no executable, or the version
+// probe failed), and `unsupported_version` (present but not 2.3.x). The latter
+// two are both `verified_unreachable` and must never be reported as covered.
+function classifyLoopx23(readiness) {
+  const { resolvedOk, resolvedError, probeStatus, versionOut } = readiness;
+  if (!resolvedOk) {
+    return {
+      ready: false,
+      state: 'absent',
+      reason: `loopx binary absent: no executable loopx 2.3.x on PATH (${resolvedError || 'no loopx executable found'})`,
+    };
+  }
+  if (probeStatus !== 0) {
+    return {
+      ready: false,
+      state: 'absent',
+      reason: `loopx binary present but --version probe failed (exit=${probeStatus}): ${versionOut || 'no output'}`,
+    };
+  }
+  if (/^loopx\s+2\.3\.\d+/.test(versionOut)) {
+    return { ready: true, state: 'ready', reason: '' };
+  }
+  return {
+    ready: false,
+    state: 'unsupported_version',
+    reason: `loopx unsupported version: detected ${versionOut || 'unknown version'}; real loopx 2.3.x is required`,
+  };
 }
 
 function renderMarkdownReport(proof) {
@@ -754,17 +818,20 @@ function main() {
         ? spawnSync(realLoopxBin, ['--version'], { encoding: 'utf8' })
         : { status: 1, stdout: '', stderr: '' };
       const versionOut = `${verProbe.stdout || ''}${verProbe.stderr || ''}`.trim();
-      const hasRealLoopx23 = verProbe.status === 0 && /^loopx\s+2\.3\.\d+/.test(versionOut);
+      const loopxReadiness = classifyLoopx23({
+        resolvedOk: Boolean(resolvedLoopx && resolvedLoopx.ok),
+        resolvedError: resolvedLoopx && resolvedLoopx.error ? resolvedLoopx.error : '',
+        probeStatus: verProbe.status,
+        versionOut,
+      });
 
-      if (!hasRealLoopx23) {
+      if (!loopxReadiness.ready) {
         steps.push({
           id: 'cli-todo-managed-canary',
           surface: 'bin/loopx-flow todo claim + todo done (real loopx 2.3.x)',
           status: 'verified_unreachable',
           real_vs_mock: 'real',
-          observations: [
-            `prerequisite missing: real loopx 2.3.x binary not installed on PATH (detected: ${versionOut || 'none'})`,
-          ],
+          observations: [loopxReadiness.reason],
         });
       } else {
         const canaryDir = path.join(sandboxDir, 'real-loopx-canary');
@@ -880,7 +947,7 @@ function main() {
     && JSON.stringify(beforeIsolation.git_status) === JSON.stringify(afterIsolation.git_status);
   const callerRepoLoopxUnchanged = Boolean(afterIsolation)
     && beforeIsolation.loopx_manifest_count === afterIsolation.loopx_manifest_count
-    && beforeIsolation.digest === afterIsolation.digest;
+    && beforeIsolation.loopx_manifest_digest === afterIsolation.loopx_manifest_digest;
 
   if (!sandboxRemoved || !mainRepoUnchanged || !hostGlobalUnchanged || !callerRepoUnchanged) {
     process.stderr.write(
@@ -895,13 +962,15 @@ function main() {
 
   const unreachableSteps = steps.filter((step) => step.status === 'verified_unreachable');
   const failedSteps = steps.filter((step) => step.status === 'failed');
+  // Every pass drives exactly five sub-features: zero failures and zero
+  // unreachable steps -> `passed`; any unreachable step -> `partial`; any
+  // failed step -> `failed`. (The legacy `steps.length < 5 -> incomplete`
+  // branch was unreachable dead code and has been removed.)
   let overallStatus = 'passed';
   if (failedSteps.length > 0) {
     overallStatus = 'failed';
   } else if (unreachableSteps.length > 0) {
     overallStatus = 'partial';
-  } else if (steps.length < 5) {
-    overallStatus = 'incomplete';
   }
   const harnessGaps = unreachableSteps.map(
     (step) => `${step.id}: ${step.observations[0] || 'verified_unreachable'}`
@@ -927,7 +996,8 @@ function main() {
         : '<isolated-loopx-tmp>/prove-cli-surface',
       sandbox_dir_kind: sandboxDirReversible ? 'relative_to_caller_repo' : 'sanitized_placeholder',
       sandbox_removed: sandboxRemoved,
-      proof_survived_cleanup: true,
+      // Derived below from the post-write survival observation, never a literal.
+      proof_survived_cleanup: false,
     },
     isolation: {
       main_repo_registry_unchanged: mainRepoUnchanged,
@@ -944,14 +1014,22 @@ function main() {
     },
   };
 
-  fs.writeFileSync(proofJsonPath, `${JSON.stringify(proof, null, 2)}\n`, 'utf8');
-  fs.writeFileSync(proofMdPath, `${renderMarkdownReport(proof)}\n`, 'utf8');
+  function writeProofArtifacts() {
+    fs.writeFileSync(proofJsonPath, `${JSON.stringify(proof, null, 2)}\n`, 'utf8');
+    fs.writeFileSync(proofMdPath, `${renderMarkdownReport(proof)}\n`, 'utf8');
+  }
+  writeProofArtifacts();
 
+  // The survival fact is only observable after the artifacts exist on disk;
+  // observe it, fail closed if missing, then finalize the derived boolean back
+  // into the same artifacts so the projection is never a hard-coded literal.
   const survived = fs.existsSync(proofJsonPath) && fs.existsSync(proofMdPath) && !fs.existsSync(sandboxDir);
   if (!survived) {
     process.stderr.write('[FAIL-CLOSED] Proof artifacts failed post-cleanup survival check.\n');
     process.exit(1);
   }
+  proof.cleanup.proof_survived_cleanup = survived;
+  writeProofArtifacts();
 
   if (overallStatus === 'passed') {
     process.stdout.write(`[✓] Cold-start Prove passed (${steps.length} sub-features). Proof saved to ${outputDir}\n`);
@@ -971,4 +1049,9 @@ module.exports = {
   DEMO_DRAFT_CONTRACT_TEXT,
   GOLDEN_LOCKED_CONTRACT_TEXT,
   GOLDEN_LOCKED_CONTRACT_SHA256,
+  PROOF_ARTIFACTS_REL,
+  sourceScopeHead,
+  sourceDiffFingerprint,
+  resolveDiffBase,
+  classifyLoopx23,
 };
