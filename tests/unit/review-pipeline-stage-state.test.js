@@ -281,3 +281,36 @@ test('红线守卫：默认预算未被放宽（TIMEOUT_MS 仍 600000）', () =>
   assert.match(src, /const TIMEOUT_MS = 600000;/);
   assert.strictEqual(MAX_STAGE_ATTEMPTS, 3);
 });
+
+test('Stage B P0-2：仅切换 model/effort 时必须重跑（selection_hash 隔离）', () => {
+  const s = sandbox();
+  try {
+    const ok = () => ({ stdout: OK_JSON, stderr: '', rawStdout: OK_JSON });
+    const a = runStageWithState(params(s, { runFn: ok, selection: { model: 'm-a', reasoningEffort: 'medium' }, timeoutMs: 1000 }));
+    assert.strictEqual(a.ok, true);
+    assert.strictEqual(Boolean(a.resumed), false);
+    const b = runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'medium' }, timeoutMs: 1000 }));
+    assert.strictEqual(b.ok, true);
+    assert.strictEqual(Boolean(b.resumed), false, '切换 model 不得复用旧输出');
+    const c = runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'high' }, timeoutMs: 1000 }));
+    assert.strictEqual(Boolean(c.resumed), false, '切换 effort 不得复用旧输出');
+    const d = runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'high' }, timeoutMs: 1000 }));
+    assert.strictEqual(d.resumed, true, '同 model/effort 仍可续跑');
+  } finally {
+    s.restore();
+  }
+});
+
+test('Stage B P0-3：并发隔离——不同 pid 落不同目录', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const dir1 = ar.reviewStateDir(s.dir, 73);
+    const dir2 = ar.reviewStateDir(s.dir, 73);
+    assert.strictEqual(dir1, dir2, '同一进程内两次取目录应一致（可接续）');
+    assert.match(dir1, /review-pr73\//);
+    assert.match(dir1, new RegExp(`${process.pid}-`));
+  } finally {
+    s.restore();
+  }
+});

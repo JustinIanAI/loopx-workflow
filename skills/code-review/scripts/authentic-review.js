@@ -176,9 +176,24 @@ const RETRY_BACKOFF_CAP_MS = 30000;
 const HEARTBEAT_INTERVAL_MS = 15000;
 
 function reviewStateDir(repoRoot, pr) {
-  const dir = path.join(resolveTmpDir(repoRoot), `review-pr${pr}`);
+  // 并发隔离：同一 PR 的多进程必须落在不同子目录，避免 stage*.state.json 与 attempt 输出互相覆盖。
+  // 同进程内两次调用视为同一运行（可接续），不同进程（不同 pid）落不同目录（隔离）。
+  const key = `${repoRoot || ''}|${pr}`;
+  if (!Object.prototype.hasOwnProperty.call(reviewStateDir, '_memo')) {
+    Object.defineProperty(reviewStateDir, '_memo', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
+  }
+  const memo = reviewStateDir._memo ? (typeof reviewStateDir._memo === 'object' ? reviewStateDir._memo : null) : null;
+  if (memo && memo[key]) return memo[key];
+  const base = path.join(resolveTmpDir(repoRoot), `review-pr${pr}`);
+  const suffix = `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  const dir = path.join(base, suffix);
   fs.mkdirSync(dir, { recursive: true });
+  if (memo) memo[key] = dir;
   return dir;
+}
+
+function reviewStateDirAbsolute(repoRoot) {
+  return path.join(resolveTmpDir(repoRoot), `review-pr${process.pid}`);
 }
 
 function stageStatePath(repoRoot, pr, stage) {
@@ -332,12 +347,21 @@ function runStageWithState(options) {
   const execStage = typeof runFn === 'function' ? runFn : runReviewAgent;
   const promptSha = crypto.createHash('sha256').update(String(prompt || ''), 'utf8').digest('hex');
   const budgetMs = timeoutMs || BUDGET_MS;
+  // 身份哈希：headOid + prompt + agentBin + selection(model/effort)；更换模型或强度即视为不同身份，强制重跑。
+  const selectionCanonical = {
+    model: selection ? (selection.model || '') : '',
+    reasoningEffort: selection ? (selection.reasoningEffort || '') : '',
+  };
+  const identityHash = crypto.createHash('sha256')
+    .update(`${headOid}\n${agentBin || ''}\n${promptSha}\n${selectionCanonical.model}\n${selectionCanonical.reasoningEffort}`, 'utf8')
+    .digest('hex');
   const stateDir = reviewStateDir(repoRoot, pr);
   const prior = readStageState(repoRoot, pr, stage);
   const sameIdentity = Boolean(prior)
     && prior.head_oid === headOid
     && prior.prompt_sha256 === promptSha
-    && (prior.agent_bin || null) === (agentBin || null);
+    && (prior.agent_bin || null) === (agentBin || null)
+    && (prior.selection_hash || null) === identityHash;
 
   if (prior && !sameIdentity) {
     appendPipelineLog(repoRoot, pr,
@@ -377,6 +401,9 @@ function runStageWithState(options) {
     const outputPath = path.join(stateDir, `${stage}.attempt${attempt}.out.txt`);
     writeStageState(repoRoot, pr, stage, {
       head_oid: headOid,
+      selection_hash: identityHash,
+      selection_model: selectionCanonical.model,
+      selection_reasoning_effort: selectionCanonical.reasoningEffort,
       started_at: startedAt,
       prompt_sha256: promptSha,
       attempt,
