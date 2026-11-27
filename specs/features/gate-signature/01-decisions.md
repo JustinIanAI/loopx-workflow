@@ -1,6 +1,6 @@
 # gate-signature 实现取舍
 
-- **Status**: APPROVED（2026-11-27；Gate1 授权记录仍由人类执行 `loopx-flow approve contract` 写入）
+- **Status**: DRAFT（待 Gate1；2026-11-27 实现完成，授权记录尚未写入）
 - **关联**：[ADR-0019](../../../docs/adr/0019-gate-signature-via-github.md)、`REQ-GATE-SIGNATURE-1`
 
 ## 取舍

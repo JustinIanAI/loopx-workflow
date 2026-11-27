@@ -2,7 +2,7 @@
 
 - **Feature**：`gate-signature`
 - **Goal**：`gate-signature-goal`（待注册）
-- **Current Status**：`Implemented`（PR 待建）
+- **Current Status**：`Implemented`（PR #90）
 - **Contract Status**：`DRAFT (Pending Approval)`
 - **追溯**：`REQ-GATE-SIGNATURE-1`、`REQ-CHECKPOINT-1`、`REQ-CHECKPOINT-2`、ADR-0019
 

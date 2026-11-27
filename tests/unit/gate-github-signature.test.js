@@ -160,3 +160,49 @@ test('Gate2 无有效评论且未加 --interactive → 失败并提示 TTY', () 
     assert.match(r.stderr + r.stdout, /TTY/);
   } finally { h.cleanup(dir); }
 });
+
+test('Gate1 评论 spec_commit 与当前 HEAD 不一致 → 拒绝', () => {
+  const { dir, lockedSha } = gate1Sandbox();
+  try {
+    writeGate1Comments(path.join(dir, 'comments.json'), { sha: lockedSha, specCommit: 'e'.repeat(40) });
+    gate1GhMock(dir, path.join(dir, 'comments.json'));
+    const r = h.run(dir, ['approve', 'contract', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    const contract = fs.readFileSync(path.join(dir, 'specs/features', FEATURE, '04-contract.md'), 'utf8');
+    assert.doesNotMatch(contract, /FROZEN & APPROVED/);
+  } finally { h.cleanup(dir); }
+});
+
+test('Gate1 --prepare --yes → 拒绝', () => {
+  const { dir } = gate1Sandbox();
+  try {
+    const r = h.run(dir, ['approve', 'contract', FEATURE, '--prepare', '--yes']);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /--yes/);
+    assert.doesNotMatch(r.stdout, /contract_sha :/);
+  } finally { h.cleanup(dir); }
+});
+
+test('Gate1 --interactive 无 TTY → 失败并提示 TTY', () => {
+  const { dir } = gate1Sandbox();
+  try {
+    const r = h.run(dir, ['approve', 'contract', FEATURE, '--interactive']);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /TTY/);
+  } finally { h.cleanup(dir); }
+});
+
+test('Gate1 independent 模式 --prepare 产出 independent 模板', () => {
+  const dir = h.makeSandbox('adr19-g1-ind-');
+  try {
+    h.writeConfig(dir, 'independent');
+    h.writeCapsule(dir, FEATURE);
+    approveLoopxMock(dir);
+    gate1GhMock(dir, path.join(dir, 'comments.json'));
+    const r = h.run(dir, ['approve', 'contract', FEATURE, '--prepare']);
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /gate=1;mode=independent;/);
+    assert.doesNotMatch(r.stdout, /gate=1;mode=single_owner;/);
+    assert.match(r.stdout, /approver=<第二 GitHub 账号 login>/);
+  } finally { h.cleanup(dir); }
+});

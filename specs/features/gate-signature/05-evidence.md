@@ -13,13 +13,13 @@
 | Typecheck | `npm run typecheck` | passed | 退出 0 |
 | Lint | `npm run lint` | passed | 5/5 PASS |
 | Build | `npm run build` | passed | 退出 0 |
-| Test | `npm run test` | passed | **351 / 351** |
+| Test | `npm run test` | passed | **355 / 355** |
 
 ## 专项
 
 | 证据 | 状态 | 备注 |
 |---|---|---|
-| `node --test tests/unit/gate-github-signature.test.js` | passed | 7 / 7 |
+| `node --test tests/unit/gate-github-signature.test.js` | passed | 11 / 11（含 spec_commit 不符、`--interactive` 无 TTY、`--prepare --yes`、independent 模板） |
 | `node --test tests/unit/adr-0009-gate1-auth.test.js tests/unit/adr-0012-gate2.test.js` | passed | 37 / 37（既有 Gate1/Gate2 语义不回退） |
 
 ## LoopX 质量收据

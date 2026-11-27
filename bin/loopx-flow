@@ -1274,20 +1274,34 @@ fs.writeFileSync(dst, text);
 
     # ADR-0019：--prepare 只打印 GitHub 签名评论模板，零写入。
     if [[ "$prepare" == "true" ]]; then
-        local prepared_by
-        prepared_by="$(auth_accepted_by)"
+        [[ "$yes" != "true" ]] || { rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] 不支持 --yes：--prepare 也不得跳过人工签名" >&2; exit 1; }
         rm -f "$temp_contract"
         wf_unregister_temp_file "$temp_contract"
-        echo "[i] Gate1 准备完成（未写入任何批准标记）"
-        echo "    feature      : $feature"
-        echo "    contract_sha : $contract_sha"
-        echo "    spec_commit  : $spec_commit"
-        echo "    approver     : $prepared_by"
-        echo ""
-        echo "请在 PR 上以 $prepared_by 身份粘贴以下评论，然后重跑 loopx-flow approve contract ${feature}："
-        echo ""
-        echo "<!-- loopx-flow:gate1-authorization:$feature@$contract_sha -->"
-        echo "gate=1;mode=single_owner;contract_sha=$contract_sha;spec_commit=$spec_commit;approver=$prepared_by"
+        if [[ "$mode" == "single_owner" ]]; then
+            local prepared_by
+            prepared_by="$(auth_accepted_by)"
+            echo "[i] Gate1 准备完成（single_owner，未写入任何批准标记）"
+            echo "    feature      : $feature"
+            echo "    contract_sha : $contract_sha"
+            echo "    spec_commit  : $spec_commit"
+            echo "    approver     : $prepared_by"
+            echo ""
+            echo "请在 PR 上以 $prepared_by 身份粘贴以下评论，然后重跑 loopx-flow approve contract ${feature}："
+            echo ""
+            echo "<!-- loopx-flow:gate1-authorization:$feature@$contract_sha -->"
+            echo "gate=1;mode=single_owner;contract_sha=$contract_sha;spec_commit=$spec_commit;approver=$prepared_by"
+        else
+            echo "[i] Gate1 准备完成（independent，未写入任何批准标记）"
+            echo "    feature      : $feature"
+            echo "    contract_sha : $contract_sha"
+            echo "    spec_commit  : $spec_commit"
+            echo ""
+            echo "请由【另一个 GitHub 账号】在 PR 上粘贴以下评论（approver 必须替换为该账号 login），"
+            echo "然后由执行者重跑 loopx-flow approve contract ${feature}："
+            echo ""
+            echo "<!-- loopx-flow:gate1-authorization:$feature@$contract_sha -->"
+            echo "gate=1;mode=independent;contract_sha=$contract_sha;spec_commit=$spec_commit;approver=<第二 GitHub 账号 login>"
+        fi
         exit 0
     fi
 
