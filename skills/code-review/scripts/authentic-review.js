@@ -1603,20 +1603,35 @@ async function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, sel
         if (stderrBytes > MAX_OUTPUT_BYTES) { overflow = true; try { child.kill('SIGTERM'); } catch (_) { /* ignore */ } return; }
         stderrAcc += chunk;
       });
+      // 单次收口：'error' 与 'close' 可能都触发，只有第一次 resolve 生效。
+      let settled = false;
+      const settle = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
+        resolve(value);
+      };
+      let spawnError = null;
       child.on('error', (err) => {
-        resolve({ __spawn_error: true, error: err && err.message ? err.message : String(err) });
+        spawnError = err;
+        // 进程根本没拉起时不会再有携带真实退出码的 close，按 spawn 失败收口。
+        if (!child.pid) {
+          settle({ __spawn_error: true, error: err && err.message ? err.message : String(err) });
+        }
       });
       child.on('close', (code, signal) => {
-        if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
-        resolve({
+        settle({
           status: code,
           signal: signal || null,
           stdout: stdoutAcc,
           stderr: stderrAcc,
           timedOut: timedOutFlag,
           overflow,
+          spawnError: spawnError ? (spawnError.message || String(spawnError)) : null,
         });
       });
+      // 子进程可能不读 stdin 就退出：EPIPE 不得升级为未捕获异常（Linux CI 实测）。
+      child.stdin.on('error', () => { /* ignore */ });
       if (prompt != null) {
         try { child.stdin.write(String(prompt)); } catch (_) { /* ignore */ }
       }
@@ -1670,10 +1685,10 @@ async function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, sel
     if (novelHostTruncation(diffText, ...truncParts)) {
       return { truncated: true, stdout: modelChannel, stderr, rawStdout, error: 'host truncation marker in model output' };
     }
-    if (result.status !== 0 || result.overflow) {
+    if (result.status !== 0 || result.overflow || result.spawnError) {
       const diag = result.overflow
         ? `${String(stderr || rawStdout || msgOut || '').slice(0, 120)} (maxBuffer exceeded 64MB)`
-        : String(stderr || rawStdout || msgOut || '');
+        : String(stderr || rawStdout || msgOut || result.spawnError || '');
       return {
         error: `exit ${result.status}: ${diag.slice(0, 300)}`,
         stdout: modelChannel,
