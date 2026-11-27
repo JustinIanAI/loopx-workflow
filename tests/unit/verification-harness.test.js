@@ -259,7 +259,7 @@ test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and h
   assert.ok(expectedFingerprint, 'sourceDiffFingerprint must resolve on a clean committed repo');
   assert.strictEqual(proof.diff_fingerprint, expectedFingerprint, 'diff_fingerprint must bind the exact source-scope diff (proof artifacts excluded)');
   assert.ok(
-    isHex64(proof.source_base) || proof.source_base === '<empty-tree>',
+    /^[0-9a-f]{40}$/.test(proof.source_base) || proof.source_base === '<empty-tree>',
     'source_base must bind the resolved diff base (merge-base SHA or empty-tree placeholder)'
   );
   const expectedSourceBase = diffBaseInfo.kind === 'origin' ? diffBaseInfo.base : '<empty-tree>';
