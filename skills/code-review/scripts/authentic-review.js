@@ -2383,6 +2383,8 @@ function main() {
     // 直接算路径而不经 reviewStateDir：成功路径不创建任何新目录；只删本进程的 pid 子目录
     const stateDir = reviewStateDir(repoRoot, o.pr);
     try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+    // 父目录已空时一并移除（保持 tmpDir 零残留）；并发 sibling 目录存在时 rmdir 抛 ENOTEMPTY → ignore
+    try { fs.rmdirSync(path.dirname(stateDir)); } catch (_) { /* ignore */ }
   }
   console.log(`\n[PASSED] Authentic review pipeline complete (verdict=${verdict}).`);
   process.exit(0);

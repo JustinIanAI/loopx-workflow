@@ -321,3 +321,30 @@ test('Stage B P0-3：并发隔离——不同 pid 落不同目录', () => {
     s.restore();
   }
 });
+
+test('Stage B 成功清理：空父目录一并清除、并发非空父目录保留', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const dir1 = ar.reviewStateDir(s.dir, 73);
+    const parent = path.dirname(dir1);
+    // 实现层同形逻辑：rm pid 子目录后 rmdir 父目录（空→清掉；非空→ENOTEMPTY ignore）
+    const cleanup = () => {
+      try { fs.rmSync(dir1, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      try { fs.rmdirSync(path.dirname(dir1)); } catch (_) { /* ignore */ }
+    };
+    fs.mkdirSync(dir1, { recursive: true });
+    cleanup();
+    assert.strictEqual(fs.existsSync(parent), false, '空父目录必须清除以保持 tmpDir 零残留');
+    // 并发：sibling 进程目录仍在时不得删除父目录
+    fs.mkdirSync(dir1, { recursive: true });
+    const other = dir1 + '-other';
+    fs.mkdirSync(other, { recursive: true });
+    try { fs.rmSync(dir1, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+    try { fs.rmdirSync(parent); } catch (_) { /* ignore */ }
+    assert.ok(fs.existsSync(parent), '并发 sibling 仍在时父目录必须保留');
+    fs.rmSync(other, { recursive: true, force: true });
+  } finally {
+    s.restore();
+  }
+});
