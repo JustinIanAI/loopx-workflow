@@ -1,6 +1,6 @@
 # capability-probe 实现取舍
 
-- **Status**: PROPOSED（随 PR 独立审查；本切片不自行锁 Gate 1，契约来源为已 Accepted 的 ADR-0015）
+- **Status**: APPROVED（2026-11-27 规格包补齐；Gate1 授权记录仍由人类 TTY 执行 `loopx-flow approve contract capability-probe` 写入，本行不代表授权已生效）
 - **关联**：[ADR-0015](../../../docs/adr/0015-todo-managed-execution-and-capability-probe.md) 决策 4、[ADR-0010](../../../docs/adr/0010-command-contracts-and-execution-protocol.md) 决策 4 / 12 / 13、`REQ-CAPABILITY-1`
 
 ## 取舍
