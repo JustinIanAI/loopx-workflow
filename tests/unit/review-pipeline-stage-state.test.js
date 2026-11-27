@@ -348,3 +348,54 @@ test('Stage B 成功清理：空父目录一并清除、并发非空父目录保
     s.restore();
   }
 });
+
+test('Stage B P0：跨进程续跑——新进程发现上一轮候选目录并锁定，不新建目录', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    // 第一轮：写一轮中断留下的 state（模拟进程崩溃）
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const priorDir = path.join(base, '99999-deadbeef');
+    fs.mkdirSync(priorDir, { recursive: true });
+    const promptSha = require('crypto').createHash('sha256').update('compact prompt', 'utf8').digest('hex');
+    const identityHash = require('crypto').createHash('sha256')
+      .update(`${HEAD}\ncodex\n${promptSha}\n\n`, 'utf8').digest('hex');
+    const priorOut = path.join(priorDir, 'stage1.attempt1.out.txt');
+    fs.writeFileSync(priorOut, OK_JSON, 'utf8');
+    fs.writeFileSync(path.join(priorDir, 'stage1.state.json'), JSON.stringify({
+      schema_version: 'loopx_flow_review_stage_state_v1',
+      pr: 73,
+      stage: 'stage1',
+      head_oid: HEAD,
+      prompt_sha256: promptSha,
+      agent_bin: 'codex',
+      selection_hash: identityHash,
+      status: 'failed',
+      error_class: 'ETIMEDOUT',
+      attempts_total: 3,
+      attempt: 3,
+      output_path: priorOut,
+    }), 'utf8');
+
+    // 模拟新进程：清理 memo 后直接走 runStageWithState（新 pid），应发现并复用 priorDir
+    if (ar.reviewStateDir._memo) {
+      for (const k of Object.keys(ar.reviewStateDir._memo)) delete ar.reviewStateDir._memo[k];
+    }
+    let calls = 0;
+    const r = runStageWithState(params(s, {
+      runFn: () => { calls += 1; return { stdout: OK_JSON, stderr: '', rawStdout: OK_JSON }; },
+    }));
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.resumed, undefined);
+    assert.strictEqual(calls, 1, '同身份失败轮次应带 attempts_total 重试，不得跳过模型调用');
+    const state = readStageState(s.dir, 73, 'stage1');
+    assert.strictEqual(state.status, 'ok');
+    assert.strictEqual(state.attempts_total, 4, '跨进程带 attempts 续跑（3→4）');
+    // 候选目录已被锁定为本次运行目录：父目录下只应有 priorDir 这一个含 state 的子目录
+    const subdirs = fs.readdirSync(base, { withFileTypes: true }).filter((e) => e.isDirectory());
+    assert.strictEqual(subdirs.length, 1, '新进程不得创建新 pid 子目录');
+    assert.strictEqual(subdirs[0].name, '99999-deadbeef');
+  } finally {
+    s.restore();
+  }
+});

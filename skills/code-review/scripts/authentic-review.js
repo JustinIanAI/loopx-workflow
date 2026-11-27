@@ -178,6 +178,9 @@ const HEARTBEAT_INTERVAL_MS = 15000;
 function reviewStateDir(repoRoot, pr) {
   // 并发隔离：同一 PR 的多进程必须落在不同子目录，避免 stage*.state.json 与 attempt 输出互相覆盖。
   // 同进程内两次调用视为同一运行（可接续），不同进程（不同 pid）落不同目录（隔离）。
+  // 跨进程续跑（Stage B P0）：runStageWithState 先调用 reviewStateDirForResume——
+  // 它按本 PR 的 stage 状态文件发现上一轮中断留下的候选目录并 memo 锁定到它，
+  // 新进程不再创建新子目录，避免 "pid 新目录里永远读不到旧状态"。
   const key = `${repoRoot || ''}|${pr}`;
   if (!Object.prototype.hasOwnProperty.call(reviewStateDir, '_memo')) {
     Object.defineProperty(reviewStateDir, '_memo', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
@@ -192,8 +195,46 @@ function reviewStateDir(repoRoot, pr) {
   return dir;
 }
 
-function reviewStateDirAbsolute(repoRoot) {
-  return path.join(resolveTmpDir(repoRoot), `review-pr${process.pid}`);
+function resumeMemo(repoRoot, pr) {
+  if (!Object.prototype.hasOwnProperty.call(reviewStateDir, '_memo')) {
+    Object.defineProperty(reviewStateDir, '_memo', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
+  }
+  return reviewStateDir._memo && typeof reviewStateDir._memo === 'object' ? reviewStateDir._memo : null;
+}
+
+// 跨进程发现：本 PR 父目录下，挑选包含 stage 状态文件、且按 mtime 最新的候选子目录。
+// 进程崩溃/中断时，每轮都会把 attempts_total 带_forward —— 正是依赖这个可发现的目录。
+function discoverPriorStateDir(repoRoot, pr) {
+  const base = path.join(resolveTmpDir(repoRoot), `review-pr${pr}`);
+  let entries;
+  try {
+    entries = fs.readdirSync(base, { withFileTypes: true });
+  } catch (_) { return null; }
+  let best = null;
+  let bestMtime = -1;
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    const dir = path.join(base, ent.name);
+    try {
+      const files = fs.readdirSync(dir);
+      const hasState = files.some((f) => f.endsWith('.state.json'));
+      if (!hasState) continue;
+      const m = fs.statSync(dir).mtimeMs;
+      if (m > bestMtime) { bestMtime = m; best = dir; }
+    } catch (_) { /* ignore */ }
+  }
+  return best;
+}
+
+function reviewStateDirForResume(repoRoot, pr) {
+  // 供 runStageWithState 调用的入口：优先复用跨进程发现的上一轮目录；
+  // 无则返回 null，调用方按新运行处理（创建新目录）。
+  const key = `${repoRoot || ''}|${pr}`;
+  const memo = resumeMemo(repoRoot, pr);
+  if (memo && memo[key]) return memo[key];
+  const dir = discoverPriorStateDir(repoRoot, pr);
+  if (dir && memo) memo[key] = dir;
+  return dir;
 }
 
 function stageStatePath(repoRoot, pr, stage) {
@@ -355,7 +396,10 @@ function runStageWithState(options) {
   const identityHash = crypto.createHash('sha256')
     .update(`${headOid}\n${agentBin || ''}\n${promptSha}\n${selectionCanonical.model}\n${selectionCanonical.reasoningEffort}`, 'utf8')
     .digest('hex');
-  const stateDir = reviewStateDir(repoRoot, pr);
+  // 跨进程续跑（P0）：新进程先在父目录下发现上一轮未成功轮次的候选目录并锁定，
+  // 使 readStageState 能读到它；无可续轮次才创建新的 pid 子目录。
+  const resumedFromPrior = reviewStateDirForResume(repoRoot, pr);
+  const stateDir = resumedFromPrior || reviewStateDir(repoRoot, pr);
   const prior = readStageState(repoRoot, pr, stage);
   const sameIdentity = Boolean(prior)
     && prior.head_oid === headOid
@@ -2421,6 +2465,8 @@ module.exports = {
   readStageState,
   writeStageState,
   reviewStateDir,
+  reviewStateDirForResume,
+  discoverPriorStateDir,
   pipelineLogPath,
   appendPipelineLog,
   classifyStageFailure,
