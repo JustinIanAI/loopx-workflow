@@ -48,6 +48,7 @@ function setup(opts = {}) {
     '  args="$*"',
     '  if [[ "$args" == *"reviews,author,reviewDecision,isDraft"* ]]; then cat "' + files.reviews + '"; exit 0; fi',
     '  if [[ "$args" == *"state,mergedAt,reviewDecision,headRefOid,headRefName,baseRefName"* ]]; then echo "' + state + '%%' + decision + '%' + head + '%' + headRef + '%main"; exit 0; fi',
+    '  if [[ "$args" == *"headRefOid,headRefName,isDraft"* ]]; then echo "' + head + '%' + headRef + '%' + draft + '"; exit 0; fi',
     '  if [[ "$args" == *"isDraft"* ]]; then echo "' + draft + '"; exit 0; fi',
     '  if [[ "$args" == *"headRefOid"* ]]; then echo "' + head + '"; exit 0; fi',
     '  exit 0',
@@ -55,6 +56,7 @@ function setup(opts = {}) {
     'if [[ "$1" == "pr" && "$2" == "merge" ]]; then echo "merged $*" >> "' + files.mergeLog + '"; exit 0; fi',
     'if [[ "$1" == "api" && "$2" == *"/issues/"* && "$2" == *"/comments"* ]]; then cat "' + files.comments + '"; exit 0; fi',
     'if [[ "$1" == "api" && "$2" == *"/pulls/"* && "$2" == *"/reviews"* ]]; then cat "' + files.pullReviews + '"; exit 0; fi',
+    'if [[ "$1" == "pr" && "$2" == "comment" ]]; then echo "commented" >> "' + files.mergeLog + '.comment"; exit 0; fi',
     'exit 0'
   ].join('\n');
   h.mockGh(dir, gh);

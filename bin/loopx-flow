@@ -199,7 +199,9 @@ usage() {
 
 核心场景指令:
   feature <name>          开启新特性管线，生成 specs/features/<name> 资产包与 Goal (阶段 0~4)
-  approve contract <name> 【断点 1】方案与契约审批，锁定 SHA256 契约基线并放行 TDD 编码
+  approve contract <name> [--prepare|--interactive]
+                          【断点 1】规格授权：默认校验 accepted_by 的 GitHub gate=1 评论；
+                          --prepare 打印评论模板；--interactive 走本机 TTY
   check [--with-ocr]      执行四大硬门禁与代码审查，生成并校验 LoopX change-quality 严格收据
   pr <action> [feature]   按 PR #7545 官方标准从胶囊生成 4-Part 描述并提交/预览/更新 PR (create|preview|update|ready)
   review <pr_id> [--model <id>] [--reasoning-effort <level>]
@@ -208,7 +210,9 @@ usage() {
                           未传且未设置环境变量时不附加参数。详见 review --help。
   respond <pr_id>         复用 LoopX 原生五段式格式提交针对 Review findings 的逐项闭环汇报
   merge <pr_id> [feature] 【断点 2】按 authorization_mode 核验 Mode A/B 授权与 readiness，Squash 合入并原子归档
-  release-approve <pr>    【断点 2 / Mode B】single_owner 发布授权：TTY 确认 + principal==accepted_by，写结构化 PR 评论
+  release-approve <pr> [--prepare|--interactive]
+                          【断点 2 / Mode B】默认校验 accepted_by 的 GitHub gate=2 评论；
+                          --prepare 打印评论模板；--interactive 走 TTY 并写评论
   issue <issue_id>        GitHub Issue 缺陷智能分流 (LoopX issue-fix feasibility 因果路由: fix_pr | comment_only | triage_only)
   integrate [--execute|--status]  LoopX 集成分支本地预集成 (默认 preview 不落盘)
   context <feature>       生成当前特性的长程上下文胶囊，供开发者与 AI Agent 快速穿透审阅
@@ -853,6 +857,62 @@ process.exit(1);
 ' "$executor" "$feature" "$pre_sha" <<< "$comments"
 }
 
+# ADR-0019：当前分支对应的 open PR（Gate1/Gate2 GitHub 签名路径使用）。
+# 兼容 feat/* 与 feature/* 分支名，不要求 Draft——授权事实来自评论本身，而不是 PR 展示状态。
+current_branch_pr() {
+    local branch
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+    [[ -n "$branch" && "$branch" != "HEAD" ]] || return 1
+    gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null | head -n1
+}
+
+# ADR-0019：single_owner 的 Gate1 由 accepted_by 本人在 PR 上的 gate=1 评论签发。
+# 与 independent 的唯一差别是身份条件：评论作者 == accepted_by（而非 != executor）。
+find_gate1_single_owner_comment() {
+    local feature="$1" pre_sha="$2" spec_commit="$3" accepted_by="$4" repo pr comments
+    repo="$(github_repo)" || return 1
+    [[ -n "$repo" ]] || return 1
+    pr="$(current_branch_pr)" || return 1
+    [[ -n "$pr" && "$pr" != "null" ]] || return 1
+    comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null || true)"
+    node -e '
+const fs = require("fs");
+const acceptedBy = process.argv[1], feature = process.argv[2], preSha = process.argv[3], specCommit = process.argv[4];
+const raw = fs.readFileSync(0, "utf8").trim();
+const rows = [];
+try {
+  let i = 0;
+  while (i < raw.length) {
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (i >= raw.length) break;
+    if (raw[i] !== "[") process.exit(1);
+    let depth = 0, inStr = false, esc = false, start = i;
+    for (; i < raw.length; i++) {
+      const c = raw[i];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
+      if (c === "\"") { inStr = true; continue; }
+      if (c === "[") depth++;
+      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
+    }
+    if (depth !== 0) process.exit(1);
+    rows.push(...JSON.parse(raw.slice(start, i)));
+  }
+} catch (_) { process.exit(1); }
+const marker = "<!-- loopx-flow:gate1-authorization:" + feature + "@" + preSha + " -->";
+for (const row of rows) {
+  const body = String(row.body || ""), login = String((row.user || {}).login || "");
+  if (!body.includes(marker) || !login || login !== acceptedBy) continue;
+  const fields = {};
+  for (const part of body.split(/[;\n]/)) { const i = part.indexOf("="); if (i <= 0) continue; const k = part.slice(0, i).trim(); if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim(); }
+  if (fields.gate === "1" && fields.mode === "single_owner" && fields.contract_sha === preSha && fields.spec_commit === specCommit && fields.approver === acceptedBy) {
+    process.stdout.write(login);
+    process.exit(0);
+  }
+}
+process.exit(1);
+' "$accepted_by" "$feature" "$pre_sha" "$spec_commit" <<< "$comments"
+}
+
 gate1_user_gate_evidence() {
     # 返回码约定：0=取到 evidence；1=载荷可读但没有匹配的 user_gate approve 记录；
     # 2=载荷不可读（命令失败或 schema_version 漂移）。调用方据此给出不同诊断。
@@ -1142,9 +1202,13 @@ branch_protection_ok() {
 }
 
 cmd_approve() {
-    local target="${1:-}" feature="${2:-}" yes=false arg
+    local target="${1:-}" feature="${2:-}" yes=false prepare=false interactive=false arg
     for arg in "$@"; do
-        if [[ "$arg" == "--yes" ]]; then yes=true; fi
+        case "$arg" in
+            --yes) yes=true ;;
+            --prepare) prepare=true ;;
+            --interactive) interactive=true ;;
+        esac
     done
     if [[ "$target" != "contract" ]]; then
         echo "[-] 错误: 目前仅支持 approve contract，例如: loopx-flow approve contract user-auth" >&2
@@ -1198,25 +1262,67 @@ fs.writeFileSync(dst, text);
     local contract_sha
     contract_sha="$(sha256_file "$temp_contract")"
 
+    # spec_commit 只作追溯（不参与 gate verify）；生产路径必须工作区干净。
+    local dirty
+    dirty="$(git status --porcelain --untracked-files=no 2>/dev/null || true)"
+    if [[ -n "$dirty" ]]; then
+        rm -f "$temp_contract"
+        echo "[-] [FAIL-CLOSED] 工作区不干净，Spec-Commit 无法确定；请先提交" >&2
+        exit 1
+    fi
+    spec_commit="$(git rev-parse HEAD)"
+
+    # ADR-0019：--prepare 只打印 GitHub 签名评论模板，零写入。
+    if [[ "$prepare" == "true" ]]; then
+        local prepared_by
+        prepared_by="$(auth_accepted_by)"
+        rm -f "$temp_contract"
+        wf_unregister_temp_file "$temp_contract"
+        echo "[i] Gate1 准备完成（未写入任何批准标记）"
+        echo "    feature      : $feature"
+        echo "    contract_sha : $contract_sha"
+        echo "    spec_commit  : $spec_commit"
+        echo "    approver     : $prepared_by"
+        echo ""
+        echo "请在 PR 上以 $prepared_by 身份粘贴以下评论，然后重跑 loopx-flow approve contract ${feature}："
+        echo ""
+        echo "<!-- loopx-flow:gate1-authorization:$feature@$contract_sha -->"
+        echo "gate=1;mode=single_owner;contract_sha=$contract_sha;spec_commit=$spec_commit;approver=$prepared_by"
+        exit 0
+    fi
+
     if [[ "$mode" == "single_owner" ]]; then
-        [[ "$yes" != "true" ]] || { echo "[-] [FAIL-CLOSED] 不支持 --yes：single_owner approve 必须真实 TTY 交互确认" >&2; exit 1; }
-        [[ -t 0 ]] || { echo "[-] [FAIL-CLOSED] single_owner approve 必须 TTY 交互确认" >&2; exit 1; }
-        command -v gh >/dev/null 2>&1 || { echo "[-] [FAIL-CLOSED] single_owner approve 需要 gh 读取 login" >&2; exit 1; }
-        executor="$(gh_login)"
-        [[ -n "$executor" ]] || { echo "[-] [FAIL-CLOSED] 无法读取 gh api user login" >&2; exit 1; }
+        [[ "$yes" != "true" ]] || { echo "[-] [FAIL-CLOSED] 不支持 --yes：授权必须来自 accepted_by 的 GitHub 评论或 --interactive TTY" >&2; exit 1; }
+        command -v gh >/dev/null 2>&1 || { echo "[-] [FAIL-CLOSED] single_owner approve 需要 gh" >&2; exit 1; }
         local accepted_by
         accepted_by="$(auth_accepted_by)"
-        [[ "$executor" == "$accepted_by" ]] || { echo "[-] [FAIL-CLOSED] 当前 gh login ($executor) 与 accepted_by ($accepted_by) 不一致" >&2; exit 1; }
-        principal="$executor"
-        local confirm_reply=""
-        printf '确认以 single_owner (%s) 签署 Gate1 契约授权 [%s]? 请输入 yes 继续: ' "$principal" "$feature"
-        if ! IFS= read -r confirm_reply; then
-            echo "[-] [FAIL-CLOSED] 未收到交互确认输入，已取消。" >&2
-            exit 1
-        fi
-        if [[ "$confirm_reply" != "yes" && "$confirm_reply" != "y" && "$confirm_reply" != "YES" ]]; then
-            echo "[-] [FAIL-CLOSED] Gate1 授权已取消（需输入 yes 确认）。" >&2
-            exit 1
+        if [[ "$interactive" == "true" ]]; then
+            [[ -t 0 ]] || { rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] --interactive 需要 TTY 交互确认" >&2; exit 1; }
+            executor="$(gh_login)"
+            [[ -n "$executor" ]] || { rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] 无法读取 gh api user login" >&2; exit 1; }
+            [[ "$executor" == "$accepted_by" ]] || { rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] 当前 gh login ($executor) 与 accepted_by ($accepted_by) 不一致" >&2; exit 1; }
+            principal="$executor"
+            local confirm_reply=""
+            printf '确认以 single_owner (%s) 签署 Gate1 契约授权 [%s]? 请输入 yes 继续: ' "$principal" "$feature"
+            if ! IFS= read -r confirm_reply; then
+                rm -f "$temp_contract"
+                echo "[-] [FAIL-CLOSED] 未收到交互确认输入，已取消。" >&2
+                exit 1
+            fi
+            if [[ "$confirm_reply" != "yes" && "$confirm_reply" != "y" && "$confirm_reply" != "YES" ]]; then
+                rm -f "$temp_contract"
+                echo "[-] [FAIL-CLOSED] Gate1 授权已取消（需输入 yes 确认）。" >&2
+                exit 1
+            fi
+        else
+            principal="$(find_gate1_single_owner_comment "$feature" "$contract_sha" "$spec_commit" "$accepted_by" || true)"
+            if [[ -z "$principal" ]]; then
+                rm -f "$temp_contract"
+                echo "[-] [FAIL-CLOSED] 未找到 single_owner 的 GitHub gate=1 授权评论：作者必须是 accepted_by=${accepted_by}，且 contract_sha/spec_commit 与当前一致。" >&2
+                echo "🧭 下一步: 运行 loopx-flow approve contract $feature --prepare，把输出评论粘贴到 PR，然后重跑本命令。" >&2
+                echo "🧭 如确实要走本机 TTY 确认：追加 --interactive。" >&2
+                exit 1
+            fi
         fi
     else
         command -v gh >/dev/null 2>&1 || { echo "[-] [FAIL-CLOSED] independent approve 需要 gh" >&2; exit 1; }
@@ -1225,12 +1331,6 @@ fs.writeFileSync(dst, text);
         principal="$(find_gate1_independent_comment "$feature" "$contract_sha" "$executor" || true)"
         [[ -n "$principal" ]] || { echo "[-] [FAIL-CLOSED] independent 缺少有效的第二 GitHub 账号 gate=1 评论（评论 contract_sha 必须等于最终锁定字节的 SHA）" >&2; exit 1; }
     fi
-
-    # spec_commit 只作追溯（不参与 gate verify）；生产路径必须工作区干净。
-    local dirty
-    dirty="$(git status --porcelain --untracked-files=no 2>/dev/null || true)"
-    [[ -z "$dirty" ]] || { echo "[-] [FAIL-CLOSED] 工作区不干净，Spec-Commit 无法确定；请先提交" >&2; exit 1; }
-    spec_commit="$(git rev-parse HEAD)"
 
     local timestamp operator
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -1886,9 +1986,15 @@ HELPTXT
 }
 
 cmd_release_approve() {
-    local pr_id="${1:-}" yes="false" arg
+    local pr_id="${1:-}" yes="false" prepare="false" interactive="false" arg
     shift || true
-    for arg in "$@"; do [[ "$arg" == "--yes" ]] && yes="true"; done
+    for arg in "$@"; do
+        case "$arg" in
+            --yes) yes="true" ;;
+            --prepare) prepare="true" ;;
+            --interactive) interactive="true" ;;
+        esac
+    done
     if [[ -z "$pr_id" ]]; then
         echo "[-] 错误: 请指定 PR 编号，例如: loopx-flow release-approve 12" >&2
         exit 1
@@ -1898,23 +2004,13 @@ cmd_release_approve() {
     local mode
     mode="$(auth_mode)"
     [[ "$mode" == "single_owner" ]] || { echo "[-] [FAIL-CLOSED] release-approve 只用于 single_owner" >&2; exit 1; }
-    [[ "$yes" != "true" ]] || { echo "[-] [FAIL-CLOSED] 不支持 --yes：release-approve 必须真实 TTY 交互确认" >&2; exit 1; }
+    [[ "$yes" != "true" ]] || { echo "[-] [FAIL-CLOSED] 不支持 --yes：授权必须来自 accepted_by 的 GitHub 评论或 --interactive TTY" >&2; exit 1; }
+
     local principal accepted_by
     principal="$(gh_login)"
     accepted_by="$(auth_accepted_by)"
     [[ -n "$principal" ]] || { echo "[-] [FAIL-CLOSED] 无法读取 gh api user login" >&2; exit 1; }
-    [[ "$principal" == "$accepted_by" ]] || { echo "[-] [FAIL-CLOSED] principal ($principal) != accepted_by ($accepted_by)" >&2; exit 1; }
-    [[ -t 0 ]] || { echo "[-] [FAIL-CLOSED] release-approve 必须 TTY 交互确认" >&2; exit 1; }
-    local confirm_reply=""
-    printf '确认以 single_owner (%s) 签发 Gate2 发布授权 PR #%s? 请输入 yes 继续: ' "$principal" "$pr_id"
-    if ! IFS= read -r confirm_reply; then
-        echo "[-] [FAIL-CLOSED] 未收到交互确认输入，已取消。" >&2
-        exit 1
-    fi
-    if [[ "$confirm_reply" != "yes" && "$confirm_reply" != "y" && "$confirm_reply" != "YES" ]]; then
-        echo "[-] [FAIL-CLOSED] Gate2 发布授权已取消（需输入 yes 确认）。" >&2
-        exit 1
-    fi
+    [[ -n "$accepted_by" ]] || { echo "[-] [FAIL-CLOSED] 缺少 single_owner risk acceptance" >&2; exit 1; }
 
     local pr_view head_oid head_ref is_draft
     pr_view="$(gh pr view "$pr_id" --json headRefOid,headRefName,isDraft --jq '[.headRefOid, .headRefName, ((.isDraft // false) | tostring)] | join("%")' 2>/dev/null || true)"
@@ -1928,6 +2024,48 @@ cmd_release_approve() {
         contract_sha="$(contract_sha_for "$feature" || true)"
         [[ -n "$contract_sha" ]] || { echo "[-] [FAIL-CLOSED] 缺少 feature $feature 的 04-contract.md" >&2; exit 1; }
     fi
+
+    # ADR-0019：--prepare 只打印 GitHub 签名评论模板，零写入。
+    if [[ "$prepare" == "true" ]]; then
+        echo "[i] Gate2 准备完成（未写入任何授权评论）"
+        echo "    pr           : #$pr_id"
+        echo "    head         : $head_oid"
+        echo "    contract_sha : $contract_sha"
+        echo "    principal    : $accepted_by"
+        echo ""
+        echo "请在 PR #${pr_id} 上以 ${accepted_by} 身份粘贴以下评论，然后重跑 loopx-flow merge ${pr_id}："
+        echo ""
+        echo "<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->"
+        echo "gate=2;mode=single_owner;head=$head_oid;contract_sha=$contract_sha;principal=$accepted_by;risk_acceptance=$(auth_accepted_by)@$(auth_accepted_at)"
+        exit 0
+    fi
+
+    # GitHub 签名路径：已存在合法 gate=2 评论即视为授权完成（不重复写）。
+    if release_authorization_ok "$pr_id" "$head_oid" "$contract_sha"; then
+        echo "[✓] 已检测到 Gate2 GitHub 授权评论（author=${accepted_by}, head=${head_oid}）"
+        exit 0
+    fi
+
+    if [[ "$interactive" != "true" ]]; then
+        echo "[-] [FAIL-CLOSED] 未找到 accepted_by=$accepted_by 的 Gate2 GitHub 授权评论（head 与 contract_sha 必须与当前一致）。" >&2
+        echo "🧭 下一步: 运行 loopx-flow release-approve $pr_id --prepare，把输出评论粘贴到 PR，然后重跑 loopx-flow merge ${pr_id}。" >&2
+        echo "🧭 如确实要走本机 TTY 确认：追加 --interactive。" >&2
+        exit 1
+    fi
+
+    [[ "$principal" == "$accepted_by" ]] || { echo "[-] [FAIL-CLOSED] principal ($principal) != accepted_by ($accepted_by)" >&2; exit 1; }
+    [[ -t 0 ]] || { echo "[-] [FAIL-CLOSED] --interactive 需要 TTY 交互确认" >&2; exit 1; }
+    local confirm_reply=""
+    printf '确认以 single_owner (%s) 签发 Gate2 发布授权 PR #%s? 请输入 yes 继续: ' "$principal" "$pr_id"
+    if ! IFS= read -r confirm_reply; then
+        echo "[-] [FAIL-CLOSED] 未收到交互确认输入，已取消。" >&2
+        exit 1
+    fi
+    if [[ "$confirm_reply" != "yes" && "$confirm_reply" != "y" && "$confirm_reply" != "YES" ]]; then
+        echo "[-] [FAIL-CLOSED] Gate2 发布授权已取消（需输入 yes 确认）。" >&2
+        exit 1
+    fi
+
     local timestamp
     timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     local body
