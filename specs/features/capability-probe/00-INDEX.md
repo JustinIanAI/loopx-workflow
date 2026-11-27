@@ -14,15 +14,15 @@
 | `01-decisions.md` | 本胶囊实现取舍 | APPROVED |
 | `02-prd.md` | 切片验收与第 2 层覆盖边界 | 完成 |
 | `03-stories.md` | 故事拆分与依赖顺序 | 完成 |
-| `04-contract.md` | 冻结签名 + AC 矩阵 + Scope + Verification Plan | DRAFT（待 Gate1） |
-| `05-evidence.md` | 四门禁与质量凭据 | 本地证据已记录；LoopX 收据 deferred |
+| `04-contract.md` | 冻结签名 + AC 矩阵 + Scope + Verification Plan | FROZEN & APPROVED（SHA `60bf4909…`） |
+| `05-evidence.md` | 四门禁与质量凭据 | ingest 生成 · `PASSING (Strict Mode Verified)` |
 
 ## 门禁状态
 
 | 门禁 | 状态 | 下一步 |
 |---|---|---|
-| Four Gates | 本地实测全绿（见 `05-evidence.md`） | 复审时在 head 上重跑 |
-| Gate1 Specification Authorization | **待人类 TTY 确认** | `./bin/loopx-flow approve contract capability-probe` |
+| Four Gates | ✅ 344/344 + 严格收据 `ok=true` | 复审时在 head 上重跑 |
+| Gate1 Specification Authorization | ✅ 已完成（JustinIanAI@2026-11-27 16:54:50） | 授权记录已写入 `user_gate` |
 | Gate2 Delivery Authorization | 待人类批准 | Mode A：非作者 Approve；Mode B：Owner `release-approve` |
 
 ## 审阅入口

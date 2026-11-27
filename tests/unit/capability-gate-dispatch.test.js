@@ -146,9 +146,13 @@ test('P0: 成功门 stdout 不含矩阵（require_success_is_quiet）', () => {
     h.writeCapsule(dir, 'gate-success');
     h.writeConfig(dir, 'independent');
     writeLoopxMock(dir, { body: 'exit 0' });
-    // 直接调用 shell 函数 require_loopx_capabilities，验证成功时 stdout 为空且退出 0。
+    // 无参调用只打印用法（不触发门），作为基线。
     const r = h.run(dir, []);
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    // 真实 dispatch 路径（review #73 P2）：issue 通过能力门后进入业务函数；
+    // 若 require_loopx_capabilities 回归成输出矩阵，这里会立刻捕获 stdout 污染。
+    const dispatched = h.run(dir, ['issue', '1']);
+    assert.doesNotMatch(dispatched.stdout, /能力\s+探测信号/, 'dispatch 成功门不得向 stdout 输出矩阵');
     // 实现层回归：直接校验 lib 的 require 路径生成结果——成功时走 quiet 不输出矩阵。
     const { spawnSync } = require('node:child_process');
     const probe = spawnSync('node', [path.join(dir, 'lib/capability-probe.js'), 'require', '--scope', 'todo', '--format', 'quiet'], {
