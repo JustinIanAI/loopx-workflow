@@ -85,9 +85,10 @@ probe_loopx_capabilities() {
 
 # L0 命令的 Fail-Closed 能力门：BLOCK 能力缺失或探测 UNKNOWN → 非 0 阻断并输出升级差异诊断卡。
 # 用法: require_loopx_capabilities <issue|integrate|todo|check|merge|review|...>
+# 成功路径只验能力、不污染 stdout（`--format quiet` 抑制成功矩阵，防脚本管道受污染）；失败时诊断卡经 stderr 呈现。
 require_loopx_capabilities() {
     local scope="${1:-doctor}"
-    node "$CAPABILITY_PROBE_LIB" require --scope "$scope"
+    node "$CAPABILITY_PROBE_LIB" require --scope "$scope" --format quiet
 }
 
 # 第 2 层：消费任何 LoopX --format json 载荷前校验 schema_version 白名单。

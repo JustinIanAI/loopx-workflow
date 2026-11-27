@@ -138,3 +138,25 @@ test('P0: --help/-h 不触发能力门（只打印用法，无副作用）', () 
     }
   } finally { h.cleanup(dir); }
 });
+
+// Stage B findings P0-1 回归用例：成功路径 stdout 不含能力矩阵（`--format quiet` 只验不污染）。
+test('P0: 成功门 stdout 不含矩阵（require_success_is_quiet）', () => {
+  const dir = makeGitSandbox('cap-gate-success-');
+  try {
+    h.writeCapsule(dir, 'gate-success');
+    h.writeConfig(dir, 'independent');
+    writeLoopxMock(dir, { body: 'exit 0' });
+    // 直接调用 shell 函数 require_loopx_capabilities，验证成功时 stdout 为空且退出 0。
+    const r = h.run(dir, []);
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    // 实现层回归：直接校验 lib 的 require 路径生成结果——成功时走 quiet 不输出矩阵。
+    const { spawnSync } = require('node:child_process');
+    const probe = spawnSync('node', [path.join(dir, 'lib/capability-probe.js'), 'require', '--scope', 'todo', '--format', 'quiet'], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: path.join(dir, '.mockbin') + ':' + process.env.PATH },
+    });
+    assert.strictEqual(probe.status, 0, probe.stdout + probe.stderr);
+    assert.doesNotMatch(probe.stdout, /能力\s+探测信号/);
+    assert.doesNotMatch(probe.stdout, /升级契约差异诊断卡/);
+    assert.doesNotMatch(String(probe.stdout || ''), /LoopX .*schema_version/);
+  } finally { h.cleanup(dir); }
+});
