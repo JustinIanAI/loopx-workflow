@@ -67,6 +67,13 @@ function writePromptArtifact(runDir, pr, headOid, prompt, stage = 'stage1') {
 }
 
 const TIMEOUT_MS = 600000;
+const MAX_TIMEOUT_MS = Number(process.env.REVIEW_TIMEOUT_MS_MAX || 7200000);
+const BUDGET_MS = Number(process.env.REVIEW_TIMEOUT_MS || TIMEOUT_MS);
+const _budgetValid = Number.isFinite(BUDGET_MS) && BUDGET_MS > 0 && BUDGET_MS <= MAX_TIMEOUT_MS;
+if (!_budgetValid) {
+  console.error(`[-] [FAIL-CLOSED] REVIEW_TIMEOUT_MS 必须是 >0 且 <= ${MAX_TIMEOUT_MS} 毫秒的有限整数（当前值: ${process.env.REVIEW_TIMEOUT_MS}）。`);
+  process.exit(1);
+}
 const REVIEW_CACHE_SCHEMA_V1 = 'loopx_flow_review_cache_v1';
 let _legacyCacheNoticePrinted = false;
 
@@ -324,7 +331,7 @@ function runStageWithState(options) {
   // runFn 仅作为单测注入点（默认就是真实的 runReviewAgent），生产调用方不传。
   const execStage = typeof runFn === 'function' ? runFn : runReviewAgent;
   const promptSha = crypto.createHash('sha256').update(String(prompt || ''), 'utf8').digest('hex');
-  const budgetMs = timeoutMs || TIMEOUT_MS;
+  const budgetMs = timeoutMs || BUDGET_MS;
   const stateDir = reviewStateDir(repoRoot, pr);
   const prior = readStageState(repoRoot, pr, stage);
   const sameIdentity = Boolean(prior)
@@ -1487,7 +1494,7 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, selection
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: 64 * 1024 * 1024,
-      timeout: timeoutMs || TIMEOUT_MS,
+      timeout: timeoutMs || BUDGET_MS,
     });
     const rawStdout = r.stdout || '';
     const msgOut = (tmpMsg && fs.existsSync(tmpMsg)) ? fs.readFileSync(tmpMsg, 'utf8') : '';
@@ -1516,7 +1523,7 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, selection
         signal: r.signal || null,
         error_code: errorCode,
         timed_out: timedOut,
-        timeout_ms: timeoutMs || TIMEOUT_MS,
+        timeout_ms: timeoutMs || BUDGET_MS,
         tmp_msg: tmpMsg || null,
       };
     }
@@ -2362,6 +2369,9 @@ module.exports = {
   formatEvidenceRequirementsForPrompt,
   capVerdictInBody,
   runReviewAgent,
+  TIMEOUT_MS,
+  MAX_TIMEOUT_MS,
+  BUDGET_MS,
   reviewAgentArgs,
   materializeReviewSandbox,
   formatArtifactManifest,

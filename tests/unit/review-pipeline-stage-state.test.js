@@ -254,9 +254,30 @@ test('失败归类与超时诊断', () => {
   assert.strictEqual(formatStageError({ error: 'exit 1: boom' }, 600000, 1, 3), 'exit 1: boom');
 });
 
-test('红线守卫：超时预算未被放宽（TIMEOUT_MS 仍 600000，且无 override 开关）', () => {
+test('R2 REVIEW_TIMEOUT_MS 默认 600000，上限 7200000，可调预算直达 spawnSync', () => {
+  const ar = require(SRC);
+  assert.strictEqual(ar.TIMEOUT_MS, 600000);
+  assert.strictEqual(ar.MAX_TIMEOUT_MS, 7200000);
+  assert.strictEqual(ar.BUDGET_MS, ar.TIMEOUT_MS, 'REVIEW_TIMEOUT_MS 未设置时预算即默认 600000');
+});
+
+test('R2 子进程校验：预算非法 Fail-Closed 超限 Fail-Closed，超限且无上浮 MAX 不放行', () => {
+  const { spawnSync } = require('node:child_process');
+  const run = (env) => spawnSync(process.execPath, ['-e',
+    'require(process.argv[1])',
+    SRC], { env: { ...process.env, ...env }, encoding: 'utf8' });
+  const bad = run({ REVIEW_TIMEOUT_MS: '0' });
+  assert.notStrictEqual(bad.status, 0);
+  assert.match(String(bad.stderr || ''), /FAIL-CLOSED.*REVIEW_TIMEOUT_MS/);
+  const over = run({ REVIEW_TIMEOUT_MS: String(7200001) });
+  assert.notStrictEqual(over.status, 0);
+  assert.match(String(over.stderr || ''), /FAIL-CLOSED.*REVIEW_TIMEOUT_MS/);
+  const big = run({ REVIEW_TIMEOUT_MS: '3600000', REVIEW_TIMEOUT_MS_MAX: '3600000' });
+  assert.strictEqual(big.status, 0, big.stderr);
+});
+
+test('红线守卫：默认预算未被放宽（TIMEOUT_MS 仍 600000）', () => {
   const src = fs.readFileSync(SRC, 'utf8');
   assert.match(src, /const TIMEOUT_MS = 600000;/);
-  assert.doesNotMatch(src, /REVIEW_TIMEOUT_MS_OVERRIDE/);
   assert.strictEqual(MAX_STAGE_ATTEMPTS, 3);
 });
