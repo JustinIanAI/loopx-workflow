@@ -144,9 +144,10 @@ function gate1Evidence({ mode = 'single_owner', sha, spec = 'b'.repeat(40), feat
 
 // independent Gate1 的 gh 替身：返回执行者 login + 一条有效 gate=1 评论（可关闭）
 function ghGate1Mock(dir, { feature, sha, approver = 'approver1', login = 'executor', includeComment = true } = {}) {
+  const specCommit = execSync('git rev-parse HEAD', { cwd: dir, encoding: 'utf8' }).trim();
   const comments = includeComment ? [{
     body: '<!-- loopx-flow:gate1-authorization:' + feature + '@' + sha + ' -->\n' +
-      'gate=1;mode=independent;contract_sha=' + sha + ';spec_commit=' + 'b'.repeat(40) + ';approver=' + approver,
+      'gate=1;mode=independent;contract_sha=' + sha + ';spec_commit=' + specCommit + ';approver=' + approver,
     user: { login: approver }
   }] : [];
   const commentsFile = path.join(dir, 'comments.json');
