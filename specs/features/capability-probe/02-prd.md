@@ -39,4 +39,4 @@
 - [x] 未知 / 缺失 `schema_version` → 非 0 + 诊断卡。
 - [x] 非关键能力（`issue-fix` / `integration-branch` 在 `doctor` 视角、`goal-acceptance`）→ WARN 披露降级，不阻断。
 - [x] 版本漂移但签名与白名单兼容 → 软提示，不阻断。
-- [ ] Four Gates 全绿（见 PR 验证矩阵；`npm run typecheck` / `lint` / `build` / `test`）。
+- [x] Four Gates 全绿（2026-11-27 本地实测：`npm run typecheck` / `lint` / `build` / `test` 全部退出 0，330 用例通过）。
