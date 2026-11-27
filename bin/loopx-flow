@@ -3544,6 +3544,18 @@ if [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
                 exit 1
             fi
             ;;
+        check)
+            if [[ -z "${1:-}" ]]; then
+                echo -e "${RED}[-] 错误: 请指定 Goal ID，例如: loopx-flow check --goal-id G123${NC}" >&2
+                exit 1
+            fi
+            ;;
+        pr)
+            if [[ -z "${1:-}" ]]; then
+                echo -e "${RED}[-] 错误: 请指定 PR 创建参数，例如: loopx-flow pr <feature>${NC}" >&2
+                exit 1
+            fi
+            ;;
     esac
 fi
 
@@ -3554,7 +3566,7 @@ fi
 if cap_scope="$(dispatch_capability_scope "$ACTION")"; then
     if [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
         require_loopx_capabilities "$cap_scope" || {
-            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 能力探针未通过（scope=$cap_scope），$ACTION 命令在第一个不可逆动作之前已阻断。${NC}" >&2
+            echo -e "${RED}[-] [FAIL-CLOSED] LoopX 能力探针未通过（scope=${cap_scope}），$ACTION 命令在第一个不可逆动作之前已阻断。${NC}" >&2
             exit 1
         }
     fi
