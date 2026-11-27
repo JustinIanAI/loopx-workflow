@@ -5,7 +5,7 @@
 
 - **日期**：2026-11-27
 - **基线**：`origin/main@491440c`（PR #80 合并后）
-- **记录 head**：本 PR 当前 head（见 PR 页面；规格补齐提交之后）
+- **记录 head**：代码 head `1476960`（规格补齐 + 合并 `main@491440c` 之后）；本文件随后的文档回填不改变代码与用例数
 
 ## 四大硬门禁
 
@@ -14,7 +14,7 @@
 | Typecheck | `npm run typecheck` | passed | `tsc --noEmit` 退出 0 |
 | Lint | `npm run lint` | passed | 5/5 静态核验 PASS |
 | Build | `npm run build` | passed | 退出 0 |
-| Test | `npm run test` | passed | **330 / 330**，0 fail |
+| Test | `npm run test` | passed | **344 / 344**，0 fail（合并 #80 后新增 14 个审查管线用例） |
 
 ## 专项证据
 
