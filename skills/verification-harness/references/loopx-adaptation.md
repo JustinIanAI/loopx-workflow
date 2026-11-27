@@ -45,6 +45,8 @@ Before requesting Gate 1 (`loopx-flow approve contract <feature>`):
 ### Stage 7 — Maintenance & Review Audit (`Triage`)
 During independent review or periodic harness upkeep, classify every observed discrepancy into three strict categories:
 
+> Automated scope note: the `prove-cli-surface.js` runner only auto-populates `triage.harness_gap` (from `verified_unreachable` steps). `Doc Drift` and `Product Bug` are human-reviewed classification slots — when either is hit mid-pass, the runner's assertion throws and Prove fails closed (exit `1`) without emitting a Proof.
+
 | Triage Category | Definition | Allowed Action & Edit Scope | LoopX Status / Gate Impact |
 |---|---|---|---|
 | **`Doc Drift`** | Product CLI behaves intentionally per PRD/ADR, but `SKILL.md` or `features/*.md` has stale flags, paths, or missing preconditions. | Edit `skills/verification-harness/` markdown files only; re-run live Prove to confirm `clean`/`changed`. | Non-blocking once map is updated and re-proved. |

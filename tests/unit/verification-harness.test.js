@@ -82,6 +82,18 @@ function git(root, args) {
   return res.stdout.trim();
 }
 
+// Workspace-decoupling guard (P5): Prove fail-closes (exit 2) on any dirty file
+// OUTSIDE the proof artifacts dir. End-to-end tests that drive Prove against
+// PROJECT_ROOT therefore skip with an explicit hint when such local drafts
+// exist, so a dev machine with drafts can still run the full suite (CI runs on
+// a clean tree and exercises every test). A dirty file INSIDE the proof dir
+// does NOT trigger this guard: Prove's own dirty check excludes that dir (F3).
+function outsideProofDirtyCount() {
+  const status = spawnSync('git', ['-C', PROJECT_ROOT, 'status', '--porcelain', '--untracked-files=all', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`], { encoding: 'utf8' });
+  if (status.status !== 0) return -1;
+  return status.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean).length;
+}
+
 // Copy the harness source into a disposable Git repo so dirty-workspace
 // fail-closed behavior can be driven black-box without dirtying PROJECT_ROOT.
 function prepareSourceCopy(scratchRoot) {
@@ -246,6 +258,12 @@ test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and h
   const expectedFingerprint = PROVE_MODULE.sourceDiffFingerprint(PROJECT_ROOT, diffBaseInfo.base);
   assert.ok(expectedFingerprint, 'sourceDiffFingerprint must resolve on a clean committed repo');
   assert.strictEqual(proof.diff_fingerprint, expectedFingerprint, 'diff_fingerprint must bind the exact source-scope diff (proof artifacts excluded)');
+  assert.ok(
+    isHex64(proof.source_base) || proof.source_base === '<empty-tree>',
+    'source_base must bind the resolved diff base (merge-base SHA or empty-tree placeholder)'
+  );
+  const expectedSourceBase = diffBaseInfo.kind === 'origin' ? diffBaseInfo.base : '<empty-tree>';
+  assert.strictEqual(proof.source_base, expectedSourceBase, 'source_base must equal the resolved diff base (merge-base origin/main HEAD)');
   assert.ok(isHex64(proof.contract_revision), 'contract_revision must bind 04-contract.md SHA-256');
   const unreachableSteps = proof.steps.filter((step) => step.status === 'verified_unreachable');
   const expectedOverall = unreachableSteps.length === 0 ? 'passed' : 'partial';
@@ -313,7 +331,17 @@ test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and h
   assert.strictEqual(fileDigestOrNull(hostRegistryPath), beforeHostRegistry, 'Host ~/.loopx/registry.global.json must not be mutated');
 });
 
-test('4. Negative fail-closed: missing --output-dir, unknown flags, and sandbox-internal --output-dir all exit non-zero', () => {
+test('4. Negative fail-closed: missing --output-dir, unknown flags, and sandbox-internal --output-dir all exit non-zero', (t) => {
+  // P5 workspace decoupling: same guard as tests 3/5/7/8 — Prove exits 2 on any
+  // dirty file OUTSIDE the proof dir before it can reach the sandbox-internal
+  // output-dir check, so skip with an explicit hint instead of spuriously
+  // reddening. A dirty file INSIDE the proof dir does not trigger this skip.
+  const outsideDirty = outsideProofDirtyCount();
+  if (outsideDirty > 0) {
+    t.skip(`negative fail-closed Prove skipped: ${outsideDirty} dirty file(s) OUTSIDE the proof dir (local drafts); run on a clean tree (CI)`);
+    return;
+  }
+
   const scratchRoot = makeScratch('vh-prove-neg-');
 
   const missing = spawnSync(process.execPath, [PROVE_SCRIPT], {
@@ -356,7 +384,16 @@ test('4. Negative fail-closed: missing --output-dir, unknown flags, and sandbox-
   assert.deepStrictEqual(fs.readdirSync(scratchRoot), [], 'Failed argument check must leave zero temp directories');
 });
 
-test('5. Missing loopx 2.3.x can never report overall_status=passed (harness gap is recorded)', () => {
+test('5. Missing loopx 2.3.x can never report overall_status=passed (harness gap is recorded)', (t) => {
+  // P5 workspace decoupling: Prove exits 2 on a dirty file OUTSIDE the proof dir
+  // before it can drive the missing-loopx scenario, so skip with an explicit
+  // hint. A dirty file INSIDE the proof dir does not trigger this skip.
+  const outsideDirty = outsideProofDirtyCount();
+  if (outsideDirty > 0) {
+    t.skip(`missing-loopx Prove skipped: ${outsideDirty} dirty file(s) OUTSIDE the proof dir (local drafts); run on a clean tree (CI)`);
+    return;
+  }
+
   const scratchRoot = makeScratch('vh-prove-noloopx-');
   const proofOutDir = path.join(scratchRoot, 'proof-artifacts');
 
@@ -462,11 +499,25 @@ test('7. Freshness guard: committed Proof binds to the exact source-scope head &
   assert.strictEqual(diffRes.status, 0, 'independent git diff must succeed');
   const fingerprint = crypto.createHash('sha256').update(diffRes.stdout, 'utf8').digest('hex');
 
+  const contractPath = path.join(PROJECT_ROOT, 'specs/features/verification-harness/04-contract.md');
+  const contractRevision = crypto.createHash('sha256').update(fs.readFileSync(contractPath)).digest('hex');
+
   assert.strictEqual(committed.source_head, scopeHead, 'committed Proof source_head is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
+  assert.strictEqual(committed.source_base, base, 'committed Proof source_base is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
   assert.strictEqual(committed.diff_fingerprint, fingerprint, 'committed Proof diff_fingerprint is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
+  assert.strictEqual(committed.contract_revision, contractRevision, 'committed Proof contract_revision is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
 });
 
-test('8. Installed-but-unsupported loopx version reports verified_unreachable (never "not installed")', () => {
+test('8. Installed-but-unsupported loopx version reports verified_unreachable (never "not installed")', (t) => {
+  // P5 workspace decoupling: Prove exits 2 on a dirty file OUTSIDE the proof dir
+  // before it can drive the unsupported-version scenario, so skip with an
+  // explicit hint. A dirty file INSIDE the proof dir does not trigger this skip.
+  const outsideDirty = outsideProofDirtyCount();
+  if (outsideDirty > 0) {
+    t.skip(`unsupported-loopx Prove skipped: ${outsideDirty} dirty file(s) OUTSIDE the proof dir (local drafts); run on a clean tree (CI)`);
+    return;
+  }
+
   const scratchRoot = makeScratch('vh-prove-unsup-');
   const proofOutDir = path.join(scratchRoot, 'proof-artifacts');
   const fakeLoopx = path.join(scratchRoot, 'loopx-2.4');

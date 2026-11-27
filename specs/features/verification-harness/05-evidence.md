@@ -1,6 +1,6 @@
 # Stage A Verification & Proof Summary: verification-harness
 
-> **Note (`ADR-0011` Boundary Disclosure)**: `loopx-flow check` / `ingest-to-loopx-quality.js` was **attempted** at the final Stage A-R3 head and failed closed (exit `1`) before any receipt could be produced — this isolated checkout has no bootstrapped `verification-harness-goal` registry, and Gate 1 (`04-contract.md`) is still `DRAFT (Pending Approval)`. Per `ADR-0011`, this file records the actual command, exit code, and stderr verbatim below, and does **not** fabricate a `change_quality_receipt_v2` signature.
+> **Note (`ADR-0011` Boundary Disclosure)**: `loopx-flow check` / `ingest-to-loopx-quality.js` was **attempted** at this PR's final source-scope head and failed closed (exit `1`) before any receipt could be produced — this isolated checkout has no bootstrapped `verification-harness-goal` registry, and Gate 1 (`04-contract.md`) is still `DRAFT (Pending Approval)`. Per `ADR-0011`, this file records the actual command, exit code, and stderr verbatim below, and does **not** fabricate a `change_quality_receipt_v2` signature.
 
 - **Goal ID**: `verification-harness-goal`
 - **Feature**: `verification-harness` (`#43` / `TRE-91`)
@@ -8,7 +8,7 @@
 - **Cold-Start Proof Artifacts**:
   - [`proofs/cli-surface-proof.json`](proofs/cli-surface-proof.json) (`loopx_verification_harness_proof_v1`)
   - [`proofs/cli-surface-proof.md`](proofs/cli-surface-proof.md)
-  - Regenerated at the final Stage A-R3 source-scope head; the committed Proof is byte-consistent with a fresh `git rev-list` / `git diff` recomputation on `HEAD` (see freshness guard).
+  - Regenerated at the final Stage A-R5 source-scope head; the committed Proof is byte-consistent with a fresh `git rev-list` / `git diff` recomputation on `HEAD` (see freshness guard).
 
 ## Freshness invariant (`ADR-0011` decision 5)
 
@@ -16,6 +16,7 @@ The Proof is a projection of the source; its own artifacts must never participat
 
 - `source_head` = the most recent commit reachable from `HEAD` touching any path **outside** `specs/features/verification-harness/proofs/`
   (`git rev-list -1 HEAD -- . ':(exclude)specs/features/verification-harness/proofs'`).
+- `source_base` = the resolved diff base — the **merge-base of `origin/main` and `HEAD`** (falling back to `origin/HEAD`, then the empty tree), recorded verbatim in the Proof so a third party can see which base the fingerprint was computed against (`<empty-tree>` placeholder in a shallow checkout).
 - `diff_fingerprint` = SHA-256 of `git diff --no-color --binary <base>..HEAD` computed with the same `:(exclude)` pathspec, where `<base>` is the **merge-base of `origin/main` and `HEAD`** (falling back to `origin/HEAD`, then the empty tree). Using the merge-base — not the moving `origin/main` ref itself — keeps the fingerprint stable when `origin/main` advances an unrelated commit while `HEAD`'s source scope is unchanged.
 
 Committing a regenerated Proof never advances either value, so the freshness guard (`tests/unit/verification-harness.test.js` test 7) recomputes the exact same values from `HEAD`. Mutation verification: swapping the committed `diff_fingerprint` to a stale value (`0000…`) reddens test 7 with the expected-vs-actual mismatch; restoring the committed value greens the guard.
@@ -23,7 +24,9 @@ Committing a regenerated Proof never advances either value, so the freshness gua
 ### 已知限制 (Known Limitations)
 
 - **浅检出（无 `origin/main`）**：`resolveDiffBase` 在找不到 `origin/main` / `origin/HEAD` 时回落到空树（`empty-tree`）作为 diff base。空树口径会改变 `diff_fingerprint` 的取值，因此**无 `origin/main` 的浅检出**与有 `origin/main` 的完整检出会得到不同的 fingerprint —— test 7 的独立 Oracle 此时也会因缺 base 而无法复算。这是**剩余失败条件**，不掩盖真实源码陈旧检测（P2）；CI 与开发机均为完整检出，不受影响。
-- **工作区解耦**：test 3 / test 7 在检测到 `specs/features/verification-harness/proofs/` **以外**存在脏文件时明确 `skip`（本地草稿不判红）；但当脏文件位于 Proof 目录内时**照常评估** freshness，绝不 skip，避免已提交 Proof 被篡改后静默跳过。
+- **工作区解耦（P5）**：当 `specs/features/verification-harness/proofs/` **以外**存在未跟踪/已修改的本地草稿时，驱动 Prove 的 test 3 / 4 / 5 / 7 / 8 一致地明确 `skip`（附原因），整包 `npm run test` 仍 exit 0；当脏改动位于 Proof 目录**内**时，test 3 / 7 **照常执行** freshness 评估，绝不 skip，避免已提交 Proof 被篡改后静默跳过；干净树（CI）下 8/8 全量执行、0 skip。
+- **Triage 真实语义（N2）**：`prove-cli-surface.js` 的每一步只会产出 `passed` 或 `verified_unreachable`；Doc Drift / Product Bug 一旦在 pass 中被观察到，断言即抛出并使 Prove fail-closed（exit 1）**不写 Proof**。因此自动 Proof 中 `overall_status` 只会是 `passed` / `partial`，`triage.outcome` 只会是 `clean` / `changed`，`triage.doc_drift` / `triage.product_bug` 恒为 `[]`（人工三分类登记槽）。
+- **`approve contract` golden 字节耦合（N3）**：step 4 的 `GOLDEN_LOCKED_CONTRACT_TEXT` / `GOLDEN_LOCKED_CONTRACT_SHA256` 把 `approve contract` 的落盘字节格式耦合进 harness。若产品侧**合法变更**该输出格式，step 4 会以 `independent Oracle mismatch` 整体 fail-closed（exit 1）且不产出 Proof —— 此时需同步更新 golden 常量后再复证。这是保留独立 Oracle（不自证）的必要代价，刻意不降级为语义校验以免放宽 fail-closed。
 
 ## Local Gates & Cold-Start Prove Matrix
 

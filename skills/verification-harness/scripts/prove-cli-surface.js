@@ -151,8 +151,9 @@ function sourceDiffFingerprint(root, base) {
   return sha256Text(res.stdout);
 }
 
-// ADR-0011 decision 5: bind the Proof to an exact `source_head` + scope diff
-// fingerprint + contract revision, and refuse to run on a dirty workspace.
+// ADR-0011 decision 5: bind the Proof to an exact `source_head` + diff base +
+// scope diff fingerprint + contract revision, and refuse to run on a dirty
+// workspace.
 function readSourceBinding(root) {
   const scopeHead = sourceScopeHead(root);
   if (!scopeHead) {
@@ -531,6 +532,7 @@ function renderMarkdownReport(proof) {
     `- **Upstream Baseline**: \`${proof.upstream_baseline}\``,
     `- **Source Head**: \`${proof.source_head}\``,
     `- **Source Dirty**: \`${proof.source_dirty}\``,
+    `- **Source Base**: \`${proof.source_base}\``,
     `- **Diff Fingerprint**: \`${proof.diff_fingerprint}\``,
     `- **Contract Revision**: \`${proof.contract_revision === null ? 'null' : proof.contract_revision}\``,
     `- **Overall Status**: \`${proof.overall_status}\``,
@@ -975,21 +977,18 @@ function main() {
   const proofMdPath = path.join(outputDir, 'cli-surface-proof.md');
 
   const unreachableSteps = steps.filter((step) => step.status === 'verified_unreachable');
-  const failedSteps = steps.filter((step) => step.status === 'failed');
-  // Every pass drives exactly five sub-features: zero failures and zero
-  // unreachable steps -> `passed`; any unreachable step -> `partial`; any
-  // failed step -> `failed`. (The legacy `steps.length < 5 -> incomplete`
-  // branch was unreachable dead code and has been removed.)
-  let overallStatus = 'passed';
-  if (failedSteps.length > 0) {
-    overallStatus = 'failed';
-  } else if (unreachableSteps.length > 0) {
-    overallStatus = 'partial';
-  }
+  // Every emitted Proof covers exactly five sub-features, each with status
+  // `passed` or `verified_unreachable`. A hard assertion failure (a Doc Drift
+  // or Product Bug discovered mid-pass) throws and fail-closes (exit 1) BEFORE
+  // any Proof is written, so an emitted Proof can only be `passed` (all five
+  // covered) or `partial` (>=1 unreachable). The `failed` / `incomplete`
+  // overall states and the `blocked` triage outcome are manual triage classes
+  // (see SKILL.md "Maintenance Loop"), never fabricated by the runner (N2).
+  const overallStatus = unreachableSteps.length > 0 ? 'partial' : 'passed';
   const harnessGaps = unreachableSteps.map(
     (step) => `${step.id}: ${step.observations[0] || 'verified_unreachable'}`
   );
-  const triageOutcome = overallStatus === 'passed' ? 'clean' : (overallStatus === 'failed' ? 'blocked' : 'changed');
+  const triageOutcome = overallStatus === 'passed' ? 'clean' : 'changed';
   const sandboxRelative = path.relative(callerRepoRoot, sandboxDir);
   const sandboxDirReversible = !sandboxRelative.startsWith('..') && !path.isAbsolute(sandboxRelative);
 
@@ -1000,6 +999,7 @@ function main() {
     generated_at: new Date().toISOString(),
     source_head: sourceBinding.source_head,
     source_dirty: sourceBinding.source_dirty,
+    source_base: sourceBinding.source_base,
     diff_fingerprint: sourceBinding.diff_fingerprint,
     contract_revision: sourceBinding.contract_revision,
     overall_status: overallStatus,
@@ -1022,6 +1022,12 @@ function main() {
     },
     triage: {
       outcome: triageOutcome,
+      // `doc_drift` and `product_bug` are manual triage classes (SKILL.md
+      // "Maintenance Loop" / loopx-adaptation.md "Stage 7"). The automated
+      // runner never populates them: when either is observed mid-pass the
+      // assertion throws and Prove fail-closes (exit 1) with no Proof, so an
+      // emitted Proof always records empty arrays here. Only `harness_gap`
+      // (verified_unreachable steps) is derived by the runner (N2).
       doc_drift: [],
       harness_gap: harnessGaps,
       product_bug: [],
