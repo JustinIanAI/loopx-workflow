@@ -361,7 +361,8 @@ test('8. D2 gc 活跃窗口保护与禁止跟随符号链接 + respond-report �
     fs.utimesSync(oldDir, twentyDaysAgo, twentyDaysAgo);
     fs.utimesSync(oldCache, twentyDaysAgo, twentyDaysAgo);
 
-    const rep = gcWorkspaceArtifacts({ repoRoot: repo, days: 14, force: false, nowMs: now });
+    // 显式传 tmpDir：check/CI 会导出 LOOPX_TMP_DIR，若依赖默认解析会指向宿主机沙箱而非本测试仓库。
+    const rep = gcWorkspaceArtifacts({ repoRoot: repo, tmpDir, days: 14, force: false, nowMs: now });
     assert.strictEqual(fs.existsSync(oldDir), false, '过期运行目录应被清理');
     assert.strictEqual(fs.existsSync(oldCache), false, '过期缓存应被清理');
     assert.strictEqual(fs.existsSync(activeDir), true, '1 小时内活跃运行目录必须受保护');

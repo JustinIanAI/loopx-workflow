@@ -78,6 +78,7 @@ exit 0
   fs.writeFileSync(path.join(MOCK_BIN_DIR, 'codex'), codexStub, { mode: 0o755 });
 
   const loopxStub = `#!/usr/bin/env bash
+${require('./helpers/capability-stub').HELP_PRELUDE}
 args="$*"
 if [[ "$args" == *"--check-result"* ]]; then
   echo '{"ok": true, "review_body_check": {"valid": true}, "errors": [], "approval_consistent": true}'

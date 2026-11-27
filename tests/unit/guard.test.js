@@ -60,6 +60,7 @@ test('2. Stage Signature Gate: contract check in specs/features/<feat>/04-contra
   fs.mkdirSync(mockBin, { recursive: true });
   const todosFile = path.join(tmpDir, 'todos.json');
   fs.writeFileSync(todosFile, JSON.stringify({
+    projection_envelope: { schema_version: 'loopx_projection_envelope_v0' },
     todos: [{
       task_class: 'user_gate',
       decision_outcome: 'approve',

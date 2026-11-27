@@ -107,6 +107,7 @@ function setupMockLoopx() {
 
   const mockLoopxPath = path.join(MOCK_BIN_DIR, 'loopx');
   const mockLoopxScript = `#!/usr/bin/env bash
+${require('./helpers/capability-stub').HELP_PRELUDE}
 args="$*"
 
 if [[ "$args" == *"--check-merge-readiness"* ]]; then
@@ -131,8 +132,13 @@ JSON
   exit 0
 fi
 
+if [[ "$args" == *"change-quality prepare"* ]]; then
+  echo '{"schema_version":"change_quality_prepare_packet_v2","ok": true, "status": "review_required", "policy": {"enabled": true, "safe_fix": false, "strict_receipt": true}, "scope": {"scope_fingerprint": "abcdef123456", "base_commit": "HEAD", "base_ref": "origin/HEAD"}}'
+  exit 0
+fi
+
 if [[ "$args" == *"change-quality verify"* ]]; then
-  echo '{"ok": true, "enabled": false, "status": "receipt_valid", "receipt_state": "recorded"}'
+  echo '{"schema_version":"change_quality_receipt_verification_v2","ok": true, "enabled": false, "status": "receipt_valid", "receipt_state": "recorded"}'
   exit 0
 fi
 
@@ -236,6 +242,7 @@ test('PR Pipeline End-to-End Simulation: Feature -> Approval -> Review -> Merge 
       ? `authorization_mode=single_owner;contract_sha=${contractSha};spec_commit=${currentHeadSha};feature=${featureName};principal=${acc.accepted_by};risk_acceptance=${acc.accepted_by}@${acc.accepted_at}`
       : `authorization_mode=${cfg.authorization_mode};contract_sha=${contractSha};spec_commit=${currentHeadSha};feature=${featureName};principal=reviewer`;
     fs.writeFileSync(path.join(MOCK_BIN_DIR, 'user-gate-todos.json'), JSON.stringify({
+      projection_envelope: { schema_version: 'loopx_projection_envelope_v0' },
       todos: [{
         task_class: 'user_gate',
         decision_outcome: 'approve',

@@ -171,7 +171,7 @@ describe('loopx-flow check 前置诊断（GitHub Issue #13）', () => {
     const tmpBin = fs.mkdtempSync(path.join(os.tmpdir(), 'cq-check-bin-'));
     const marker = path.join(tmpBin, 'npm-was-run');
     fs.writeFileSync(path.join(tmpBin, 'loopx'),
-      `#!/usr/bin/env bash\nprintf '%s' ${JSON.stringify(QUALIFICATION_DISABLED)}\nexit 0\n`, { mode: 0o755 });
+      `#!/usr/bin/env bash\n${require('./helpers/capability-stub').HELP_PRELUDE}\nprintf '%s' ${JSON.stringify(QUALIFICATION_DISABLED)}\nexit 0\n`, { mode: 0o755 });
     fs.writeFileSync(path.join(tmpBin, 'npm'),
       `#!/usr/bin/env bash\ntouch ${JSON.stringify(marker)}\nexit 0\n`, { mode: 0o755 });
     try {
@@ -198,6 +198,7 @@ describe('loopx-flow check 前置诊断（GitHub Issue #13）', () => {
     const marker = path.join(tmpBin, 'npm-was-run');
     const logFile = path.join(tmpBin, 'loopx-calls.log');
     fs.writeFileSync(path.join(tmpBin, 'loopx'), `#!/usr/bin/env bash
+${require('./helpers/capability-stub').HELP_PRELUDE}
 echo "$*" >> ${JSON.stringify(logFile)}
 if [[ "$*" == *"change-quality prepare"* ]]; then
   printf '%s' '{"ok":false,"schema_version":"change_quality_error_v0","error":"goal not found in registry"}'
