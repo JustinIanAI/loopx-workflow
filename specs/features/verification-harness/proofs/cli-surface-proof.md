@@ -3,12 +3,12 @@
 - **Schema Version**: `loopx_verification_harness_proof_v1`
 - **Feature Map**: `skills/verification-harness/features/cli-surface.md`
 - **Upstream Baseline**: `cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)`
-- **Source Head**: `e4fa307238b66ab89f409f65df8636a436bd9296`
+- **Source Head**: `e77825cd37ebb7547bee242c41d70c74f7c31eb3`
 - **Source Dirty**: `false`
-- **Diff Fingerprint**: `53ba2c2c90af4e3d2702c6e990f950f3f7ae26533f5687f09d0e47e4bb375f4d`
-- **Contract Revision**: `43c434152297966b7a91616a44d755d66f6ab66fa6cebfaf615532cfd67d8a1b`
+- **Diff Fingerprint**: `d09c2556ddc04cd53c53ed8c8112ab8cc88675535d57d8df6d0b759cc189fbe2`
+- **Contract Revision**: `56e30cc70f94f8165dee7878113e0b58f1f32d20e1783da4d85778b6d54a8560`
 - **Overall Status**: `passed`
-- **Generated At**: `2026-11-26T07:12:15.445Z`
+- **Generated At**: `2026-11-27T01:11:25.407Z`
 - **Sandbox Removed**: `true`
 - **Proof Survived Cleanup**: `true`
 - **Main Repo Registry Unchanged**: `true`
