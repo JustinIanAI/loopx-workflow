@@ -34,6 +34,11 @@ const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const HARNESS_DIR = path.join(PROJECT_ROOT, 'skills/verification-harness');
 const PROVE_SCRIPT = path.join(HARNESS_DIR, 'scripts/prove-cli-surface.js');
 const PROVE_MODULE = require(PROVE_SCRIPT);
+// Hard-coded literal (independent of PROVE_MODULE) used by the freshness guard's
+// independent Oracle in test 7, and by the workspace-decoupling skip guards in
+// tests 3 & 7. Kept as a literal so the guard never re-derives its pathspec from
+// the production module it is trying to verify.
+const PROOF_ARTIFACTS_DIR = 'specs/features/verification-harness/proofs';
 
 const UPSTREAM_EXPECTED_SHA256 = {
   'LICENSE': 'bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e',
@@ -178,7 +183,20 @@ test('2. SKILL.md, loopx-adaptation.md & Feature Map enforce 5-dim model, 4 H2s,
 // an INTERNAL-CONSISTENCY check whose expectations are derived from
 // `proof.steps`, never hard-coded to one environment. The regression oracle for
 // `overall_status` being derived from steps (not a hard-coded literal) is test 5.
-test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and host/repo have zero residue', () => {
+test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and host/repo have zero residue', (t) => {
+  // P5 workspace decoupling: a dirty file OUTSIDE the proof dir (e.g. a local
+  // draft) is correctly rejected fail-closed by Prove, but the end-to-end guard
+  // is a clean-tree check. Skip with an explicit hint instead of globally
+  // reddening. A dirty file INSIDE the proof dir does NOT trigger this skip —
+  // the Prove's own dirty check excludes that dir (F3), so the run still
+  // proceeds and its freshness/isolation assertions still hold.
+  const outsideStatus = spawnSync('git', ['-C', PROJECT_ROOT, 'status', '--porcelain', '--untracked-files=all', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`], { encoding: 'utf8' });
+  const outsideDirty = outsideStatus.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean);
+  if (outsideDirty.length > 0) {
+    t.skip(`cold-start Prove skipped: ${outsideDirty.length} dirty file(s) OUTSIDE the proof dir (local drafts); run on a clean tree (CI)`);
+    return;
+  }
+
   const scratchRoot = makeScratch('vh-prove-test-');
 
   // Sandbox root inside the caller repo (gitignored `.loopx/tmp`) so the recorded
@@ -402,28 +420,50 @@ test('6. Dirty source workspace fails closed; source binding matches the exact c
   assert.deepStrictEqual(residue, [], 'Dirty workspace rejection must not create sandbox residue');
 });
 
-test('7. Freshness guard: committed Proof binds to the exact source-scope head & fingerprint', () => {
-  const proofPath = path.join(PROJECT_ROOT, 'specs/features/verification-harness/proofs/cli-surface-proof.json');
+test('7. Freshness guard: committed Proof binds to the exact source-scope head & fingerprint (independent Oracle)', (t) => {
+  const proofPath = path.join(PROJECT_ROOT, PROOF_ARTIFACTS_DIR, 'cli-surface-proof.json');
   assert.strictEqual(fs.existsSync(proofPath), true, 'Committed Proof JSON must exist');
 
-  // The guard is meaningful only on a clean workspace (as in CI). Compute the
-  // live source binding with the SAME proof-artifact exclusion the runner uses,
-  // then require the committed artifact to match it exactly.
-  const statusRes = spawnSync('git', ['-C', PROJECT_ROOT, 'status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' });
-  assert.strictEqual(statusRes.status, 0, 'git status must succeed');
-  const dirtyLines = statusRes.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean);
-  assert.strictEqual(dirtyLines.length, 0, `freshness guard requires a clean workspace (${dirtyLines.length} dirty line(s)); commit and regenerate the Proof`);
+  // P5 workspace decoupling: dirty files OUTSIDE the proof dir make this guard
+  // meaningless for local drafts (skip with an explicit hint); dirty files
+  // INSIDE the proof dir mean the committed Proof was tampered with and MUST
+  // still be evaluated — never skipped.
+  const outsideStatus = spawnSync('git', ['-C', PROJECT_ROOT, 'status', '--porcelain', '--untracked-files=all', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`], { encoding: 'utf8' });
+  assert.strictEqual(outsideStatus.status, 0, 'git status must succeed');
+  const outsideDirty = outsideStatus.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean);
+  const proofStatus = spawnSync('git', ['-C', PROJECT_ROOT, 'status', '--porcelain', '--untracked-files=all', '--', PROOF_ARTIFACTS_DIR], { encoding: 'utf8' });
+  const proofDirty = proofStatus.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean);
+  if (proofDirty.length === 0 && outsideDirty.length > 0) {
+    t.skip(`freshness guard skipped: ${outsideDirty.length} dirty file(s) OUTSIDE the proof dir (local drafts); the guard binds committed source only — run on a clean tree (CI)`);
+    return;
+  }
 
   const committed = JSON.parse(fs.readFileSync(proofPath, 'utf8'));
-  const scopeHead = PROVE_MODULE.sourceScopeHead(PROJECT_ROOT);
-  assert.ok(scopeHead, 'sourceScopeHead must resolve');
-  const diffBaseInfo = PROVE_MODULE.resolveDiffBase(PROJECT_ROOT);
-  assert.ok(diffBaseInfo, 'resolveDiffBase must resolve');
-  const fingerprint = PROVE_MODULE.sourceDiffFingerprint(PROJECT_ROOT, diffBaseInfo.base);
-  assert.ok(fingerprint, 'sourceDiffFingerprint must resolve');
 
-  assert.strictEqual(committed.source_head, scopeHead, 'committed Proof source_head is stale; rerun prove-cli-surface and commit the new artifact');
-  assert.strictEqual(committed.diff_fingerprint, fingerprint, 'committed Proof diff_fingerprint is stale; rerun prove-cli-surface and commit the new artifact');
+  // Independent Oracle (P4): recompute both bound fields with raw `git` + `crypto`,
+  // hard-coding the pathspec and the stable merge-base semantics, WITHOUT going
+  // through PROVE_MODULE.sourceScopeHead / resolveDiffBase / sourceDiffFingerprint.
+  // If the production binding definitions were wrong (wrong pathspec, wrong base),
+  // this independent recomputation would disagree with the committed Proof and
+  // redden the guard.
+  const scopeHead = git(PROJECT_ROOT, ['rev-list', '-1', 'HEAD', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`]);
+  assert.ok(scopeHead, 'independent source_head must resolve');
+
+  let base = '';
+  for (const ref of ['origin/main', 'origin/HEAD']) {
+    const rev = spawnSync('git', ['-C', PROJECT_ROOT, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { encoding: 'utf8' });
+    if (rev.status !== 0 || !rev.stdout.trim()) continue;
+    const mb = spawnSync('git', ['-C', PROJECT_ROOT, 'merge-base', rev.stdout.trim(), 'HEAD'], { encoding: 'utf8' });
+    if (mb.status === 0 && mb.stdout.trim()) { base = mb.stdout.trim(); break; }
+  }
+  assert.ok(base, 'independent diff base (merge-base origin/main HEAD) must resolve when origin/main exists');
+
+  const diffRes = spawnSync('git', ['-C', PROJECT_ROOT, 'diff', '--no-color', '--binary', base, 'HEAD', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`], { encoding: 'utf8' });
+  assert.strictEqual(diffRes.status, 0, 'independent git diff must succeed');
+  const fingerprint = crypto.createHash('sha256').update(diffRes.stdout, 'utf8').digest('hex');
+
+  assert.strictEqual(committed.source_head, scopeHead, 'committed Proof source_head is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
+  assert.strictEqual(committed.diff_fingerprint, fingerprint, 'committed Proof diff_fingerprint is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
 });
 
 test('8. Installed-but-unsupported loopx version reports verified_unreachable (never "not installed")', () => {

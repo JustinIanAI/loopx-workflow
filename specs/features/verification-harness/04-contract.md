@@ -36,7 +36,7 @@ export interface VerificationHarnessProofV1 {
   // ADR-0011 决策 5：Proof 必须锚定精确源码与契约，dirty 工作区 fail-closed
   source_head: string;          // 最近一个触及 proof 工件目录以外任意路径的提交（`git rev-list -1 HEAD -- . ':(exclude)specs/features/verification-harness/proofs'`）
   source_dirty: false;          // dirty workspaces never emit a Proof
-  diff_fingerprint: string;     // SHA-256 of `git diff <base>..HEAD`（同一 pathspec 排除 proof 工件目录）
+  diff_fingerprint: string;     // SHA-256 of `git diff <base>..HEAD`（同一 pathspec 排除 proof 工件目录；`<base>` = `origin/main` 与 `HEAD` 的 merge-base，回落 `origin/HEAD` → 空树）
   contract_revision: string | null; // SHA-256 of `specs/features/verification-harness/04-contract.md`
   // 由 steps 派生：全部 passed → passed；含 verified_unreachable → partial；
   // 含 failed → failed（incomplete 保留为未来子特性不足时的降级态，当前 runner 恒产出 5 步）
@@ -88,3 +88,8 @@ export interface VerificationHarnessProofV1 {
 - [x] `t2` (`Story-2`): 编写 `SKILL.md`、`references/loopx-adaptation.md`、`features/README.md` 与 `features/cli-surface.md`
 - [x] `t3` (`Story-3`): 编写 `tests/unit/verification-harness.test.js`（先红后绿）与可执行 `scripts/prove-cli-surface.js`
 - [x] `t4` (`Story-3`): 冷启动运行 `prove-cli-surface.js` 产出持久化 Proof 并跑通双 locale Four Gates
+
+## 5. 已知限制 (Known Limitations)
+
+- **浅检出（无 `origin/main`）**：`resolveDiffBase` 在找不到 `origin/main` / `origin/HEAD` 时回落到空树（`empty-tree`）作为 diff base，此时 `diff_fingerprint` 口径与完整检出不同，test 7 的独立 Oracle 因缺 base 无法复算 —— 属**剩余失败条件**，不掩盖真实源码陈旧检测。CI 与开发机均为完整检出，不受影响。
+- **工作区解耦**：test 3 / test 7 在 Proof 目录以外存在脏文件时明确 `skip`；Proof 目录内的脏改动**照常评估**，绝不 skip，防止已提交 Proof 被篡改后静默跳过。

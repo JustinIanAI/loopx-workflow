@@ -105,9 +105,10 @@ function gitText(root, args) {
 // ADR-0011 decision 5 freshness invariant: `source_head` is the most recent
 // commit reachable from HEAD that touches any path OUTSIDE the proof artifacts
 // directory, and `diff_fingerprint` is the SHA-256 of the same scope diff
-// (origin/main..HEAD) with that directory excluded. Committing a regenerated
-// Proof therefore never advances `source_head` nor changes `diff_fingerprint`,
-// so a freshness guard can recompute the exact same values from HEAD forever.
+// (`<base>..HEAD`, where `<base>` is the merge-base of `origin/main` and `HEAD`)
+// with that directory excluded. Committing a regenerated Proof therefore never
+// advances `source_head` nor changes `diff_fingerprint`, so a freshness guard
+// can recompute the exact same values from HEAD forever.
 const PROOF_ARTIFACTS_REL = 'specs/features/verification-harness/proofs';
 
 function sourceScopePaths() {
@@ -123,8 +124,16 @@ function sourceScopeHead(root) {
 function resolveDiffBase(root) {
   for (const ref of ['origin/main', 'origin/HEAD']) {
     const res = gitText(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
-    if (res.status === 0 && res.stdout.trim()) {
-      return { base: res.stdout.trim(), kind: 'origin' };
+    if (res.status !== 0 || !res.stdout.trim()) continue;
+    // `origin/main` / `origin/HEAD` are moving refs: advancing `origin/main` with
+    // an unrelated commit changes `git diff origin/main..HEAD` and spuriously
+    // invalidates the freshness guard even though HEAD's source scope is
+    // untouched. The merge-base of `origin/main` and `HEAD` is the fork point:
+    // it stays fixed while either side advances, so the scope diff fingerprint
+    // is stable against unrelated upstream drift (F2 / P1).
+    const mergeBase = gitText(root, ['merge-base', res.stdout.trim(), 'HEAD']);
+    if (mergeBase.status === 0 && mergeBase.stdout.trim()) {
+      return { base: mergeBase.stdout.trim(), kind: 'origin' };
     }
   }
   // Empty tree object: a Git repo without an origin still yields a stable,
@@ -151,7 +160,12 @@ function readSourceBinding(root) {
       error: `source workspace ${root} is not a resolvable Git commit; Proof cannot be bound to an exact head.`,
     };
   }
-  const dirtyRes = gitText(root, ['status', '--porcelain', '--untracked-files=all']);
+  // Dirty check must apply the SAME proof-artifact exclusion as the binding
+  // (sourceScopeHead / sourceDiffFingerprint): a freshly generated Proof written
+  // under PROOF_ARTIFACTS_REL must never make Prove reject a re-run as "dirty".
+  // This keeps Prove idempotent (F3) while still failing closed on any change to
+  // real source paths outside the proof directory.
+  const dirtyRes = gitText(root, ['status', '--porcelain', '--untracked-files=all', '--', ...sourceScopePaths()]);
   if (dirtyRes.status !== 0) {
     return { error: `git status failed in source workspace ${root}: ${dirtyRes.stderr.trim()}` };
   }
