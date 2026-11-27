@@ -37,11 +37,9 @@ export interface VerificationHarnessProofV1 {
   feature_map: 'skills/verification-harness/features/cli-surface.md';
   upstream_baseline: 'cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)';
   generated_at: string;
-  // ADR-0011 决策 5：Proof 必须锚定精确源码与契约，dirty 工作区 fail-closed
-  source_head: string;          // 最近一个触及 proof 工件目录以外任意路径的提交（`git rev-list -1 HEAD -- . ':(exclude)specs/features/verification-harness/proofs'`）
+  // ADR-0011 决策 5（内容寻址，B1）：Proof 锚定内容寻址的源码 scope 指纹与契约，dirty 工作区 fail-closed
+  scope_fingerprint: string;    // SHA-256 of `git diff --no-color --binary <empty-tree>..HEAD`（pathspec 排除 proof 工件目录）。空树是固定内容寻址基线，该值只取决于当前源码 scope 内容（tree），与 HEAD 的 commit SHA / 历史 / origin/main 漂移无关 —— squash/merge 合入后源码树不变则 fingerprint 不变（不再因新 commit SHA 误判 stale）
   source_dirty: false;          // dirty workspaces never emit a Proof
-  source_base: string;          // diff base：`origin/main` 与 `HEAD` 的 merge-base SHA（无 origin 的浅检出回落 `<empty-tree>` 占位）
-  diff_fingerprint: string;     // SHA-256 of `git diff <base>..HEAD`（同一 pathspec 排除 proof 工件目录；`<base>` = `origin/main` 与 `HEAD` 的 merge-base，回落 `origin/HEAD` → 空树）
   contract_revision: string | null; // SHA-256 of `specs/features/verification-harness/04-contract.md`
   // 由 steps 派生：5 步全 passed → passed；含 verified_unreachable → partial。
   // Doc Drift / Product Bug 一旦在 pass 中被观察到，断言抛出并使 Prove
@@ -56,6 +54,8 @@ export interface VerificationHarnessProofV1 {
     proof_survived_cleanup: true;
   };
   isolation: {
+    main_repo_registry_present: boolean;   // 运行前主仓 `.loopx/registry.json` 是否已存在（诚实记录，避免 null === null 空转）
+    host_global_registry_present: boolean; // 运行前宿主机 `~/.loopx/registry.global.json` 是否已存在
     main_repo_registry_unchanged: true;
     host_global_registry_unchanged: true;
     caller_repo_git_status_unchanged: true;
@@ -100,7 +100,7 @@ export interface VerificationHarnessProofV1 {
 
 ## 5. 已知限制 (Known Limitations)
 
-- **浅检出（无 `origin/main`）**：`resolveDiffBase` 在找不到 `origin/main` / `origin/HEAD` 时回落到空树（`empty-tree`）作为 diff base，此时 `diff_fingerprint` 口径与完整检出不同，test 7 的独立 Oracle 因缺 base 无法复算 —— 属**剩余失败条件**，不掩盖真实源码陈旧检测。CI 与开发机均为完整检出，不受影响。
-- **工作区解耦（P5）**：当 `specs/features/verification-harness/proofs/` **以外**存在未跟踪/已修改的本地草稿时，驱动 Prove 的 test 3 / 4 / 5 / 7 / 8 一致地明确 `skip`（附原因），整包 `npm run test` 仍 exit 0；当脏改动位于 Proof 目录**内**时，test 3 / 7 **照常执行** freshness 评估，绝不 skip，防止已提交 Proof 被篡改后静默跳过；干净树（CI）下 8/8 全量执行、0 skip。Prove 本体对真实源码脏改动（如 `bin/loopx-flow` 1 字节改动）的 fail-closed（exit ≠ 0、零 Proof、零沙箱残留）不受影响。
+- **内容寻址 scope_fingerprint（B1）**：`scope_fingerprint` = SHA-256 of `git diff --no-color --binary <empty-tree>..HEAD`（pathspec 排除 proof 工件目录）。空树是固定内容寻址基线，因此该值**不依赖 `origin/main` / commit SHA / 历史**：squash/merge 合入 `main` 产生新 commit 但源码树不变，fingerprint 不变，test 7 不再误判（B1 修复）；任何真实源码改动都会改变 fingerprint。独立 Oracle 在任意完整 git 树（含无 `origin/main` 的浅检出）上均可复算。
+- **工作区解耦（P5）**：当 `specs/features/verification-harness/proofs/` **以外**存在未跟踪/已修改的本地草稿时，驱动 Prove 的 test 3 / 4 / 5 / 7 / 8 一致地明确 `skip`（附原因），整包 `npm run test` 仍 exit 0；当脏改动位于 Proof 目录**内**时，test 3 / 7 **照常执行** freshness 评估，绝不 skip，防止已提交 Proof 被篡改后静默跳过；干净树（CI）下 9/9 全量执行、0 skip。Prove 本体对真实源码脏改动（如 `bin/loopx-flow` 1 字节改动）的 fail-closed（exit ≠ 0、零 Proof、零沙箱残留）不受影响。
 - **Triage 真实语义（N2）**：`prove-cli-surface.js` 的每一步只会产出 `passed` 或 `verified_unreachable`；Doc Drift / Product Bug 一旦在 pass 中被观察到，断言即抛出并使 Prove fail-closed（exit 1）**不写 Proof**。因此自动 Proof 中 `overall_status` 只会是 `passed` / `partial`，`triage.outcome` 只会是 `clean` / `changed`，`triage.doc_drift` / `triage.product_bug` 恒为 `[]`；`failed` / `incomplete` / `blocked` 与 Doc Drift / Product Bug 的分类是**人工维护三分类**（`SKILL.md` "Maintenance Loop"、`references/loopx-adaptation.md` "Stage 7"）的登记槽，不由 runner 伪造。
 - **`approve contract` golden 字节耦合（N3）**：step 4 用实现之外算定的 `GOLDEN_LOCKED_CONTRACT_TEXT` / `GOLDEN_LOCKED_CONTRACT_SHA256` 作为独立 Oracle 锁定 `approve contract` 的落盘字节。若产品侧**合法变更** `approve contract` 的输出格式，该步会以 `independent Oracle mismatch` 整体 fail-closed（exit 1）且不产出 Proof —— 此时需同步更新 golden 常量后再复证。这是保留独立 Oracle（不自证）的必要代价，刻意不降级为语义校验以免放宽 fail-closed。

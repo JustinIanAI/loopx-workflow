@@ -102,68 +102,57 @@ function gitText(root, args) {
 // The Proof is a projection of the source tree; its own artifacts must never
 // participate in their own binding, otherwise committing a freshly generated
 // Proof would always invalidate the one already committed (self-defeating).
-// ADR-0011 decision 5 freshness invariant: `source_head` is the most recent
-// commit reachable from HEAD that touches any path OUTSIDE the proof artifacts
-// directory, and `diff_fingerprint` is the SHA-256 of the same scope diff
-// (`<base>..HEAD`, where `<base>` is the merge-base of `origin/main` and `HEAD`)
-// with that directory excluded. Committing a regenerated Proof therefore never
-// advances `source_head` nor changes `diff_fingerprint`, so a freshness guard
-// can recompute the exact same values from HEAD forever.
+// ADR-0011 decision 5 freshness invariant, aligned to content addressing (B1):
+// the Proof binds to a `scope_fingerprint` — the SHA-256 of the source scope's
+// content-addressed tree projection (every path OUTSIDE the proof artifacts
+// directory). This is stable across squash/merge: merging the PR into `main`
+// produces a NEW commit with the SAME source-scope tree, so the fingerprint is
+// unchanged and the freshness guard does NOT false-positive (unlike a
+// commit-SHA or merge-base-diff binding, which changes whenever a new commit
+// lands even though the source content is byte-identical). Committing a
+// regenerated Proof only touches the proof artifacts directory, so it too never
+// changes the fingerprint.
 const PROOF_ARTIFACTS_REL = 'specs/features/verification-harness/proofs';
 
 function sourceScopePaths() {
   return ['.', `:(exclude)${PROOF_ARTIFACTS_REL}`];
 }
 
-function sourceScopeHead(root) {
-  const res = gitText(root, ['rev-list', '-1', 'HEAD', '--', ...sourceScopePaths()]);
-  if (res.status !== 0 || !res.stdout.trim()) return null;
-  return res.stdout.trim();
-}
-
-function resolveDiffBase(root) {
-  for (const ref of ['origin/main', 'origin/HEAD']) {
-    const res = gitText(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
-    if (res.status !== 0 || !res.stdout.trim()) continue;
-    // `origin/main` / `origin/HEAD` are moving refs: advancing `origin/main` with
-    // an unrelated commit changes `git diff origin/main..HEAD` and spuriously
-    // invalidates the freshness guard even though HEAD's source scope is
-    // untouched. The merge-base of `origin/main` and `HEAD` is the fork point:
-    // it stays fixed while either side advances, so the scope diff fingerprint
-    // is stable against unrelated upstream drift (F2 / P1).
-    const mergeBase = gitText(root, ['merge-base', res.stdout.trim(), 'HEAD']);
-    if (mergeBase.status === 0 && mergeBase.stdout.trim()) {
-      return { base: mergeBase.stdout.trim(), kind: 'origin' };
-    }
-  }
-  // Empty tree object: a Git repo without an origin still yields a stable,
-  // content-addressed fingerprint of the whole tracked tree.
+// Content-addressed scope fingerprint: SHA-256 of
+// `git diff --no-color --binary <empty-tree>..HEAD` restricted to the source
+// scope pathspec. The empty tree is a FIXED, content-addressed baseline, so the
+// fingerprint depends only on the current source-scope content (tree) — never on
+// HEAD's commit SHA, commit history, or the moving `origin/main` ref. Identical
+// source-scope trees (the PR head and its squash/merge result) yield identical
+// fingerprints; any real source change yields a different one.
+function sourceScopeFingerprint(root) {
   const emptyTree = gitText(root, ['hash-object', '-t', 'tree', '/dev/null']);
-  if (emptyTree.status === 0 && emptyTree.stdout.trim()) {
-    return { base: emptyTree.stdout.trim(), kind: 'empty-tree' };
-  }
-  return null;
-}
-
-function sourceDiffFingerprint(root, base) {
-  const res = gitText(root, ['diff', '--no-color', '--binary', base, 'HEAD', '--', ...sourceScopePaths()]);
+  if (emptyTree.status !== 0 || !emptyTree.stdout.trim()) return null;
+  // The empty-tree diff serializes the FULL source-scope content (every blob), so
+  // its stdout routinely exceeds spawnSync's 1 MiB default maxBuffer. Raise it for
+  // this one command so the fingerprint is computed from the whole tree, never a
+  // truncated prefix.
+  const res = spawnSync('git', ['-C', root, 'diff', '--no-color', '--binary', emptyTree.stdout.trim(), 'HEAD', '--', ...sourceScopePaths()], {
+    encoding: 'utf8',
+    timeout: 30000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
   if (res.status !== 0) return null;
   return sha256Text(res.stdout);
 }
 
-// ADR-0011 decision 5: bind the Proof to an exact `source_head` + diff base +
-// scope diff fingerprint + contract revision, and refuse to run on a dirty
-// workspace.
+// ADR-0011 decision 5: bind the Proof to a content-addressed `scope_fingerprint`
+// + `contract_revision`, and refuse to run on a dirty workspace.
 function readSourceBinding(root) {
-  const scopeHead = sourceScopeHead(root);
-  if (!scopeHead) {
+  const headCheck = gitText(root, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+  if (headCheck.status !== 0 || !headCheck.stdout.trim()) {
     return {
-      error: `source workspace ${root} is not a resolvable Git commit; Proof cannot be bound to an exact head.`,
+      error: `source workspace ${root} is not a resolvable Git commit; Proof cannot be bound to an exact source tree.`,
     };
   }
   // Dirty check must apply the SAME proof-artifact exclusion as the binding
-  // (sourceScopeHead / sourceDiffFingerprint): a freshly generated Proof written
-  // under PROOF_ARTIFACTS_REL must never make Prove reject a re-run as "dirty".
+  // (sourceScopeFingerprint): a freshly generated Proof written under
+  // PROOF_ARTIFACTS_REL must never make Prove reject a re-run as "dirty".
   // This keeps Prove idempotent (F3) while still failing closed on any change to
   // real source paths outside the proof directory.
   const dirtyRes = gitText(root, ['status', '--porcelain', '--untracked-files=all', '--', ...sourceScopePaths()]);
@@ -178,21 +167,15 @@ function readSourceBinding(root) {
     };
   }
 
-  const diffBaseInfo = resolveDiffBase(root);
-  if (!diffBaseInfo) {
-    return { error: 'unable to resolve a diff baseline (origin/main, origin/HEAD or empty tree) for diff_fingerprint.' };
-  }
-  const fingerprint = sourceDiffFingerprint(root, diffBaseInfo.base);
+  const fingerprint = sourceScopeFingerprint(root);
   if (!fingerprint) {
-    return { error: 'git diff failed while computing diff_fingerprint.' };
+    return { error: 'git diff failed while computing the content-addressed scope_fingerprint.' };
   }
 
   const contractPath = path.join(root, 'specs/features/verification-harness/04-contract.md');
   return {
-    source_head: scopeHead,
+    scope_fingerprint: fingerprint,
     source_dirty: false,
-    source_base: diffBaseInfo.kind === 'origin' ? diffBaseInfo.base : '<empty-tree>',
-    diff_fingerprint: fingerprint,
     contract_revision: digestOrNull(contractPath),
   };
 }
@@ -530,10 +513,8 @@ function renderMarkdownReport(proof) {
     `- **Schema Version**: \`${proof.schema_version}\``,
     `- **Feature Map**: \`${proof.feature_map}\``,
     `- **Upstream Baseline**: \`${proof.upstream_baseline}\``,
-    `- **Source Head**: \`${proof.source_head}\``,
+    `- **Scope Fingerprint**: \`${proof.scope_fingerprint}\``,
     `- **Source Dirty**: \`${proof.source_dirty}\``,
-    `- **Source Base**: \`${proof.source_base}\``,
-    `- **Diff Fingerprint**: \`${proof.diff_fingerprint}\``,
     `- **Contract Revision**: \`${proof.contract_revision === null ? 'null' : proof.contract_revision}\``,
     `- **Overall Status**: \`${proof.overall_status}\``,
     `- **Generated At**: \`${proof.generated_at}\``,
@@ -945,6 +926,14 @@ function main() {
     // Always force-clean disposable sandbox even if an assertion failed mid-drive
     runHandle.cleanup(0);
     fs.rmSync(sandboxDir, { recursive: true, force: true });
+    // L2: Prove auto-creates <repo>/.loopx/tmp when LOOPX_TMP_DIR is unset; once
+    // the sandbox is gone that tmp root is left empty in the caller repo. Remove
+    // it with a non-recursive rmdir (only succeeds when truly empty) so the
+    // caller repo is left with zero `.loopx/tmp` residue. Never touch a
+    // caller-provided LOOPX_TMP_DIR (the caller owns that directory's lifecycle).
+    if (!process.env.LOOPX_TMP_DIR) {
+      try { fs.rmdirSync(tmpRoot); } catch (_) {}
+    }
   }
 
   if (runError) {
@@ -997,10 +986,8 @@ function main() {
     feature_map: 'skills/verification-harness/features/cli-surface.md',
     upstream_baseline: 'cursor/plugins@fbb86c09bbb4a25e490aaed136899ced1e9140e4 (pstack@0.15.46, MIT)',
     generated_at: new Date().toISOString(),
-    source_head: sourceBinding.source_head,
+    scope_fingerprint: sourceBinding.scope_fingerprint,
     source_dirty: sourceBinding.source_dirty,
-    source_base: sourceBinding.source_base,
-    diff_fingerprint: sourceBinding.diff_fingerprint,
     contract_revision: sourceBinding.contract_revision,
     overall_status: overallStatus,
     steps,
@@ -1014,6 +1001,11 @@ function main() {
       proof_survived_cleanup: false,
     },
     isolation: {
+      // L3: record whether each registry actually existed BEFORE the run, so a
+      // caller can distinguish "registry was absent (unchanged = null === null)"
+      // from "registry existed and Prove left its bytes untouched".
+      main_repo_registry_present: beforeMainRegistryDigest !== null,
+      host_global_registry_present: beforeHostRegistryDigest !== null,
       main_repo_registry_unchanged: mainRepoUnchanged,
       host_global_registry_unchanged: hostGlobalUnchanged,
       caller_repo_git_status_unchanged: callerRepoStatusUnchanged,
@@ -1070,8 +1062,6 @@ module.exports = {
   GOLDEN_LOCKED_CONTRACT_TEXT,
   GOLDEN_LOCKED_CONTRACT_SHA256,
   PROOF_ARTIFACTS_REL,
-  sourceScopeHead,
-  sourceDiffFingerprint,
-  resolveDiffBase,
+  sourceScopeFingerprint,
   classifyLoopx23,
 };

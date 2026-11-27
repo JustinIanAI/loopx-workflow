@@ -18,9 +18,10 @@
  *   4. Negative fail-closed behavior: missing `--output-dir`, unknown arguments,
  *      `--output-dir` inside the disposable sandbox, and a dirty source workspace
  *      all exit non-zero without leaving sandbox residue.
- *   5. Proof binding (ADR-0011 decision 5): `source_head` / `source_dirty` /
- *      `diff_fingerprint` / `contract_revision` are present, and `overall_status`
- *      is derived from steps (missing `loopx 2.3.x` can never report `passed`).
+ *   5. Proof binding (ADR-0011 decision 5): `scope_fingerprint` / `source_dirty` /
+ *      `contract_revision` are present (content-addressed, stable across
+ *      squash/merge), and `overall_status` is derived from steps (missing
+ *      `loopx 2.3.x` can never report `passed`).
  */
 const { test, after } = require('node:test');
 const assert = require('node:assert');
@@ -92,6 +93,21 @@ function outsideProofDirtyCount() {
   const status = spawnSync('git', ['-C', PROJECT_ROOT, 'status', '--porcelain', '--untracked-files=all', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`], { encoding: 'utf8' });
   if (status.status !== 0) return -1;
   return status.stdout.split('\n').map((l) => l.trimEnd()).filter(Boolean).length;
+}
+
+// Independent Oracle (P4) for the content-addressed `scope_fingerprint`: recompute
+// with raw `git` + `crypto`, hard-coding the pathspec and the empty-tree baseline,
+// WITHOUT going through PROVE_MODULE.sourceScopeFingerprint. The empty tree is a
+// FIXED, content-addressed baseline, so two commits with an identical source-scope
+// tree (e.g. a PR head and its squash/merge result) yield an identical fingerprint,
+// while any real source change yields a different one (B1).
+function independentScopeFingerprint(root) {
+  const emptyTree = spawnSync('git', ['-C', root, 'hash-object', '-t', 'tree', '/dev/null'], { encoding: 'utf8' });
+  assert.strictEqual(emptyTree.status, 0, `git hash-object empty tree failed: ${emptyTree.stderr}`);
+  const emptyTreeSha = emptyTree.stdout.trim();
+  const diffRes = spawnSync('git', ['-C', root, 'diff', '--no-color', '--binary', emptyTreeSha, 'HEAD', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  assert.strictEqual(diffRes.status, 0, 'independent git diff must succeed');
+  return crypto.createHash('sha256').update(diffRes.stdout, 'utf8').digest('hex');
 }
 
 // Copy the harness source into a disposable Git repo so dirty-workspace
@@ -247,23 +263,11 @@ test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and h
   const proof = JSON.parse(fs.readFileSync(proofJsonPath, 'utf8'));
   assert.strictEqual(proof.schema_version, 'loopx_verification_harness_proof_v1');
   assert.strictEqual(proof.feature_map, 'skills/verification-harness/features/cli-surface.md');
-  assert.match(proof.source_head, /^[0-9a-f]{40}$/, 'Proof must bind an exact source_head commit');
-  const expectedScopeHead = PROVE_MODULE.sourceScopeHead(PROJECT_ROOT);
-  assert.ok(expectedScopeHead, 'sourceScopeHead must resolve on a clean committed repo');
-  assert.strictEqual(proof.source_head, expectedScopeHead, 'source_head must bind the exact source-scope head (proof artifacts excluded)');
+  assert.ok(isHex64(proof.scope_fingerprint), 'scope_fingerprint must be a SHA-256 digest');
+  const expectedScopeFingerprint = PROVE_MODULE.sourceScopeFingerprint(PROJECT_ROOT);
+  assert.ok(expectedScopeFingerprint, 'sourceScopeFingerprint must resolve on a clean committed repo');
+  assert.strictEqual(proof.scope_fingerprint, expectedScopeFingerprint, 'scope_fingerprint must bind the content-addressed source scope (proof artifacts excluded)');
   assert.strictEqual(proof.source_dirty, false, 'Proof must record a clean source workspace');
-  assert.ok(isHex64(proof.diff_fingerprint), 'diff_fingerprint must be a SHA-256 digest');
-  const diffBaseInfo = PROVE_MODULE.resolveDiffBase(PROJECT_ROOT);
-  assert.ok(diffBaseInfo, 'resolveDiffBase must resolve on a clean committed repo');
-  const expectedFingerprint = PROVE_MODULE.sourceDiffFingerprint(PROJECT_ROOT, diffBaseInfo.base);
-  assert.ok(expectedFingerprint, 'sourceDiffFingerprint must resolve on a clean committed repo');
-  assert.strictEqual(proof.diff_fingerprint, expectedFingerprint, 'diff_fingerprint must bind the exact source-scope diff (proof artifacts excluded)');
-  assert.ok(
-    /^[0-9a-f]{40}$/.test(proof.source_base) || proof.source_base === '<empty-tree>',
-    'source_base must bind the resolved diff base (merge-base SHA or empty-tree placeholder)'
-  );
-  const expectedSourceBase = diffBaseInfo.kind === 'origin' ? diffBaseInfo.base : '<empty-tree>';
-  assert.strictEqual(proof.source_base, expectedSourceBase, 'source_base must equal the resolved diff base (merge-base origin/main HEAD)');
   assert.ok(isHex64(proof.contract_revision), 'contract_revision must bind 04-contract.md SHA-256');
   const unreachableSteps = proof.steps.filter((step) => step.status === 'verified_unreachable');
   const expectedOverall = unreachableSteps.length === 0 ? 'passed' : 'partial';
@@ -304,6 +308,10 @@ test('3. Cold-start Prove runs end-to-end, Proof survives sandbox cleanup, and h
   assert.strictEqual(proof.isolation.host_global_registry_unchanged, true);
   assert.strictEqual(proof.isolation.caller_repo_git_status_unchanged, true);
   assert.strictEqual(proof.isolation.caller_repo_loopx_manifest_unchanged, true);
+  // L3: the Proof must honestly record whether each registry existed before the
+  // run, so "unchanged" is never a vacuous null === null comparison.
+  assert.strictEqual(proof.isolation.main_repo_registry_present, beforeRepoRegistry !== null, 'Proof must honestly record main repo registry presence');
+  assert.strictEqual(proof.isolation.host_global_registry_present, beforeHostRegistry !== null, 'Proof must honestly record host global registry presence');
 
   // Verify tmpSandboxRoot contains zero leftover prove-* directories
   const remainingTmpEntries = fs.readdirSync(tmpSandboxRoot);
@@ -438,7 +446,8 @@ test('6. Dirty source workspace fails closed; source binding matches the exact c
   });
   assert.strictEqual(clean.status, 0, `Clean source copy Prove must run (status=${clean.status}):\n${clean.stderr}`);
   const proof = JSON.parse(fs.readFileSync(path.join(cleanOut, 'cli-surface-proof.json'), 'utf8'));
-  assert.strictEqual(proof.source_head, git(sourceRoot, ['rev-parse', 'HEAD']));
+  assert.ok(isHex64(proof.scope_fingerprint), 'Clean source copy Proof must bind a content-addressed scope_fingerprint');
+  assert.strictEqual(proof.scope_fingerprint, PROVE_MODULE.sourceScopeFingerprint(sourceRoot), 'scope_fingerprint must bind the content-addressed source scope');
   assert.strictEqual(proof.source_dirty, false);
 
   const loopxFlowPath = path.join(sourceRoot, 'bin/loopx-flow');
@@ -457,7 +466,7 @@ test('6. Dirty source workspace fails closed; source binding matches the exact c
   assert.deepStrictEqual(residue, [], 'Dirty workspace rejection must not create sandbox residue');
 });
 
-test('7. Freshness guard: committed Proof binds to the exact source-scope head & fingerprint (independent Oracle)', (t) => {
+test('7. Freshness guard: committed Proof binds to the content-addressed scope_fingerprint (independent Oracle)', (t) => {
   const proofPath = path.join(PROJECT_ROOT, PROOF_ARTIFACTS_DIR, 'cli-surface-proof.json');
   assert.strictEqual(fs.existsSync(proofPath), true, 'Committed Proof JSON must exist');
 
@@ -477,34 +486,17 @@ test('7. Freshness guard: committed Proof binds to the exact source-scope head &
 
   const committed = JSON.parse(fs.readFileSync(proofPath, 'utf8'));
 
-  // Independent Oracle (P4): recompute both bound fields with raw `git` + `crypto`,
-  // hard-coding the pathspec and the stable merge-base semantics, WITHOUT going
-  // through PROVE_MODULE.sourceScopeHead / resolveDiffBase / sourceDiffFingerprint.
-  // If the production binding definitions were wrong (wrong pathspec, wrong base),
-  // this independent recomputation would disagree with the committed Proof and
-  // redden the guard.
-  const scopeHead = git(PROJECT_ROOT, ['rev-list', '-1', 'HEAD', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`]);
-  assert.ok(scopeHead, 'independent source_head must resolve');
-
-  let base = '';
-  for (const ref of ['origin/main', 'origin/HEAD']) {
-    const rev = spawnSync('git', ['-C', PROJECT_ROOT, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { encoding: 'utf8' });
-    if (rev.status !== 0 || !rev.stdout.trim()) continue;
-    const mb = spawnSync('git', ['-C', PROJECT_ROOT, 'merge-base', rev.stdout.trim(), 'HEAD'], { encoding: 'utf8' });
-    if (mb.status === 0 && mb.stdout.trim()) { base = mb.stdout.trim(); break; }
-  }
-  assert.ok(base, 'independent diff base (merge-base origin/main HEAD) must resolve when origin/main exists');
-
-  const diffRes = spawnSync('git', ['-C', PROJECT_ROOT, 'diff', '--no-color', '--binary', base, 'HEAD', '--', '.', `:(exclude)${PROOF_ARTIFACTS_DIR}`], { encoding: 'utf8' });
-  assert.strictEqual(diffRes.status, 0, 'independent git diff must succeed');
-  const fingerprint = crypto.createHash('sha256').update(diffRes.stdout, 'utf8').digest('hex');
+  // Independent Oracle (P4): recompute the content-addressed scope_fingerprint
+  // with raw `git` + `crypto` (empty-tree baseline), WITHOUT going through
+  // PROVE_MODULE.sourceScopeFingerprint. If the production binding definition
+  // were wrong (wrong pathspec, wrong baseline), this independent recomputation
+  // would disagree with the committed Proof and redden the guard.
+  const fingerprint = independentScopeFingerprint(PROJECT_ROOT);
 
   const contractPath = path.join(PROJECT_ROOT, 'specs/features/verification-harness/04-contract.md');
   const contractRevision = crypto.createHash('sha256').update(fs.readFileSync(contractPath)).digest('hex');
 
-  assert.strictEqual(committed.source_head, scopeHead, 'committed Proof source_head is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
-  assert.strictEqual(committed.source_base, base, 'committed Proof source_base is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
-  assert.strictEqual(committed.diff_fingerprint, fingerprint, 'committed Proof diff_fingerprint is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
+  assert.strictEqual(committed.scope_fingerprint, fingerprint, 'committed Proof scope_fingerprint is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
   assert.strictEqual(committed.contract_revision, contractRevision, 'committed Proof contract_revision is stale (independent Oracle mismatch); rerun prove-cli-surface and commit the new artifact');
 });
 
@@ -544,4 +536,50 @@ test('8. Installed-but-unsupported loopx version reports verified_unreachable (n
   assert.match(obs, /unsupported/i, 'unsupported version must be reported as unsupported');
   assert.match(obs, /2\.4\.0/, 'unsupported version must name the detected version');
   assert.doesNotMatch(obs, /not installed/i, 'unsupported version must not be misreported as not installed');
+});
+
+test('9. Freshness guard survives squash/merge (content-addressed scope_fingerprint, no false positive)', () => {
+  const scratchRoot = makeScratch('vh-prove-squash-');
+  const sourceRoot = prepareSourceCopy(scratchRoot);
+  const sourceScript = path.join(sourceRoot, 'skills/verification-harness/scripts/prove-cli-surface.js');
+  const proofOutDir = path.join(scratchRoot, 'proof-artifacts');
+  const env = { ...process.env, LOOPX_TMP_DIR: path.join(scratchRoot, 'loopx-tmp'), LOOPX_USAGE_PING: '0' };
+
+  // 1. Cold-start Prove on the clean source copy → emits a Proof bound to a
+  //    content-addressed scope_fingerprint.
+  const run = spawnSync(process.execPath, [sourceScript, '--output-dir', proofOutDir], {
+    cwd: sourceRoot,
+    encoding: 'utf8',
+    timeout: 60000,
+    env,
+  });
+  assert.strictEqual(run.status, 0, `Clean source copy Prove must run (status=${run.status}):\n${run.stderr}`);
+  const proof = JSON.parse(fs.readFileSync(path.join(proofOutDir, 'cli-surface-proof.json'), 'utf8'));
+  const committedFingerprint = proof.scope_fingerprint;
+  assert.ok(isHex64(committedFingerprint), 'Prove must emit a content-addressed scope_fingerprint');
+
+  // 2. Simulate squash/merge: `git merge --squash` + commit produces a NEW commit
+  //    whose source-scope TREE is identical to HEAD but whose commit SHA differs.
+  //    Build that commit directly with `git commit-tree` on HEAD's tree (same tree,
+  //    new parent/commit) and advance the branch to it — exactly what landing the
+  //    PR into `main` does to the freshness binding (B1).
+  const headBefore = git(sourceRoot, ['rev-parse', 'HEAD']);
+  const tree = git(sourceRoot, ['rev-parse', 'HEAD^{tree}']);
+  const squashSha = git(sourceRoot, ['commit-tree', tree, '-p', headBefore, '-m', 'squash/merge simulation']);
+  git(sourceRoot, ['update-ref', 'refs/heads/main', squashSha]);
+  git(sourceRoot, ['checkout', '-q', 'main']);
+  const headAfter = git(sourceRoot, ['rev-parse', 'HEAD']);
+  assert.strictEqual(headAfter, squashSha, 'branch must point at the squash commit');
+  assert.notStrictEqual(headAfter, headBefore, 'squash/merge must produce a NEW commit SHA');
+
+  // 3. The freshness guard must NOT false-positive: recomputing the independent
+  //    scope_fingerprint on the squash'd HEAD yields the SAME value as the Proof
+  //    committed before the merge (content is byte-identical; only the commit SHA
+  //    changed). This is the exact regression that previously reddened test 7 in CI.
+  const recomputed = independentScopeFingerprint(sourceRoot);
+  assert.strictEqual(
+    recomputed,
+    committedFingerprint,
+    'scope_fingerprint must be stable across squash/merge (content-addressed, not commit-SHA)'
+  );
 });

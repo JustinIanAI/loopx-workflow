@@ -21,7 +21,7 @@
 
 Preconditions:
 
-- **Surface & Run**: `bin/loopx-flow`, `lib/paths.sh`, and `lib/paths.js` exist. (`./scripts/preflight-check.sh` is a Stage 0 environment precondition run by CI / the operator; `prove-cli-surface` does not drive it.) The harness source worktree must be clean and committed — Prove fails closed on a dirty workspace and records `source_head`, `diff_fingerprint`, and `contract_revision`.
+- **Surface & Run**: `bin/loopx-flow`, `lib/paths.sh`, and `lib/paths.js` exist. (`./scripts/preflight-check.sh` is a Stage 0 environment precondition run by CI / the operator; `prove-cli-surface` does not drive it.) The harness source worktree must be clean and committed — Prove fails closed on a dirty workspace and records a content-addressed `scope_fingerprint` plus `contract_revision` (stable across squash/merge, `ADR-0011` decision 5).
 - **Isolate**: `prove-cli-surface.js` allocates a disposable run directory via `lib/paths.js#createRunDir('prove-cli-surface')` under `LOOPX_TMP_DIR` and sets isolated `HOME`, `LOOPX_TMP_DIR`, and `LOOPX_REGISTRY` for every spawned `bin/loopx-flow` child process.
 - **Drive & Observe**: Output directory `--output-dir <proof-dir>` points outside the disposable sandbox so Proof JSON and Markdown survive teardown.
 
