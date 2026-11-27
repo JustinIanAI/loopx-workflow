@@ -310,6 +310,13 @@ test('Stage B P0-3：并发隔离——不同 pid 落不同目录', () => {
     assert.strictEqual(dir1, dir2, '同一进程内两次取目录应一致（可接续）');
     assert.match(dir1, /review-pr73\//);
     assert.match(dir1, new RegExp(`${process.pid}-`));
+    // 成功清理只删本进程子目录，不删父目录（并发对方的目录不受影响）
+    const fakeOther = dir1 + '-other-pid-not-me';
+    fs.mkdirSync(fakeOther, { recursive: true });
+    fs.writeFileSync(path.join(fakeOther, 'stage1.state.json'), '{}', 'utf8');
+    fs.rmSync(dir1, { recursive: true, force: true });
+    assert.ok(fs.existsSync(path.join(fakeOther, 'stage1.state.json')), '成功清理不得删除父级共享目录');
+    fs.rmSync(fakeOther, { recursive: true, force: true });
   } finally {
     s.restore();
   }

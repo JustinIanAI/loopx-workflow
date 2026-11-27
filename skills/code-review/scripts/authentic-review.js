@@ -2376,11 +2376,12 @@ function main() {
   }
 
   // 成功路径沿用既有不变式：本次运行临时目录零残留。
-  // 阶段状态目录只在失败/中断时保留（供续跑与排障），成功时一并清理；
-  // 需要留档时显式设置 LOOPX_KEEP_TMP=1。
+  // 只清理本次进程自己的状态目录（pid 子目录），绝不删除共享父目录，
+  // 避免并发审查时互相删除对方的 state/output；阶段状态目录只在失败/中断时保留
+  // （供续跑与排障），成功时一并清理；需要留档时显式设置 LOOPX_KEEP_TMP=1。
   if (process.env.LOOPX_KEEP_TMP !== '1') {
-    // 直接算路径而不经 reviewStateDir：成功路径不创建任何新目录
-    const stateDir = path.join(resolveTmpDir(repoRoot), `review-pr${o.pr}`);
+    // 直接算路径而不经 reviewStateDir：成功路径不创建任何新目录；只删本进程的 pid 子目录
+    const stateDir = reviewStateDir(repoRoot, o.pr);
     try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
   }
   console.log(`\n[PASSED] Authentic review pipeline complete (verdict=${verdict}).`);
