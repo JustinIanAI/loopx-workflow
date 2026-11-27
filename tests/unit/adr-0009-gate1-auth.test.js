@@ -7,6 +7,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execSync } = require('node:child_process');
 const h = require('./helpers/m0-sandbox');
 
 const FEATURE = 'gate1-auth';
@@ -33,8 +34,9 @@ exit 0
 
 function gateComments(dir, sha) {
   const commentsFile = path.join(dir, 'comments.json');
+  const specCommit = execSync('git rev-parse HEAD', { cwd: dir }).toString().trim();
   const body = '<!-- loopx-flow:gate1-authorization:' + FEATURE + '@' + sha + ' -->\n' +
-    'gate=1;mode=independent;contract_sha=' + sha + ';spec_commit=' + 'b'.repeat(40) + ';approver=approver1';
+    'gate=1;mode=independent;contract_sha=' + sha + ';spec_commit=' + specCommit + ';approver=approver1';
   fs.writeFileSync(commentsFile, JSON.stringify([{ body, user: { login: 'approver1' } }]));
   return commentsFile;
 }

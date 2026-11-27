@@ -816,7 +816,7 @@ if (missing.length) {
 }
 
 find_gate1_independent_comment() {
-    local feature="$1" pre_sha="$2" executor="$3" branch="feature/$1" repo pr comments
+    local feature="$1" pre_sha="$2" executor="$3" spec_commit="$4" branch="feature/$1" repo pr comments
     repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
     [[ -n "$repo" ]] || return 1
     pr="$(gh pr list --head "$branch" --state open --json number,isDraft --jq '.[0] | select(.isDraft == true) | .number' 2>/dev/null || true)"
@@ -824,7 +824,7 @@ find_gate1_independent_comment() {
     comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null || true)"
     node -e '
 const fs = require("fs");
-const executor = process.argv[1], feature = process.argv[2], preSha = process.argv[3];
+const executor = process.argv[1], feature = process.argv[2], preSha = process.argv[3], specCommit = process.argv[4];
 const raw = fs.readFileSync(0, "utf8").trim();
 const rows = [];
 try {
@@ -851,10 +851,10 @@ for (const row of rows) {
   if (!body.includes(marker) || !login || login === executor) continue;
   const fields = {};
   for (const part of body.split(/[;\n]/)) { const i = part.indexOf("="); if (i <= 0) continue; const k = part.slice(0, i).trim(); if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim(); }
-  if (fields.gate === "1" && fields.mode === "independent" && fields.contract_sha === preSha && fields.approver === login) { process.stdout.write(login); process.exit(0); }
+  if (fields.gate === "1" && fields.mode === "independent" && fields.contract_sha === preSha && fields.spec_commit === specCommit && fields.approver === login) { process.stdout.write(login); process.exit(0); }
 }
 process.exit(1);
-' "$executor" "$feature" "$pre_sha" <<< "$comments"
+' "$executor" "$feature" "$pre_sha" "$spec_commit" <<< "$comments"
 }
 
 # ADR-0019：当前分支对应的 open PR（Gate1/Gate2 GitHub 签名路径使用）。
@@ -864,6 +864,17 @@ current_branch_pr() {
     branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
     [[ -n "$branch" && "$branch" != "HEAD" ]] || return 1
     gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null | head -n1
+}
+
+# ADR-0019：解析 PR 对应 feature。优先 feature/<name> 分支，其次 PR body 的 loopx-meta goal_id（<feature>-goal）。
+resolve_pr_feature() {
+    local pr_id="$1" head_ref="$2" feature="" goal=""
+    if [[ "$head_ref" =~ ^feature/(.+) ]]; then feature="${BASH_REMATCH[1]}"; fi
+    if [[ -z "$feature" ]]; then
+        goal="$(gh pr view "$pr_id" --json body --jq '.body' 2>/dev/null | sed -n 's/.*"goal_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        if [[ "$goal" == *-goal ]]; then feature="${goal%-goal}"; fi
+    fi
+    printf '%s' "$feature"
 }
 
 # ADR-0019：single_owner 的 Gate1 由 accepted_by 本人在 PR 上的 gate=1 评论签发。
@@ -1266,7 +1277,7 @@ fs.writeFileSync(dst, text);
     local dirty
     dirty="$(git status --porcelain --untracked-files=no 2>/dev/null || true)"
     if [[ -n "$dirty" ]]; then
-        rm -f "$temp_contract"
+        rm -f "$temp_contract"; wf_unregister_temp_file "$temp_contract"
         echo "[-] [FAIL-CLOSED] 工作区不干净，Spec-Commit 无法确定；请先提交" >&2
         exit 1
     fi
@@ -1275,7 +1286,7 @@ fs.writeFileSync(dst, text);
     # ADR-0019：--prepare 只打印 GitHub 签名评论模板，零写入。
     if [[ "$prepare" == "true" ]]; then
         [[ "$yes" != "true" ]] || { rm -f "$temp_contract"; echo "[-] [FAIL-CLOSED] 不支持 --yes：--prepare 也不得跳过人工签名" >&2; exit 1; }
-        rm -f "$temp_contract"
+        rm -f "$temp_contract"; wf_unregister_temp_file "$temp_contract"
         wf_unregister_temp_file "$temp_contract"
         if [[ "$mode" == "single_owner" ]]; then
             local prepared_by
@@ -1319,19 +1330,19 @@ fs.writeFileSync(dst, text);
             local confirm_reply=""
             printf '确认以 single_owner (%s) 签署 Gate1 契约授权 [%s]? 请输入 yes 继续: ' "$principal" "$feature"
             if ! IFS= read -r confirm_reply; then
-                rm -f "$temp_contract"
+                rm -f "$temp_contract"; wf_unregister_temp_file "$temp_contract"
                 echo "[-] [FAIL-CLOSED] 未收到交互确认输入，已取消。" >&2
                 exit 1
             fi
             if [[ "$confirm_reply" != "yes" && "$confirm_reply" != "y" && "$confirm_reply" != "YES" ]]; then
-                rm -f "$temp_contract"
+                rm -f "$temp_contract"; wf_unregister_temp_file "$temp_contract"
                 echo "[-] [FAIL-CLOSED] Gate1 授权已取消（需输入 yes 确认）。" >&2
                 exit 1
             fi
         else
             principal="$(find_gate1_single_owner_comment "$feature" "$contract_sha" "$spec_commit" "$accepted_by" || true)"
             if [[ -z "$principal" ]]; then
-                rm -f "$temp_contract"
+                rm -f "$temp_contract"; wf_unregister_temp_file "$temp_contract"
                 echo "[-] [FAIL-CLOSED] 未找到 single_owner 的 GitHub gate=1 授权评论：作者必须是 accepted_by=${accepted_by}，且 contract_sha/spec_commit 与当前一致。" >&2
                 echo "🧭 下一步: 运行 loopx-flow approve contract $feature --prepare，把输出评论粘贴到 PR，然后重跑本命令。" >&2
                 echo "🧭 如确实要走本机 TTY 确认：追加 --interactive。" >&2
@@ -1342,7 +1353,7 @@ fs.writeFileSync(dst, text);
         command -v gh >/dev/null 2>&1 || { echo "[-] [FAIL-CLOSED] independent approve 需要 gh" >&2; exit 1; }
         executor="$(gh_login)"
         [[ -n "$executor" ]] || { echo "[-] [FAIL-CLOSED] 无法读取 gh api user login" >&2; exit 1; }
-        principal="$(find_gate1_independent_comment "$feature" "$contract_sha" "$executor" || true)"
+        principal="$(find_gate1_independent_comment "$feature" "$contract_sha" "$executor" "$spec_commit" || true)"
         [[ -n "$principal" ]] || { echo "[-] [FAIL-CLOSED] independent 缺少有效的第二 GitHub 账号 gate=1 评论（评论 contract_sha 必须等于最终锁定字节的 SHA）" >&2; exit 1; }
     fi
 
@@ -1354,7 +1365,7 @@ fs.writeFileSync(dst, text);
     local goal_id="$feature-goal"
     local configure_out
     if ! configure_out="$(run_loopx configure-goal --goal-id "$goal_id" --progress-review-contract-revision "$contract_sha" --execute 2>&1)"; then
-        rm -f "$temp_contract"
+        rm -f "$temp_contract"; wf_unregister_temp_file "$temp_contract"
         echo "[-] [FAIL-CLOSED] 契约 SHA256 物理锁定失败: $configure_out" >&2
         exit 1
     fi
@@ -2032,11 +2043,13 @@ cmd_release_approve() {
     IFS="%" read -r head_oid head_ref is_draft <<< "$pr_view"
     [[ "$is_draft" != "true" ]] || { echo "[-] [FAIL-CLOSED] PR #$pr_id 仍为 Draft：先 pr ready，再签发 release-approve。" >&2; exit 1; }
     local feature=""
-    if [[ "$head_ref" =~ ^feature/(.+) ]]; then feature="${BASH_REMATCH[1]}"; fi
+    feature="$(resolve_pr_feature "$pr_id" "$head_ref")"
     local contract_sha="none"
     if [[ -n "$feature" ]]; then
         contract_sha="$(contract_sha_for "$feature" || true)"
-        [[ -n "$contract_sha" ]] || { echo "[-] [FAIL-CLOSED] 缺少 feature $feature 的 04-contract.md" >&2; exit 1; }
+        [[ -n "$contract_sha" ]] || { echo "[-] [FAIL-CLOSED] 缺少 feature ${feature} 的 04-contract.md" >&2; exit 1; }
+    else
+        echo "[WARN] 非 feature 分支且 PR body 无 loopx-meta：Gate2 评论不绑定契约（contract_sha=none）。" >&2
     fi
 
     # ADR-0019：--prepare 只打印 GitHub 签名评论模板，零写入。
@@ -2138,6 +2151,7 @@ cmd_merge() {
     if [[ -z "$feature" && "$head_ref" =~ ^feature/(.+) ]]; then
         feature="${BASH_REMATCH[1]}"
     fi
+    if [[ -z "$feature" ]]; then feature="$(resolve_pr_feature "$pr_id" "$head_ref")"; fi
     local auth_mode_val=""
     if [[ -f "$(auth_config_path)" ]]; then
         # 文件在但解析失败或 mode 非法时，禁止退回「无配置」的 reviewDecision 路径（ADR-0009：非法配置即非 0）。

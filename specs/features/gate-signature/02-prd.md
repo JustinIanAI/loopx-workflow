@@ -18,4 +18,4 @@
 - [x] 有效评论路径可无 TTY 完成 Gate1 / Gate2。
 - [x] 作者/SHA/`spec_commit`/mode 任一不符即拒绝。
 - [x] `--interactive` 仍要求 TTY，`--yes` 仍非 0。
-- [x] 四门禁全绿（351 用例）。
+- [x] 四门禁全绿（355 用例）。
