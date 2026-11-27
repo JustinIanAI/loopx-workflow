@@ -477,6 +477,12 @@ async function runStageWithState(options) {
       stopStageHeartbeat(hb);
     }
     const elapsed = Date.now() - startedMs;
+    if (Number(heartbeatIntervalMs) > 0 && elapsed >= Number(heartbeatIntervalMs)) {
+      // wait-out 证据：慢推理在既有预算内被等待完成（或按预算终止），
+      // 同窗口内心跳行可证明等待期间调用方事件循环未被阻塞。
+      appendPipelineLog(repoRoot, pr,
+        `stage=${stage} attempt=${attempt} event=wait_out elapsed_ms=${elapsed} heartbeat_interval_ms=${heartbeatIntervalMs} timeout_ms=${budgetMs} outcome=${(run && (run.error || run.timed_out)) ? 'failed' : 'ok'}`);
+    }
 
     if (run.unavailable) {
       const detail = `${agentBin} CLI unavailable on PATH`;
@@ -554,7 +560,7 @@ async function runStageWithState(options) {
     });
     appendPipelineLog(repoRoot, pr,
       `stage=${stage} attempt=${attempt} event=retry trigger=${errorClass} before_status=failed after_status=retrying next_attempt=${attempt + 1} backoff_ms=${backoff} elapsed_ms=${elapsed}`);
-    if (backoff > 0) sleepSync(backoff);
+    if (backoff > 0) await new Promise((resolve) => setTimeout(resolve, backoff));
   }
 
   return {
@@ -1568,6 +1574,12 @@ async function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, sel
     const result = await new Promise((resolve, reject) => {
       let stdoutAcc = '';
       let stderrAcc = '';
+      // 与改造前 spawnSync 的 maxBuffer 语义对齐：stdout/stderr 分别计数，
+      // 超过 64MB 即视为输出溢出（ENOBUFS），不得当作成功。
+      const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let overflow = false;
       try {
         child = spawn(resolvedBin, args, {
           stdio: ['pipe', 'pipe', 'pipe'],
@@ -1581,8 +1593,16 @@ async function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, sel
       }
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
-      child.stdout.on('data', (chunk) => { stdoutAcc += chunk; });
-      child.stderr.on('data', (chunk) => { stderrAcc += chunk; });
+      child.stdout.on('data', (chunk) => {
+        stdoutBytes += Buffer.byteLength(chunk);
+        if (stdoutBytes > MAX_OUTPUT_BYTES) { overflow = true; try { child.kill('SIGTERM'); } catch (_) { /* ignore */ } return; }
+        stdoutAcc += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderrBytes += Buffer.byteLength(chunk);
+        if (stderrBytes > MAX_OUTPUT_BYTES) { overflow = true; try { child.kill('SIGTERM'); } catch (_) { /* ignore */ } return; }
+        stderrAcc += chunk;
+      });
       child.on('error', (err) => {
         resolve({ __spawn_error: true, error: err && err.message ? err.message : String(err) });
       });
@@ -1594,6 +1614,7 @@ async function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, sel
           stdout: stdoutAcc,
           stderr: stderrAcc,
           timedOut: timedOutFlag,
+          overflow,
         });
       });
       if (prompt != null) {
@@ -1649,8 +1670,10 @@ async function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, sel
     if (novelHostTruncation(diffText, ...truncParts)) {
       return { truncated: true, stdout: modelChannel, stderr, rawStdout, error: 'host truncation marker in model output' };
     }
-    if (result.status !== 0) {
-      const diag = String(stderr || rawStdout || msgOut || '');
+    if (result.status !== 0 || result.overflow) {
+      const diag = result.overflow
+        ? `${String(stderr || rawStdout || msgOut || '').slice(0, 120)} (maxBuffer exceeded 64MB)`
+        : String(stderr || rawStdout || msgOut || '');
       return {
         error: `exit ${result.status}: ${diag.slice(0, 300)}`,
         stdout: modelChannel,
@@ -1658,7 +1681,7 @@ async function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, sel
         rawStdout,
         status: result.status,
         signal: result.signal || null,
-        error_code: null,
+        error_code: result.overflow ? 'ENOBUFS' : null,
         timed_out: false,
         timeout_ms: budget,
         tmp_msg: tmpMsg || null,
