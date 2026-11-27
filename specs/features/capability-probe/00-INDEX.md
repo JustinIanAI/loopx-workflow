@@ -2,8 +2,8 @@
 
 - **Feature**：`capability-probe`
 - **Goal**：`capability-probe-goal`（已由 `loopx bootstrap` 注册，change-quality 已启用）
-- **Current Status**：`Proposed → Implemented`（PR #73）
-- **Contract Status**：`DRAFT (Pending Approval)`
+- **Current Status**: APPROVED (Stage 5 TDD Ready)
+- **Contract Status**: FROZEN & APPROVED
 - **追溯**：`REQ-CAPABILITY-1`、ADR-0015 决策 4、ADR-0010 决策 4 / T2 / T3
 - **PR**：#73（`feat/loopx-capability-probe-w4`）
 

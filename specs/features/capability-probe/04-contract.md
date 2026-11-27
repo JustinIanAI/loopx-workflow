@@ -1,6 +1,6 @@
 # 04-Contract: capability-probe（三层 LoopX 能力探针与 schema 白名单）
 
-- **Contract-Status**: DRAFT (Pending Approval)
+- **Contract-Status**: FROZEN & APPROVED
 - **Spec-Commit**: 由 `loopx-flow approve contract` 写入
 - **追溯**：`REQ-CAPABILITY-1`、ADR-0015 决策 4、ADR-0010 决策 4 / T2 / T3
 
