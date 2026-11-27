@@ -47,9 +47,8 @@ $ LC_ALL=en_US.UTF-8 ./bin/loopx-flow check verification-harness
 exit code: 1
 
 stderr:
-[-] [FAIL-CLOSED] 当前 worktree 无 LoopX registry: <worktree>/.loopx/registry.json
-    可选：(1) 在本 worktree 执行 loopx bootstrap --project "<worktree>"
-          (2) 显式指定 --registry "<...>/loopx-workflow/.loopx/registry.json" 或导出 LOOPX_REGISTRY
+[-] [FAIL-CLOSED] 本地 LoopX registry 缺失: <checkout>/.loopx/registry.json
+    修复指令: loopx bootstrap --project "<checkout>"（或通过 --registry / LOOPX_REGISTRY 显式指定）
 ```
 
-Blocking reason: the isolated Stage A-R3 checkout has no bootstrapped `verification-harness-goal`, and `04-contract.md` is `DRAFT (Pending Approval)` (Gate 1 not frozen). Producing a `change_quality_receipt_v2` requires Gate 1 approval, which is outside this ticket's authorization — therefore no receipt is fabricated and none is asserted.
+Blocking reason: this isolated checkout has no bootstrapped `verification-harness-goal`, and `04-contract.md` is `DRAFT (Pending Approval)` (Gate 1 not frozen). Producing a `change_quality_receipt_v2` requires Gate 1 approval, which is outside this ticket's authorization — therefore no receipt is fabricated and none is asserted.
