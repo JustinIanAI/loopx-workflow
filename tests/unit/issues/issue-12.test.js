@@ -19,8 +19,19 @@ function setupMocks() {
   fs.mkdirSync(LOOPX_TMP, { recursive: true });
   fs.writeFileSync(REGISTRY_FILE, JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
   fs.writeFileSync(path.join(MOCK_BIN_DIR, 'loopx'), `#!/usr/bin/env bash
-echo "$*" >> ${CALLS_LOG}
 args="$*"
+# 能力探针的第 1 层会真实调用 --version / --help：按 loopx 2.3.0 锚点帮助签名应答，再记录业务调用。
+if [[ "$args" == "--version" ]]; then echo "loopx 2.3.0"; exit 0; fi
+if [[ "$args" == *"--help"* ]]; then
+  case "$args" in
+    "todo claim --help") echo "usage: loopx todo claim --goal-id GOAL_ID [options]"; echo "  --goal-id GOAL_ID"; echo "  --todo-id TODO_ID"; echo "  --claim-operation-id CLAIM_OPERATION_ID"; echo "  --claimed-by CLAIMED_BY"; echo "  --agent-id AGENT_ID" ;;
+    "todo complete --help") echo "usage: loopx todo [--format {markdown,json}] --goal-id GOAL_ID"; echo "  --claim-operation-id CLAIM_OPERATION_ID"; echo "  --evidence EVIDENCE" ;;
+    "todo add --help") echo "usage: loopx todo [--format {markdown,json}] --goal-id GOAL_ID"; echo "  --required-write-scope REQUIRED_WRITE_SCOPES"; echo "  --task-domain TASK_DOMAIN"; echo "  --task-repository TASK_REPOSITORY"; echo "  --validation-command VALIDATION_COMMAND"; echo "  --operation-id OPERATION_ID"; echo "  --claim-operation-id CLAIM_OPERATION_ID"; echo "  --task-class {advancement_task,continuous_monitor,user_gate,user_action,blocker}"; echo "  --decision-scope DECISION_SCOPE"; echo "  --decision-outcome {approve,reject,cancel}"; echo "  --global-gate" ;;
+    *) echo "usage: loopx" ;;
+  esac
+  exit 0
+fi
+echo "$*" >> ${CALLS_LOG}
 goal=""; todo=""
 for ((i=1; i<=$#; i++)); do
   case "\${!i}" in
@@ -37,15 +48,19 @@ if [[ "$args" == *"agent-directory"* ]]; then
     cursor="\${cursor%% *}"
   fi
   if [[ "$mode" == "none" ]]; then
-    printf '%s\\n' '{"ok":true,"registered_agent_count":0,"rows":[],"next_cursor":null}'
+    printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":0,"rows":[],"next_cursor":null}'
     exit 0
   fi
   if [[ "$mode" == "claimant-only" ]]; then
-    printf '%s\\n' '{"ok":true,"registered_agent_count":0,"rows":[{"agent_id":"old-claimant","registered":false}],"next_cursor":null}'
+    printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":0,"rows":[{"agent_id":"old-claimant","registered":false}],"next_cursor":null}'
     exit 0
   fi
   if [[ "$mode" == "many" ]]; then
-    printf '%s\\n' '{"ok":true,"registered_agent_count":2,"rows":[{"agent_id":"alpha-agent","registered":true},{"agent_id":"beta-agent","registered":true}],"next_cursor":null}'
+    printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":2,"rows":[{"agent_id":"alpha-agent","registered":true},{"agent_id":"beta-agent","registered":true}],"next_cursor":null}'
+    exit 0
+  fi
+  if [[ "$mode" == "schema-drift" ]]; then
+    printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v9","registered_agent_count":1,"rows":[{"agent_id":"sandbox-analysis-agent","registered":true}],"next_cursor":null}'
     exit 0
   fi
   if [[ "$mode" == "goal-missing" ]]; then
@@ -57,35 +72,35 @@ if [[ "$args" == *"agent-directory"* ]]; then
     exit 1
   fi
   if [[ "$mode" == "truncated-no-cursor" ]]; then
-    printf '%s\\n' '{"ok":true,"registered_agent_count":2,"rows":[{"agent_id":"old-claimant","registered":false}],"next_cursor":null,"omitted_row_count":2}'
+    printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":2,"rows":[{"agent_id":"old-claimant","registered":false}],"next_cursor":null,"omitted_row_count":2}'
     exit 0
   fi
   if [[ "$mode" == "paged-one" || "$mode" == "paged-env" || "$mode" == "paged-many" ]]; then
     if [[ -z "$cursor" ]]; then
       if [[ "$mode" == "paged-one" ]]; then
-        printf '%s\\n' '{"ok":true,"registered_agent_count":1,"rows":[{"agent_id":"old-claimant","registered":false},{"agent_id":"diag-holder","registered":false}],"next_cursor":"diag-holder","omitted_row_count":1}'
+        printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":1,"rows":[{"agent_id":"old-claimant","registered":false},{"agent_id":"diag-holder","registered":false}],"next_cursor":"diag-holder","omitted_row_count":1}'
       else
-        printf '%s\\n' '{"ok":true,"registered_agent_count":2,"rows":[{"agent_id":"alpha-agent","registered":true},{"agent_id":"old-claimant","registered":false}],"next_cursor":"old-claimant","omitted_row_count":1}'
+        printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":2,"rows":[{"agent_id":"alpha-agent","registered":true},{"agent_id":"old-claimant","registered":false}],"next_cursor":"old-claimant","omitted_row_count":1}'
       fi
       exit 0
     fi
     if [[ "$cursor" == "diag-holder" ]]; then
-      printf '%s\\n' '{"ok":true,"registered_agent_count":1,"rows":[{"agent_id":"later-agent","registered":true}],"next_cursor":null}'
+      printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":1,"rows":[{"agent_id":"later-agent","registered":true}],"next_cursor":null}'
       exit 0
     fi
     if [[ "$cursor" == "old-claimant" ]]; then
-      printf '%s\\n' '{"ok":true,"registered_agent_count":2,"rows":[{"agent_id":"later-agent","registered":true}],"next_cursor":null}'
+      printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":2,"rows":[{"agent_id":"later-agent","registered":true}],"next_cursor":null}'
       exit 0
     fi
     printf '%s\\n' '{"ok":false,"error_code":"bad_cursor"}'
     exit 1
   fi
   if [[ "$mode" == "paged-cycle" ]]; then
-    printf '%s\\n' '{"ok":true,"registered_agent_count":2,"rows":[{"agent_id":"old-claimant","registered":false}],"next_cursor":"stuck-cursor"}'
+    printf '%s\\n' '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":2,"rows":[{"agent_id":"old-claimant","registered":false}],"next_cursor":"stuck-cursor"}'
     exit 0
   fi
   owner="\${MOCK_REGISTERED_AGENT:-sandbox-analysis-agent}"
-  printf '{"ok":true,"registered_agent_count":1,"rows":[{"agent_id":"%s","registered":true},{"agent_id":"old-claimant","registered":false}],"next_cursor":null}\\n' "$owner"
+  printf '{"ok":true,"schema_version":"peer_agent_directory_v0","registered_agent_count":1,"rows":[{"agent_id":"%s","registered":true},{"agent_id":"old-claimant","registered":false}],"next_cursor":null}\\n' "$owner"
   exit 0
 fi
 
@@ -214,6 +229,16 @@ test('issue 12: ambiguous, unregistered, missing or corrupt agent-directory fail
   setupMocks();
   const broken = runFlow(['todo', 'claim', 'todo_ab12cd34ef56', '--goal-id', 'broken-goal'], { MOCK_AGENT_DIRECTORY: 'broken' });
   assert.strictEqual(broken.status, 1);
+  assert.doesNotMatch(callsText(), /todo claim/);
+});
+
+test('issue 12: agent-directory schema_version 漂移必须在申领前 fail-closed', () => {
+  setupMocks();
+  const drift = runFlow(['todo', 'claim', 'todo_ab12cd34ef56', '--goal-id', 'multi-goal'], { MOCK_AGENT_DIRECTORY: 'schema-drift' });
+  assert.strictEqual(drift.status, 1, drift.stdout + drift.stderr);
+  assert.match(`${drift.stderr}${drift.stdout}`, /FAIL-CLOSED/);
+  assert.match(`${drift.stderr}${drift.stdout}`, /peer_agent_directory_v9/);
+  assert.match(`${drift.stderr}${drift.stdout}`, /升级契约差异诊断卡/);
   assert.doesNotMatch(callsText(), /todo claim/);
 });
 

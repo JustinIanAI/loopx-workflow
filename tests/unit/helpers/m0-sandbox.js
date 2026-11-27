@@ -24,6 +24,7 @@ function makeSandbox(prefix = 'm0-sandbox-') {
   fs.chmodSync(path.join(dir, 'bin/loopx-flow'), 0o755);
   fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.sh'), path.join(dir, 'lib/paths.sh'));
   fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.js'), path.join(dir, 'lib/paths.js'));
+  fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/capability-probe.js'), path.join(dir, 'lib/capability-probe.js'));
   fs.writeFileSync(path.join(dir, 'README.md'), '# sandbox\n');
   fs.writeFileSync(path.join(dir, '.gitignore'), '.loopx/\n');
   fs.writeFileSync(path.join(dir, '.loopx/registry.json'), JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
@@ -88,7 +89,7 @@ function mock(dir, name, body) {
 }
 
 function mockLoopx(dir, body) {
-  return mock(dir, 'loopx', 'echo "$*" >> "' + path.join(dir, 'loopx-calls.log') + '"\n' + body);
+  return mock(dir, 'loopx', 'echo "$*" >> "' + path.join(dir, 'loopx-calls.log') + '"\n' + require('./capability-stub').HELP_PRELUDE + body);
 }
 
 function mockGh(dir, body) {
@@ -124,6 +125,7 @@ function registryWithGoal(dir, goalId, contractSha) {
 
 function userGateTodos(sha, evidence, outcome = 'approve') {
   return JSON.stringify({
+    projection_envelope: { schema_version: 'loopx_projection_envelope_v0' },
     todos: [{
       task_class: 'user_gate',
       decision_outcome: outcome,
