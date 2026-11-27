@@ -1,6 +1,6 @@
 # capability-probe 切片验收
 
-- **Goal**: `loopx-capability-probe-goal`
+- **Goal**: `capability-probe-goal`
 - **追溯**：`REQ-CAPABILITY-1`、ADR-0015 决策 4、ADR-0010 决策 4 / T2 / T3
 
 ## 切片

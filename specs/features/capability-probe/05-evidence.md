@@ -1,7 +1,7 @@
 # capability-probe 门禁与质量凭据
 
 > 本文件按 AGENTS.md 六状态口径记录本地证据。LoopX `change-quality` 收据当前 **deferred**（原因见末节），
-> 待 Goal 注册后由 `skills/code-review/scripts/ingest-to-loopx-quality.js` 重新生成并覆盖本文件。
+> 待 Gate1 冻结契约后由 `loopx-flow check`（经 `ingest-to-loopx-quality.js`）生成并覆盖本文件。
 
 - **日期**：2026-11-27
 - **基线**：`origin/main@491440c`（PR #80 合并后）
@@ -43,7 +43,7 @@
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `loopx-flow check` / `change-quality record` | **deferred** | Goal `loopx-capability-probe-goal` 未在 `.loopx/registry.json` 注册；`loopx configure-goal` 返回 `goal_id not found`，无法 `change-quality prepare`。不伪造收据。 |
+| `loopx-flow check` / `change-quality record` | **deferred** | Goal 已注册且 `change-quality-strict-receipt` 已启用；`loopx-flow check` 先执行 `gate verify contract`，须等 Gate1 冻结契约后才能生成严格收据。不伪造收据。 |
 | `loopx integration-branch` | **deferred** | 本环境无工作区 integration registry；分支基于 `origin/main@491440c`，GitHub `mergeStateStatus` 由平台判定。 |
 
 ## 复审要求

@@ -1,7 +1,7 @@
 # capability-probe 审阅总览
 
 - **Feature**：`capability-probe`
-- **Goal**：`loopx-capability-probe-goal`（目标值；当前 registry 未注册，见 `05-evidence.md`）
+- **Goal**：`capability-probe-goal`（已由 `loopx bootstrap` 注册，change-quality 已启用）
 - **Current Status**：`Proposed → Implemented`（PR #73）
 - **Contract Status**：`DRAFT (Pending Approval)`
 - **追溯**：`REQ-CAPABILITY-1`、ADR-0015 决策 4、ADR-0010 决策 4 / T2 / T3
