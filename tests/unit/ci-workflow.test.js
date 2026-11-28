@@ -4,6 +4,7 @@
  *
  * 断言 .github/workflows/ci.yml：
  *   - pull_request 与 push main 触发；ubuntu-latest；Node 22（engines >=22.22.3）；
+ *   - Node 25 独立作业覆盖第二主版本（默认 test reporter 随主版本漂移）；
  *   - job id four-gates + job name 恰好为 "Four Gates"（分支保护的 required status check context）；
  *   - npm ci 后分别跑 typecheck / lint / build / test，且不得 continue-on-error / 无权限提升。
  */
@@ -44,12 +45,16 @@ test('4. 四门禁步骤：npm ci + typecheck/lint/build/test', () => {
   const yml = readWorkflow();
   assert.match(yml, /run:\s*npm ci\b/, '必须用 npm ci 安装依赖');
   for (const gate of ['typecheck', 'lint', 'build', 'test']) {
-    assert.strictEqual(
-      yml.includes('npm run ' + gate),
-      true,
-      '缺少 npm run ' + gate + ' 步骤'
-    );
+    const runs = yml.split('npm run ' + gate).length - 1;
+    assert.ok(runs >= 2, `每个 CI 作业都必须运行 npm run ${gate}（双版本各一次），实际出现 ${runs} 次`);
   }
+});
+
+test('4b. Node 25 作业：覆盖第二主版本且不占用 required check 名', () => {
+  const yml = readWorkflow();
+  assert.match(yml, /node-version:\s*['"]?25['"]?/, '必须覆盖 Node 25（默认 reporter 漂移的第二主版本）');
+  assert.match(yml, /^ {2}four-gates-node25:\s*$/m, 'Node 25 必须是独立作业');
+  assert.match(yml, /^ {4}name:\s*Four Gates \(Node 25\)\s*$/m, 'Node 25 作业名不得等于 required context "Four Gates"');
 });
 
 test('5. 状态检查 context：job id four-gates + job name 恰好 "Four Gates"', () => {
