@@ -749,6 +749,73 @@ auth_accepted_at() {
     node -e 'const fs=require("fs");const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write((d.single_owner_risk_acceptance||{}).accepted_at||"")' "$(auth_config_path)" 2>/dev/null || true
 }
 
+# ADR-0021：Gate2 重绑（默认关闭）。仅当配置显式写 "patch_id" 时启用。
+# 背景：仓库开了 strict（必须与 base 同步才能合），合入任何一个 PR 后其余 PR 全部 BEHIND；
+# 更新分支会换 head，而 gate=2 签名绑 head → 已签授权集体作废，作者被迫为同一份改动反复签字。
+gate2_rebind_mode() {
+    node -e 'const fs=require("fs");try{const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(String(d.gate2_rebind||""))}catch(_){}' "$(auth_config_path)" 2>/dev/null || true
+}
+
+# 候选签名：其余字段全对齐、只有 head 不同的 gate=2 评论，输出其 head（每行一个）。
+# 与 gate_comment_author 同源语义（同作者、同 mode/contract_sha/risk_acceptance），只在 head 上放宽。
+gate2_rebind_candidates() {
+    local comments="$1" pr_id="$2" head_oid="$3" accepted_by="$4" contract_sha="$5" risk="$6"
+    node -e '
+const fs = require("fs");
+const [pr, head, acceptedBy, contractSha, risk] = process.argv.slice(1);
+const prefix = "<!-- loopx-flow:release-authorization:" + pr + "@";
+const raw = fs.readFileSync(0, "utf8").trim();
+const rows = [];
+try {
+  let i = 0;
+  while (i < raw.length) {
+    while (i < raw.length && /\s/.test(raw[i])) i++;
+    if (i >= raw.length) break;
+    if (raw[i] !== "[") process.exit(2);
+    let depth = 0, inStr = false, esc = false, start = i;
+    for (; i < raw.length; i++) {
+      const c = raw[i];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
+      if (c === "\"") { inStr = true; continue; }
+      if (c === "[") depth++;
+      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
+    }
+    if (depth !== 0) process.exit(2);
+    rows.push(...JSON.parse(raw.slice(start, i)));
+  }
+} catch (_) { process.exit(2); }
+const seen = new Set();
+for (const row of rows) {
+  const body = String(row.body || ""), login = String((row.user || {}).login || "");
+  if (login !== acceptedBy || !body.includes(prefix)) continue;
+  const fields = {};
+  for (const part of body.split(/[;\n]/)) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    const k = part.slice(0, i).trim();
+    if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim();
+  }
+  if (fields.gate !== "2" || fields.mode !== "single_owner" || fields.principal !== acceptedBy) continue;
+  if (fields.contract_sha !== contractSha || fields.risk_acceptance !== risk) continue;
+  if (/^[0-9a-f]{40}$/.test(fields.head || "") && fields.head !== head && !seen.has(fields.head)) {
+    seen.add(fields.head);
+    process.stdout.write(fields.head + "\n");
+  }
+}
+' "$pr_id" "$head_oid" "$accepted_by" "$contract_sha" "$risk" <<< "$comments"
+}
+
+# 判定实现见 lib/gate2-rebind.js（patch-id 语义与边界都在那里，单测直接覆盖）。
+gate2_rebind_allowed() {
+    local signed="$1" current="$2" base_ref="$3"
+    [[ "$(gate2_rebind_mode)" == "patch_id" ]] || return 1
+    [[ -n "$signed" && -n "$current" && -n "$base_ref" ]] || return 1
+    [[ "$signed" != "$current" ]] || return 1
+    # 只丢 stdout（判定结果由退出码承载）；stderr 必须透传，否则 fetch 失败的告警
+    # 会和「指纹不等」在错误面上混在一起，用户无法判断是离线还是改动真的变了。
+    LOOPX_REPO_ROOT="$PROJECT_ROOT" node "$WORKFLOW_ROOT/lib/gate2-rebind.js" same-change "origin/$base_ref" "$signed" "$current" >/dev/null
+}
+
 gh_login() {
     gh api user --jq .login 2>/dev/null || gh api user -q .login 2>/dev/null || true
 }
@@ -1166,7 +1233,7 @@ process.exit(rows.some((r) => String(r.body || "").includes(marker)) ? 0 : 1);
 
 # Mode B：release-authorization 评论必须绑定当前 head、当前契约 SHA 与 accepted_by（ADR-0012 决策 10）
 release_authorization_ok() {
-    local pr_id="$1" head_oid="$2" contract_sha="$3" repo comments accepted_by accepted_at risk
+    local pr_id="$1" head_oid="$2" contract_sha="$3" repo comments accepted_by accepted_at risk candidates candidate base_ref
     [[ "$(auth_mode)" == "single_owner" ]] || return 1
     accepted_by="$(auth_accepted_by)"
     accepted_at="$(auth_accepted_at)"
@@ -1176,9 +1243,30 @@ release_authorization_ok() {
     [[ -n "$repo" ]] || return 1
     comments="$(gh api "repos/$repo/issues/$pr_id/comments" --paginate 2>/dev/null || true)"
     # 输出被丢弃：本函数只回 0/1，匹配到的 login 不进入调用方 stdout。
-    gate_comment_author "$comments" "<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->" \
+    if gate_comment_author "$comments" "<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->" \
         eq "$accepted_by" principal \
-        gate=2 mode=single_owner head="$head_oid" contract_sha="$contract_sha" risk_acceptance="$risk" >/dev/null
+        gate=2 mode=single_owner head="$head_oid" contract_sha="$contract_sha" risk_acceptance="$risk" >/dev/null; then
+        return 0
+    fi
+    # ADR-0021（默认关闭）：head 不匹配时，若其余字段全对齐且改动指纹一致，复用既有签名。
+    [[ "$(gate2_rebind_mode)" == "patch_id" ]] || return 1
+    # `|| true`：本脚本是 set -euo pipefail，解析器遇到非 JSON（如代理返回 HTML 错误页）
+    # 会非 0 退出；不加兜底会让整个 merge 以裸退出码 2 结束，丢掉下面的 fail-closed 文案。
+    if ! candidates="$(gate2_rebind_candidates "$comments" "$pr_id" "$head_oid" "$accepted_by" "$contract_sha" "$risk")"; then
+        echo "[i] Gate2 重绑候选解析失败（评论不是合法 JSON），按 fail-closed 处理。" >&2
+        return 1
+    fi
+    [[ -n "$candidates" ]] || return 1
+    base_ref="$(gh pr view "$pr_id" --json baseRefName --jq .baseRefName 2>/dev/null || true)"
+    [[ -n "$base_ref" ]] || return 1
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        if gate2_rebind_allowed "$candidate" "$head_oid" "$base_ref"; then
+            echo -e "${YELLOW}[WARN] Gate2 重绑（ADR-0021）：head ${candidate:0:8} -> ${head_oid:0:8}，本 PR 改动 patch-id 一致，复用既有 gate=2 签名。${NC}" >&2
+            return 0
+        fi
+    done <<< "$candidates"
+    return 1
 }
 
 # Mode A：非作者 formal review APPROVED 且 review commit == 当前 head，PR 非 Draft（ADR-0012 决策 2②）

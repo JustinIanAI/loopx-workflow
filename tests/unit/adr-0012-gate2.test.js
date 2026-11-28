@@ -16,6 +16,8 @@ const RISK = { accepted_by: 'owner', accepted_at: '2026-11-12T00:00:00Z' };
 
 function setup(opts = {}) {
   const dir = h.makeSandbox('adr12-');
+  // ADR-0021 重绑需要真实 commit：调用方可在写替身之前把沙箱仓库的历史造好。
+  const prepared = typeof opts.prepareRepo === 'function' ? opts.prepareRepo(dir) : null;
   const mode = opts.mode || 'independent';
   const capsule = h.writeCapsule(dir, FEATURE);
   const contractSha = capsule.contractSha;
@@ -23,7 +25,8 @@ function setup(opts = {}) {
   fs.writeFileSync(path.join(dir, 'scripts/setup-branch-protection.sh'), '#!/usr/bin/env bash\nexit $(cat "$(dirname "$0")/../bp-exit" 2>/dev/null || echo 0)\n', { mode: 0o755 });
   fs.writeFileSync(path.join(dir, 'bp-exit'), String(opts.bpExit || 0));
 
-  const head = opts.head || HEAD;
+  const head = (prepared && prepared.head) || opts.head || HEAD;
+  const baseRefName = (prepared && prepared.baseRefName) || 'main';
   const headRef = opts.headRef || ('feature/' + FEATURE);
   const draft = opts.draft === true ? 'true' : 'false';
   const decision = opts.decision || 'APPROVED';
@@ -46,6 +49,7 @@ function setup(opts = {}) {
     'if [[ "$1" == "api" && "$2" == "user" ]]; then echo "' + login + '"; exit 0; fi',
     'if [[ "$1" == "pr" && "$2" == "view" ]]; then',
     '  args="$*"',
+    '  if [[ "$args" == *"baseRefName"* && "$args" != *"headRefOid"* ]]; then echo "' + baseRefName + '"; exit 0; fi',
     '  if [[ "$args" == *"reviews,author,reviewDecision,isDraft"* ]]; then cat "' + files.reviews + '"; exit 0; fi',
     '  if [[ "$args" == *"state,mergedAt,reviewDecision,headRefOid,headRefName,baseRefName"* ]]; then echo "' + state + '%%' + decision + '%' + head + '%' + headRef + '%main"; exit 0; fi',
     '  if [[ "$args" == *"headRefOid,headRefName,isDraft"* ]]; then echo "' + head + '%' + headRef + '%' + draft + '"; exit 0; fi',
@@ -67,7 +71,7 @@ function setup(opts = {}) {
   ].join('\n');
   h.mockLoopx(dir, loopx);
 
-  return { dir, contractSha, files };
+  return { dir, contractSha, files, signedHead: prepared ? prepared.signedHead : null, head };
 }
 
 function releaseComment(contractSha, opts = {}) {
@@ -328,4 +332,96 @@ test('P0-B：gh pr merge 携带 --match-head-commit，single_owner 校验操作�
   const flowSrc = fs.readFileSync(path.join(h.PROJECT_ROOT, 'bin/loopx-flow'), 'utf8');
   assert.match(flowSrc, /签署 Gate1 契约授权[\s\S]*read -r confirm_reply/);
   assert.match(flowSrc, /签发 Gate2 发布授权[\s\S]*read -r confirm_reply/);
+});
+
+// --- ADR-0021：Gate2 重绑（默认关闭）在真实 merge 入口上的接线 ---
+// 纯函数层面由 tests/unit/gate2-rebind.test.js 覆盖；这里锁住「开关、候选筛选、
+// WARN 与 fail-closed 接线」——即 reviewer 指出的"安全敏感分支无自动化验证"。
+
+function enableRebind(dir) {
+  const p = path.join(dir, 'loopx-workflow.config.json');
+  const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+  cfg.gate2_rebind = 'patch_id';
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+}
+
+test('Mode B + gate2_rebind=patch_id：仅 base 前进换 head → 复用签名并打 WARN', () => {
+  const { dir, contractSha, signedHead, head } = setup({
+    mode: 'single_owner',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] }),
+    prepareRepo: (d) => h.withRebindHistory(d),
+  });
+  try {
+    assert.notStrictEqual(head, signedHead, '沙箱历史必须换过 head');
+    enableRebind(dir);
+    fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment(contractSha, { head: signedHead }));
+
+    const r = h.run(dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stderr, /Gate2 重绑/, '命中重绑必须在 stderr 打印 WARN');
+    assert.match(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), /merged/);
+  } finally { h.cleanup(dir); }
+});
+
+test('Mode B 默认关闭：同样的换 head 不得重绑', () => {
+  const { dir, contractSha, signedHead } = setup({
+    mode: 'single_owner',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] }),
+    prepareRepo: (d) => h.withRebindHistory(d),
+  });
+  try {
+    fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment(contractSha, { head: signedHead }));
+    const r = h.run(dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1, '开关未开时必须与改动前逐字等价地 fail-closed');
+    assert.match(r.stderr + r.stdout, /release-authorization/);
+    assert.doesNotMatch(r.stderr, /Gate2 重绑/);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8').trim(), '', '不得调用 gh pr merge');
+  } finally { h.cleanup(dir); }
+});
+
+test('Mode B + gate2_rebind：签署后改动内容 → 指纹不同，仍 fail-closed', () => {
+  const { dir, contractSha, signedHead } = setup({
+    mode: 'single_owner',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] }),
+    prepareRepo: (d) => h.withRebindHistory(d, { currentContent: 'export const a = 2;\n' }),
+  });
+  try {
+    enableRebind(dir);
+    fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment(contractSha, { head: signedHead }));
+    const r = h.run(dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stderr, /Gate2 重绑/);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8').trim(), '');
+  } finally { h.cleanup(dir); }
+});
+
+test('Mode B + gate2_rebind：评论不是合法 JSON → fail-closed 有文案，不得裸退出 2', () => {
+  const { dir } = setup({
+    mode: 'single_owner',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] }),
+    prepareRepo: (d) => h.withRebindHistory(d),
+  });
+  try {
+    enableRebind(dir);
+    fs.writeFileSync(path.join(dir, 'comments.json'), '<html>proxy error</html>');
+    const r = h.run(dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.notStrictEqual(r.status, 0, '解析失败必须非 0');
+    assert.match(r.stderr + r.stdout, /fail-closed|FAIL-CLOSED/i, '不得以裸退出码结束而丢掉 fail-closed 文案');
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), '', '失败路径不得调用 gh pr merge');
+  } finally { h.cleanup(dir); }
+});
+
+test('Mode B + gate2_rebind：contract_sha 不符的评论永不进入指纹判定', () => {
+  const { dir, signedHead } = setup({
+    mode: 'single_owner',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] }),
+    prepareRepo: (d) => h.withRebindHistory(d),
+  });
+  try {
+    enableRebind(dir);
+    fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment('0'.repeat(64), { head: signedHead }));
+    const r = h.run(dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stderr, /Gate2 重绑/);
+  } finally { h.cleanup(dir); }
 });

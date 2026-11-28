@@ -399,3 +399,380 @@ test('Stage B P0：跨进程续跑——新进程发现上一轮候选目录并�
     s.restore();
   }
 });
+
+// --- 并发隔离（实测事故）---
+// 两个 review 进程同时跑同一 PR：后者经 discoverPriorStateDir 接管前者的 <pid>-<hex>
+// 子目录，并在成功清理时把它删掉 → 前者读 stage1.attempt*.out.txt ENOENT → fail-closed
+// → 用户重试 → 再撞。以下三条锁死"活进程目录不接管 / 不删除 / 跳过留痕"。
+
+function clearResumeMemo(ar) {
+  if (ar.reviewStateDir._memo) {
+    for (const k of Object.keys(ar.reviewStateDir._memo)) delete ar.reviewStateDir._memo[k];
+  }
+}
+
+function withLiveChild(fn) {
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+  return Promise.resolve()
+    .then(() => fn(child.pid))
+    .finally(() => { try { child.kill('SIGKILL'); } catch (_) { /* ignore */ } });
+}
+
+function listStateDirs(base) {
+  return fs.readdirSync(base, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name);
+}
+
+test('并发隔离：所有者进程存活时，其状态目录不得被接管', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    await withLiveChild(async (livePid) => {
+      const base = path.join(s.dir, 'tmp', 'review-pr73');
+      const liveName = `${livePid}-abcdef01`;
+      const liveDir = path.join(base, liveName);
+      fs.mkdirSync(liveDir, { recursive: true });
+      fs.writeFileSync(path.join(liveDir, 'stage1.state.json'), JSON.stringify({
+        schema_version: 'loopx_flow_review_stage_state_v1',
+        pr: 73,
+        stage: 'stage1',
+        head_oid: HEAD,
+        status: 'failed',
+        error_class: 'ENOENT',
+        attempts_total: 1,
+        attempt: 1,
+      }), 'utf8');
+
+      clearResumeMemo(ar);
+      let calls = 0;
+      const r = await runStageWithState(params(s, {
+        runFn: () => { calls += 1; return { stdout: OK_JSON, stderr: '', rawStdout: OK_JSON }; },
+      }));
+      assert.strictEqual(r.ok, true);
+      assert.strictEqual(calls, 1);
+
+      const names = listStateDirs(base);
+      assert.ok(names.includes(liveName), '活进程目录必须原样保留');
+      assert.strictEqual(names.length, 2, '不得复用活进程目录：本次运行必须另建自己的 <pid>-<hex> 子目录');
+      assert.ok(names.some((n) => n.startsWith(`${process.pid}-`)), '本次运行目录必须是自己的 pid 子目录');
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+test('并发隔离：跳过活进程目录必须落 pipeline.log（可排障）', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    await withLiveChild(async (livePid) => {
+      const base = path.join(s.dir, 'tmp', 'review-pr73');
+      const liveName = `${livePid}-0badf00d`;
+      fs.mkdirSync(path.join(base, liveName), { recursive: true });
+      fs.writeFileSync(path.join(base, liveName, 'stage1.state.json'), '{}', 'utf8');
+
+      clearResumeMemo(ar);
+      const r = await runStageWithState(params(s, {
+        runFn: () => ({ stdout: OK_JSON, stderr: '', rawStdout: OK_JSON }),
+      }));
+      assert.strictEqual(r.ok, true);
+
+      const log = fs.readFileSync(pipelineLogPath(s.dir, 73), 'utf8');
+      assert.match(log, /event=resume_skipped reason=owner_process_alive/);
+      assert.ok(log.includes(liveName), '日志必须点名被跳过的目录，否则"为什么没续上"无迹可查');
+      assert.ok(log.includes(`owner_pid=${livePid}`));
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+test('并发隔离：removableStateDir 只放行本进程创建的或所有者已死的目录', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    await withLiveChild(async (livePid) => {
+      const base = path.join(s.dir, 'tmp', 'review-pr73');
+      const liveDir = path.join(base, `${livePid}-1234abcd`);
+      const deadDir = path.join(base, '99999999-8765fedc');
+      fs.mkdirSync(liveDir, { recursive: true });
+      fs.mkdirSync(deadDir, { recursive: true });
+
+      assert.strictEqual(ar.stateDirOwnerPid(liveDir), livePid);
+      assert.strictEqual(ar.stateDirOwnerPid('/no/pid/here'), null);
+      assert.strictEqual(ar.pidIsAlive(livePid), true);
+      assert.strictEqual(ar.pidIsAlive(99999999), false);
+
+      const memo = {};
+      Object.defineProperty(ar.reviewStateDir, '_memo', { value: memo, writable: true, configurable: true });
+
+      memo[`${s.dir}|73`] = liveDir;
+      assert.strictEqual(ar.removableStateDir(s.dir, 73), null, '活进程目录不得删除');
+
+      memo[`${s.dir}|73`] = deadDir;
+      assert.strictEqual(ar.removableStateDir(s.dir, 73), deadDir, '所有者已死的目录可清理');
+
+      const own = ar.reviewStateDir(s.dir, 73);
+      assert.strictEqual(ar.removableStateDir(s.dir, 73), own, '本进程创建的目录可清理');
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+// --- 崩溃残留目录的原子认领（复审 follow_up #1）---
+// 事故后「立刻重试两次」：两个新进程同时 discover 同一残留目录（所有者已死），
+// 若无排他认领会共同写 attempt 输出、先结束的整删目录 → 原 ENOENT 竞态重现。
+
+function writePriorState(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'stage1.state.json'), JSON.stringify({
+    schema_version: 'loopx_flow_review_stage_state_v1',
+    pr: 73,
+    stage: 'stage1',
+    head_oid: HEAD,
+    status: 'failed',
+    error_class: 'ENOENT',
+    attempts_total: 1,
+    attempt: 1,
+  }), 'utf8');
+}
+
+function withClaimingChild(dir, fn) {
+  const { spawn } = require('node:child_process');
+  const code = 'const ar = require(process.argv[1]);'
+    + 'const ok = ar.claimPriorStateDir(process.argv[2]);'
+    + 'process.stdout.write((ok ? "CLAIMED" : "REFUSED") + "\\n");'
+    + 'setTimeout(() => {}, 20000);';
+  const child = spawn(process.execPath, ['-e', code, SRC, dir], { stdio: ['ignore', 'pipe', 'ignore'] });
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    child.stdout.on('data', (chunk) => {
+      buf += chunk;
+      if (buf.includes('\n')) resolve({ child, out: buf.trim() });
+    });
+    child.on('error', reject);
+  }).then((v) => fn(v.child, v.out)).finally(() => { try { child.kill('SIGKILL'); } catch (_) { /* ignore */ } });
+}
+
+
+function withRacingClaimChildren(dirs, fn) {
+  const { spawn } = require('node:child_process');
+  const code = 'const ar = require(process.argv[1]);'
+    + 'const dir = process.argv[2];'
+    + 'process.stdout.write("READY\\n");'
+    + 'process.stdin.once("data", () => {'
+    + '  const ok = ar.claimPriorStateDir(dir);'
+    + '  process.stdout.write((ok ? "CLAIMED" : "REFUSED") + "\\n");'
+    + '  setTimeout(() => {}, 20000);'
+    + '});';
+  const children = dirs.map((dir) => spawn(process.execPath, ['-e', code, SRC, dir], { stdio: ['pipe', 'pipe', 'ignore'] }));
+  const waitFor = (child, tokens) => new Promise((resolve, reject) => {
+    let buf = '';
+    child.stdout.on('data', (chunk) => {
+      buf += chunk;
+      const hit = tokens.find((t) => buf.includes(t));
+      if (hit) resolve(hit);
+    });
+    child.on('error', reject);
+  });
+  return Promise.all(children.map((c) => waitFor(c, ['READY'])))
+    .then(() => {
+      // 同一时刻发令：两个子进程在 claimPriorStateDir 内真实交错
+      for (const c of children) c.stdin.write('go\n');
+      return Promise.all(children.map((c) => waitFor(c, ['CLAIMED', 'REFUSED'])));
+    })
+    .then((results) => fn(results))
+    .finally(() => { for (const c of children) { try { c.kill('SIGKILL'); } catch (_) { /* ignore */ } } });
+}
+
+test('原子认领：所有者已死的残留目录可被新进程抢占（陈旧认领不阻止续跑）', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const deadDir = path.join(base, '99999-deadbeef');
+    writePriorState(deadDir);
+    // 上一轮进程留下的陈旧认领（持有者早已死亡）
+    fs.mkdirSync(path.join(deadDir, 'owner.lock'), { recursive: true });
+    fs.writeFileSync(path.join(deadDir, 'owner.lock', 'owner'), JSON.stringify({
+      pid: 99999, host: os.hostname(), started_at: '2026-01-01T00:00:00Z',
+    }) + '\n', 'utf8');
+
+    clearResumeMemo(ar);
+    assert.strictEqual(ar.discoverPriorStateDir(s.dir, 73), deadDir, '陈旧认领必须可被抢占，跨进程续跑不能因此失效');
+    const owner = JSON.parse(fs.readFileSync(path.join(deadDir, 'owner.lock', 'owner'), 'utf8'));
+    assert.strictEqual(owner.pid, process.pid, '抢占后认领必须归属本进程');
+    assert.strictEqual(owner.host, os.hostname(), 'ADR-0017 D4：认领必须记录 host');
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：另一存活进程持有认领时，本次运行不接管该目录并留痕', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const contendedDir = path.join(base, '99999-feedface');
+    writePriorState(contendedDir);
+
+    await withClaimingChild(contendedDir, async (child, out) => {
+      assert.strictEqual(out, 'CLAIMED', '子进程应成为认领持有者');
+      assert.strictEqual(ar.claimPriorStateDir(contendedDir), false, '同一目录只能有一个持有者：认领必须是排他的');
+
+      clearResumeMemo(ar);
+      const r = await runStageWithState(params(s, {
+        runFn: () => ({ stdout: OK_JSON, stderr: '', rawStdout: OK_JSON }),
+      }));
+      assert.strictEqual(r.ok, true);
+
+      const log = fs.readFileSync(pipelineLogPath(s.dir, 73), 'utf8');
+      assert.match(log, /event=resume_skipped reason=claimed_by_live_process/);
+      assert.ok(log.includes(`holder_pid=${child.pid}`), '日志必须点名认领持有者，否则排障只能靠猜');
+
+      const names = listStateDirs(base);
+      assert.strictEqual(names.length, 2, '被他人认领的目录不得复用：本次运行必须另建自己的 pid 子目录');
+      assert.ok(names.some((n) => n.startsWith(`${process.pid}-`)));
+      assert.ok(names.includes('99999-feedface'), '他人持有中的目录必须原样保留');
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：空 owner 的认领目录在宽限期内不得被抢占（发布窗口不可被利用）', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-cafebabe');
+    writePriorState(dir);
+    fs.mkdirSync(path.join(dir, 'owner.lock'), { recursive: true }); // 尚无 owner，恰在发布窗口
+    assert.strictEqual(ar.claimPriorStateDir(dir), false, '刚出现且没有 owner 的认领不得被当作陈旧抢占');
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：陈旧空 owner 认领（旧版本崩溃残留）可被抢占', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-cafed00d');
+    writePriorState(dir);
+    const claimDir = path.join(dir, 'owner.lock');
+    fs.mkdirSync(claimDir, { recursive: true });
+    const old = new Date(Date.now() - 60000);
+    fs.utimesSync(claimDir, old, old);
+    assert.strictEqual(ar.claimPriorStateDir(dir), true, '超过宽限的空 owner 残留必须可抢占，否则续跑永久卡死');
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：持有者存活但认领超龄（ADR-0017 D4 的 pid 复用兜底）一律视为陈旧', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-staleage');
+    writePriorState(dir);
+    await withClaimingChild(dir, async (child, out) => {
+      assert.strictEqual(out, 'CLAIMED');
+      const claimDir = path.join(dir, 'owner.lock');
+      const old = new Date(Date.now() - 5 * 60 * 60 * 1000); // 超过默认 2 × REVIEW_TIMEOUT_MS_MAX
+      fs.utimesSync(claimDir, old, old);
+      assert.strictEqual(ar.claimPriorStateDir(dir), true, '超龄认领必须可被抢占，否则 pid 复用会让残留目录永久卡死');
+      const audit = ar.claimTakeoverAudit();
+      assert.strictEqual(audit[audit.length - 1].reason, 'host_live_over_stale', '同机 pid 存活但认领超龄的抢占同样必须留痕');
+      const owner = JSON.parse(fs.readFileSync(path.join(claimDir, 'owner'), 'utf8'));
+      assert.strictEqual(owner.pid, process.pid);
+      assert.notStrictEqual(owner.pid, child.pid);
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+test('所有权口径：新建运行目录同样发布 owner.lock', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const dir = ar.reviewStateDir(s.dir, 73);
+    const ownerFile = path.join(dir, 'owner.lock', 'owner');
+    assert.ok(fs.existsSync(ownerFile), '新建目录必须与复用目录使用同一套认领口径（ADR-0017 D4）');
+    const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'));
+    assert.strictEqual(owner.pid, process.pid);
+  } finally {
+    s.restore();
+  }
+});
+
+test('跨主机认领：新鲜的外机认领不得被抢占，超龄才可并留痕', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-foreign1');
+    writePriorState(dir);
+    const claimDir = path.join(dir, 'owner.lock');
+    fs.mkdirSync(claimDir, { recursive: true });
+    fs.writeFileSync(path.join(claimDir, 'owner'), JSON.stringify({
+      pid: 99999, host: 'other-machine', started_at: '2026-01-01T00:00:00Z',
+    }), 'utf8');
+    assert.strictEqual(ar.claimPriorStateDir(dir), false, '跨主机无法核验存活，新鲜认领一律不得抢占');
+
+    const old = new Date(Date.now() - 5 * 60 * 60 * 1000);
+    fs.utimesSync(claimDir, old, old);
+    const before = ar.claimTakeoverAudit().length;
+    assert.strictEqual(ar.claimPriorStateDir(dir), true, '超龄外机认领必须可抢占，否则共享 tmp 下永久卡死');
+    const audit = ar.claimTakeoverAudit();
+    assert.strictEqual(audit.length, before + 1, '跨主机抢占必须留审计行');
+    assert.strictEqual(audit[before].holder.host, 'other-machine');
+    assert.strictEqual(audit[before].reason, 'foreign_host_stale');
+  } finally {
+    s.restore();
+  }
+});
+
+test('pid 复用兜底：目录名 pid 存活但目录超龄，可被接管与清理', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    await withLiveChild(async (livePid) => {
+      const base = path.join(s.dir, 'tmp', 'review-pr73');
+      const dir = path.join(base, `${livePid}-reused00`);
+      writePriorState(dir);
+      const old = new Date(Date.now() - 5 * 60 * 60 * 1000);
+      fs.utimesSync(dir, old, old);
+
+      clearResumeMemo(ar);
+      assert.strictEqual(ar.discoverPriorStateDir(s.dir, 73), dir, '超龄目录不得因 pid 复用被永久跳过（续跑失效）');
+
+      const memo = {};
+      Object.defineProperty(ar.reviewStateDir, '_memo', { value: memo, writable: true, configurable: true });
+      memo[`${s.dir}|73`] = dir;
+      assert.strictEqual(ar.removableStateDir(s.dir, 73), dir, '超龄目录必须可清理，否则临时目录永久泄漏');
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：两个子进程同时竞争同一残留目录，恰好一个成功', async () => {
+  const s = sandbox();
+  try {
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-race0001');
+    writePriorState(dir);
+    await withRacingClaimChildren([dir, dir], (results) => {
+      assert.strictEqual(results.filter((r) => r === 'CLAIMED').length, 1, '认领必须排他：恰好一个进程赢，另一个必须放手');
+    });
+  } finally {
+    s.restore();
+  }
+});

@@ -33,6 +33,7 @@ const REQUIRED_FINAL_SECTIONS = ['动机', '改动思路', '具体改动', '对�
 const THREE_D_EVAL = ['delivery', 'long_horizon', 'user_experience'];
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync, spawn } = require('node:child_process');
@@ -208,7 +209,61 @@ function reviewStateDir(repoRoot, pr) {
   const dir = path.join(base, suffix);
   fs.mkdirSync(dir, { recursive: true });
   if (memo) memo[key] = dir;
+  stateDirOwnedSet().add(dir);
+  // 与「复用的目录」保持同一套所有权口径：新建目录同样发布 owner.lock。
+  // 失败不阻断（目录名本身已含 pid），但会记一次审计，避免两套口径悄悄分叉。
+  if (!claimPriorStateDir(dir)) {
+    try { console.error('[i] owner.lock 发布失败（按目录名 pid 兜底）'); } catch (_) { /* ignore */ }
+  }
   return dir;
+}
+
+// 目录名约定：<pid>-<hex>。所有者为该 pid 的进程。
+function stateDirOwnerPid(dir) {
+  const m = /^(\d+)-[0-9a-f]+$/.exec(path.basename(String(dir || '')));
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+// 存活判定：EPERM 说明进程存在但无权限发信号，仍算存活（宁可不复用也不误删）。
+function pidIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === 'EPERM');
+  }
+}
+
+// 目录年龄：用于「pid 被无关进程复用」时的兜底（ADR-0017 D4 的 mtime 陈旧判定）。
+function stateDirAgeMs(dir) {
+  try { return Date.now() - fs.statSync(dir).mtimeMs; } catch (_) { return 0; }
+}
+
+// 本次进程真正创建的目录集合（续跑复用的目录不计入，删不得）。
+function stateDirOwnedSet() {
+  if (!Object.prototype.hasOwnProperty.call(reviewStateDir, '_owned')) {
+    Object.defineProperty(reviewStateDir, '_owned', { value: new Set(), writable: true, enumerable: false, configurable: true });
+  }
+  if (!(reviewStateDir._owned instanceof Set)) reviewStateDir._owned = new Set();
+  return reviewStateDir._owned;
+}
+
+// 成功路径可清理的目录：只允许删本进程创建的，或所有者进程已死的。
+// 所有者仍存活时必须放手——否则会删掉对方正在写的 attempt 输出（ENOENT 竞态的根因）。
+function removableStateDir(repoRoot, pr) {
+  const memo = resumeMemo(repoRoot, pr);
+  const dir = memo ? memo[`${repoRoot || ''}|${pr}`] : null;
+  if (!dir) return null;
+  if (stateDirOwnedSet().has(dir)) return dir;
+  const owner = stateDirOwnerPid(dir);
+  if (owner === process.pid) return dir;
+  if (owner === null) return null;
+  // pid 复用兜底：目录年龄超过 OWNER_STALE_MS（默认 2 × 单轮硬上限）时，
+  // 即使同名 pid 仍存活也只可能是无关进程，允许清理；否则泄漏永久残留。
+  return !pidIsAlive(owner) || stateDirAgeMs(dir) >= OWNER_STALE_MS ? dir : null;
 }
 
 function resumeMemo(repoRoot, pr) {
@@ -220,26 +275,165 @@ function resumeMemo(repoRoot, pr) {
 
 // 跨进程发现：本 PR 父目录下，挑选包含 stage 状态文件、且按 mtime 最新的候选子目录。
 // 进程崩溃/中断时，每轮都会把 attempts_total 带_forward —— 正是依赖这个可发现的目录。
+//
+// 并发隔离与认领（ADR-0017 D4）：所有者已死的残留目录在事故后「立刻重试两次」时
+// 会被两个新进程同时 discover。若不排他认领，两者会共同写同名的 attempt 输出、
+// 先结束的再把目录整删 —— 原 ENOENT 竞态在这一支路重现。
+// 认领的**发布**必须原子：先在唯一临时目录写好含 {pid, host, started_at} 的 `owner`
+// 文件，再 rename 成 `owner.lock`。若先建目录再写内容，会留下「目录已存在但读不到
+// 持有者」的窗口，读取方把空内容当陈旧、搬走目录再自建，双方都以为持有。
+const OWNER_LOCK_DIR = 'owner.lock';
+// 认领目录存在但读不到 owner 时，只有足够陈旧才按「崩溃残留」抢占：
+// 正常发布是原子的，owner 永远在 rename 之前写好，空 owner 只会来自旧版本崩溃残留。
+const OWNER_GRACE_MS = 1000;
+// ADR-0017 D4：即使 pid 仍存活，认领超过该年龄也判为陈旧（覆盖 pid 复用与不可信存活）。
+// 默认 2 × REVIEW_TIMEOUT_MS_MAX，另可用 REVIEW_STATE_STALE_MS 覆盖。
+const OWNER_STALE_MS = (() => {
+  const raw = process.env.REVIEW_STATE_STALE_MS;
+  if (raw === undefined) return 2 * MAX_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 2 * MAX_TIMEOUT_MS;
+})();
+
+function claimHolder(claimDir) {
+  try {
+    const raw = fs.readFileSync(path.join(claimDir, 'owner'), 'utf8').trim();
+    if (raw.startsWith('{')) {
+      const obj = JSON.parse(raw);
+      const pid = Number(obj && obj.pid);
+      return {
+        pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+        host: obj && typeof obj.host === 'string' ? obj.host : null,
+        startedAt: obj && typeof obj.started_at === 'string' ? obj.started_at : null,
+      };
+    }
+    // 旧版本纯文本（"<pid>\n<时间>"）：仍可解析出 pid。
+    const m = /^(\d+)/.exec(raw);
+    const pid = m ? Number(m[1]) : NaN;
+    return { pid: Number.isInteger(pid) && pid > 0 ? pid : null, host: null, startedAt: null };
+  } catch (_) {
+    return { pid: null, host: null, startedAt: null };
+  }
+}
+
+function claimIsStale(claimDir, holder) {
+  let stat = null;
+  try { stat = fs.statSync(claimDir); } catch (_) { return false; }
+  if (holder.pid === null) {
+    // 读不到持有者：正常发布不会出现这种状态，保守按「正在发布/状态不明」处理，
+    // 只有超过宽限期才当作崩溃残留。
+    return Date.now() - stat.mtimeMs >= OWNER_GRACE_MS;
+  }
+  if (holder.pid === process.pid) return false;
+  const sameHost = holder.host === null || holder.host === os.hostname();
+  // 跨主机（共享临时目录）无法核验对方进程存活：只有认领足够陈旧才允许抢占，
+  // 否则会把对端正在跑的审查目录抢走，重现「共用目录 → 互相覆盖 → ENOENT」。
+  if (!sameHost) return Date.now() - stat.mtimeMs >= OWNER_STALE_MS;
+  if (!pidIsAlive(holder.pid)) return true;
+  return Date.now() - stat.mtimeMs >= OWNER_STALE_MS;
+}
+
+function claimPriorStateDir(dir) {
+  if (!dir) return false;
+  const claimDir = path.join(dir, OWNER_LOCK_DIR);
+  const stamp = `${JSON.stringify({ pid: process.pid, host: os.hostname(), started_at: new Date().toISOString() })}\n`;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    let exists = false;
+    try { exists = fs.statSync(claimDir).isDirectory(); } catch (_) { exists = false; }
+    if (exists) {
+      const holder = claimHolder(claimDir);
+      if (holder.pid === process.pid) {
+        stateDirOwnedSet().add(dir);
+        return true;
+      }
+      if (!claimIsStale(claimDir, holder)) return false;
+      // 每次抢占都留痕：跨主机与「同机 pid 存活但认领超龄」都必须能解释「目录为何易主」。
+      const reason = holder.host && holder.host !== os.hostname()
+        ? 'foreign_host_stale'
+        : (holder.pid !== null && holder.pid !== process.pid && pidIsAlive(holder.pid)
+          ? 'host_live_over_stale'
+          : 'owner_dead');
+      claimTakeoverAudit().push({ dir, holder, reason });
+      // 陈旧认领：搬走再抢建。rename 原子，两个进程只有一个能把目录搬走，输家下一轮照常竞争。
+      const stale = `${claimDir}.stale.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
+      try { fs.renameSync(claimDir, stale); } catch (_) { /* 已被别人搬走，回到竞争 */ }
+      try { fs.rmSync(stale, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      continue;
+    }
+    // 原子发布：owner 与目录同生共死，任何读取者看到的认领目录都自带持有者信息。
+    const tmp = `${claimDir}.tmp.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
+    try {
+      fs.mkdirSync(tmp);
+      fs.writeFileSync(path.join(tmp, 'owner'), stamp, 'utf8');
+      // 目标已存在（含空目录被 POSIX rename 覆盖的情形）会失败 → 输给并发发布者。
+      fs.renameSync(tmp, claimDir);
+      stateDirOwnedSet().add(dir);
+      return true;
+    } catch (_) {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      // 回到循环重新判定：可能已被他人发布并持有。
+    }
+  }
+  return false;
+}
+
+// 跨主机抢占必须留痕：共享临时目录下这是唯一能解释「目录为何易主」的证据。
+function claimTakeoverAudit() {
+  if (!Object.prototype.hasOwnProperty.call(claimPriorStateDir, '_takeover')) {
+    Object.defineProperty(claimPriorStateDir, '_takeover', { value: [], writable: true, enumerable: false, configurable: true });
+  }
+  if (!Array.isArray(claimPriorStateDir._takeover)) claimPriorStateDir._takeover = [];
+  return claimPriorStateDir._takeover;
+}
+
 function discoverPriorStateDir(repoRoot, pr) {
   const base = path.join(resolveTmpDir(repoRoot), `review-pr${pr}`);
   let entries;
   try {
     entries = fs.readdirSync(base, { withFileTypes: true });
   } catch (_) { return null; }
-  let best = null;
-  let bestMtime = -1;
+  const candidates = [];
   for (const ent of entries) {
     if (!ent.isDirectory()) continue;
     const dir = path.join(base, ent.name);
+    // 并发隔离硬约束：所有者进程仍存活时绝不接管它的目录。
+    // 接管后对方的清理/写入会与本次运行互相踩踏（曾导致 stage 输出 ENOENT 反复重试）。
+    const owner = stateDirOwnerPid(dir);
+    if (owner !== null && owner !== process.pid && pidIsAlive(owner) && stateDirAgeMs(dir) < OWNER_STALE_MS) {
+      skippedLiveStateDirs().push({ dir, owner });
+      continue;
+    }
     try {
       const files = fs.readdirSync(dir);
       const hasState = files.some((f) => f.endsWith('.state.json'));
       if (!hasState) continue;
-      const m = fs.statSync(dir).mtimeMs;
-      if (m > bestMtime) { bestMtime = m; best = dir; }
+      candidates.push({ dir, mtime: fs.statSync(dir).mtimeMs });
     } catch (_) { /* ignore */ }
   }
-  return best;
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  for (const cand of candidates) {
+    if (claimPriorStateDir(cand.dir)) return cand.dir;
+    skippedClaimedDirs().push({ dir: cand.dir, holder: claimHolder(path.join(cand.dir, OWNER_LOCK_DIR)).pid });
+  }
+  return null;
+}
+
+// 认领失败（另一进程正持有）的目录（供 runStageWithState 落日志）。
+function skippedClaimedDirs() {
+  if (!Object.prototype.hasOwnProperty.call(discoverPriorStateDir, '_claimed')) {
+    Object.defineProperty(discoverPriorStateDir, '_claimed', { value: [], writable: true, enumerable: false, configurable: true });
+  }
+  if (!Array.isArray(discoverPriorStateDir._claimed)) discoverPriorStateDir._claimed = [];
+  return discoverPriorStateDir._claimed;
+}
+
+// 被跳过的活进程目录（供 runStageWithState 落日志，满足"跳过必须留痕"）。
+function skippedLiveStateDirs() {
+  if (!Object.prototype.hasOwnProperty.call(discoverPriorStateDir, '_skipped')) {
+    Object.defineProperty(discoverPriorStateDir, '_skipped', { value: [], writable: true, enumerable: false, configurable: true });
+  }
+  if (!Array.isArray(discoverPriorStateDir._skipped)) discoverPriorStateDir._skipped = [];
+  return discoverPriorStateDir._skipped;
 }
 
 function reviewStateDirForResume(repoRoot, pr) {
@@ -416,6 +610,25 @@ async function runStageWithState(options) {
   // 使 readStageState 能读到它；无可续轮次才创建新的 pid 子目录。
   const resumedFromPrior = reviewStateDirForResume(repoRoot, pr);
   const stateDir = resumedFromPrior || reviewStateDir(repoRoot, pr);
+  // 跳过活进程目录必须留痕：否则"为什么没续上"在 pipeline.log 里无迹可查。
+  const skippedDirs = skippedLiveStateDirs();
+  while (skippedDirs.length > 0) {
+    const skipped = skippedDirs.shift();
+    appendPipelineLog(repoRoot, pr,
+      `event=resume_skipped reason=owner_process_alive dir=${path.basename(skipped.dir)} owner_pid=${skipped.owner} adopted_dir=${path.basename(stateDir)}`);
+  }
+  const takeoverDirs = claimTakeoverAudit();
+  while (takeoverDirs.length > 0) {
+    const t = takeoverDirs.shift();
+    appendPipelineLog(repoRoot, pr,
+      `event=claim_takeover reason=${t.reason || 'unknown'} dir=${path.basename(t.dir)} holder_pid=${t.holder.pid ?? '-'} holder_host=${t.holder.host || '-'} adopted_dir=${path.basename(stateDir)}`);
+  }
+  const claimedDirs = skippedClaimedDirs();
+  while (claimedDirs.length > 0) {
+    const skipped = claimedDirs.shift();
+    appendPipelineLog(repoRoot, pr,
+      `event=resume_skipped reason=claimed_by_live_process dir=${path.basename(skipped.dir)} holder_pid=${skipped.holder ?? '-'} adopted_dir=${path.basename(stateDir)}`);
+  }
   const prior = readStageState(repoRoot, pr, stage);
   const sameIdentity = Boolean(prior)
     && prior.head_oid === headOid
@@ -899,6 +1112,32 @@ function fetchPrChecks(repo, prId) {
   }
 }
 
+// 模型偶尔会在 JSON 字符串里直接换行（长正文中途从 \n 转义切换成真实换行），
+// 严格解析会整块失败、被当成「缺少 review_body」白跑一轮。这里只在字符串内部
+// 转义裸控制字符，不改变任何可见文本；修复后仍须过 acceptModelOutput 与原生 check-result。
+function escapeRawControlCharsInStrings(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) { out += ch; escaped = false; continue; }
+      if (ch === '\\') { out += ch; escaped = true; continue; }
+      if (ch === '"') { out += ch; inString = false; continue; }
+      if (ch === '\n') { out += '\\n'; continue; }
+      if (ch === '\r') { out += '\\r'; continue; }
+      if (ch === '\t') { out += '\\t'; continue; }
+      if (ch < ' ') { out += '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'); continue; }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    out += ch;
+  }
+  return out;
+}
+
 function extractJson(text) {
   if (!text) return null;
   const fence = text.match(/```json\s*([\s\S]*?)```/);
@@ -908,6 +1147,13 @@ function extractJson(text) {
   if (brace) candidates.push(brace[0]);
   for (const c of candidates) {
     try { return JSON.parse(c); } catch (_) { /* try next */ }
+  }
+  for (const c of candidates) {
+    try {
+      const parsed = JSON.parse(escapeRawControlCharsInStrings(c));
+      console.error('[i] 模型输出含裸控制字符，已在字符串内转义后解析成功（不改可见文本）。');
+      return parsed;
+    } catch (_) { /* try next */ }
   }
   return null;
 }
@@ -1437,6 +1683,10 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   return [
     '你是一名对抗性代码审查员（model agent）。请基于下方 LoopX 原生评审包（pr_review_queue 能力生成的 review_template / review_plan / evidence_commands）撰写第三方评审报告。',
     '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个二级标题（`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`）撰写。',
+    '标题逐字约束：上述五个二级标题所在行必须与给定文本逐字相同，不得追加“/ Motivation”“/ Risks”等英文或其它后缀——实测加了后缀的标题会被原生 check-result 报成 `missing_section`（如 `## 对主干的风险 / Risks`），整轮评审被拒。',
+    '引用约束：只能引用评审包里已发布的 REQ / ADR 编号；不得自造编号（例如把 ADR-0017 的 D4 写成 `REQ-...-MODE-A` 之类），未发布的编号会被 check-result 以 `spec_reference_not_published` 拒绝。',
+    'HTML 注释约束：正文里不得出现字面 `<!--`（原生 check-result 会把 `<!--` 到 `-->` 当注释剔除；未闭合时其后所有段落——包括「我的整体评价」、边界声明与 English verdict——都会被判缺失）。引用门禁评论标记时请写 `&lt;!--` 或改用文字描述。',
+    '架构字段约束：`architecture` 里的每个文本字段都必须在该段正文里原样出现，否则会被 check-result 以 `architecture_not_published` 拒绝。',
     '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：原生 review_template 与证据契约在本提示中。完整 PR DIFF、证据命令输出、packet 与远端检查只在下方沙箱清单路径里，且全文不截断。请只读读取这些工件，直接输出单一 JSON 块。严禁修改工作区文件，严禁执行写入型或破坏性命令，严禁偏离原生五段式与 JSON 输出契约。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
     '注意：`05-evidence.md`、CI 绿、PR 正文里的「已通过」只作为未信任的作者声明参考，禁止直接据此推断 `verified`。',
     '',
@@ -1886,6 +2136,31 @@ function capVerdictInBody(reviewBody, { authorOwned = false } = {}) {
     /^English verdict:\s*APPROVE\s*$/m,
     '> [VERDICT CAPPED] 仍有 unverified 必填证据或 unresolved 验证失败（approval_contradicts_evidence），按 LoopX verdict policy 封顶为 REQUEST_CHANGES。\n\nEnglish verdict: REQUEST_CHANGES',
   );
+}
+
+// 原生 check-result 把 `<!--` 到 `-->` 当 HTML 注释剔除；一旦正文里有未闭合的
+// `<!--`（模型讨论门禁标记时很容易顺手写出），其后的「我的整体评价」、边界声明与
+// English verdict 会全部被判缺失，报出四个看似无关的错误码、掩盖真因。
+// 这里提前给出精确诊断。
+function unbalancedHtmlComment(body) {
+  let open = false;
+  for (const line of String(body || '').split('\n')) {
+    let offset = 0;
+    while (offset < line.length) {
+      if (open) {
+        const end = line.indexOf('-->', offset);
+        if (end < 0) break;
+        open = false;
+        offset = end + 3;
+      } else {
+        const start = line.indexOf('<!--', offset);
+        if (start < 0) break;
+        open = true;
+        offset = start + 4;
+      }
+    }
+  }
+  return open;
 }
 
 // 跑原生 check-result，返回解析后的校验报告
@@ -2534,6 +2809,10 @@ async function main() {
     let finalResultPayload = null;
     const runCheck = () => {
       finalResultPayload = buildResultFile();
+      if (unbalancedHtmlComment(finalResultPayload.review_body)) {
+        console.error('[i] 正文含未闭合的 `<!--`：原生 check-result 会把它之后的内容全部当注释剔除，'
+          + '「我的整体评价」/English verdict 会被判缺失。请改写该处（用 `&lt;!--` 或文字描述）。');
+      }
       fs.writeFileSync(resultPath, JSON.stringify(finalResultPayload, null, 2));
       check = runNativeCheckResult(resultPath, packetPath, loopxResolved.bin);
       fmt = bodyFormatPasses(check);
@@ -2595,11 +2874,24 @@ async function main() {
   // 避免并发审查时互相删除对方的 state/output；阶段状态目录只在失败/中断时保留
   // （供续跑与排障），成功时一并清理；需要留档时显式设置 LOOPX_KEEP_TMP=1。
   if (process.env.LOOPX_KEEP_TMP !== '1') {
-    // 直接算路径而不经 reviewStateDir：成功路径不创建任何新目录；只删本进程的 pid 子目录
-    const stateDir = reviewStateDir(repoRoot, o.pr);
-    try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
-    // 父目录已空时一并移除（保持 tmpDir 零残留）；并发 sibling 目录存在时 rmdir 抛 ENOTEMPTY → ignore
-    try { fs.rmdirSync(path.dirname(stateDir)); } catch (_) { /* ignore */ }
+    // 直接算路径而不经 reviewStateDir：成功路径不创建任何新目录；只删本进程的 pid 子目录。
+    // removableStateDir 兜底：若本次运行实际复用了他人的目录（所有者仍存活），
+    // 删掉会把对方正在写的 attempt 输出一起拔掉 → 立即放弃清理并留痕。
+    const stateDir = removableStateDir(repoRoot, o.pr);
+    if (stateDir) {
+      try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      // 父目录已空时一并移除（保持 tmpDir 零残留）；并发 sibling 目录存在时 rmdir 抛 ENOTEMPTY → ignore
+      try { fs.rmdirSync(path.dirname(stateDir)); } catch (_) { /* ignore */ }
+    } else {
+      // 只有「确实有一个可续跑目录、但无权删除」时才留痕；
+      // 压根没有目录（本进程从未创建或复用）不需要日志——为写日志新建目录本身就是残留。
+      const memo = resumeMemo(repoRoot, o.pr);
+      const candidate = memo ? memo[`${repoRoot || ''}|${o.pr}`] : null;
+      if (candidate) {
+        appendPipelineLog(repoRoot, o.pr,
+          'event=cleanup_skipped reason=state_dir_owned_by_live_process');
+      }
+    }
   }
   console.log(`\n[PASSED] Authentic review pipeline complete (verdict=${verdict}).`);
   process.exit(0);
@@ -2656,6 +2948,15 @@ module.exports = {
   reviewStateDir,
   reviewStateDirForResume,
   discoverPriorStateDir,
+  // 并发隔离：目录所有权（活进程目录不接管、不删除）
+  removableStateDir,
+  claimPriorStateDir,
+  skippedClaimedDirs,
+  claimTakeoverAudit,
+  unbalancedHtmlComment,
+  escapeRawControlCharsInStrings,
+  stateDirOwnerPid,
+  pidIsAlive,
   pipelineLogPath,
   appendPipelineLog,
   classifyStageFailure,

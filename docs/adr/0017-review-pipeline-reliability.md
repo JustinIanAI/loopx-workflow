@@ -64,10 +64,12 @@ PR #73 在交付能力探针时为跑通 `loopx-flow review`，夹带了 6 个�
 
 决策：
 
-- 每个运行子目录创建时原子写入 `owner.lock`（`O_EXCL`），内容为 `{pid, host, started_at, head_oid}`；获取失败视为目录已被占用，另建新子目录。
-- **陈旧判定**：`pid` 不存在（同 host）或目录 mtime 超过 `REVIEW_STATE_STALE_MS`（默认 `2 × REVIEW_TIMEOUT_MS_MAX`）时视为陈旧，可被跨进程发现；活跃锁目录不得被其他进程写入。
-- **清理所有权**：只删本进程 `owner.lock` 对应的子目录；陈旧目录只由显式 `--clean-stale-state` 或超龄清理回收，不在普通运行中删除。
-- 父目录 `review-pr<N>/` 的删除仅限"已空"。
+- 每个运行子目录的认领是 `owner.lock/` 目录，内含 `owner` 文件（JSON `{pid, host, started_at}`）。**发布必须原子**：先在唯一临时目录写好 `owner`，再 `rename` 成 `owner.lock/`；目标已存在即失败，视为输给并发发布者并另建子目录。先建目录再写内容会留下「读不到持有者」的窗口，读取方会把空内容当陈旧并把目录搬走，导致双持有——这正是原 ENOENT 故障类的成因。
+- **陈旧判定**：持有者 `pid` 不存在、或认领目录 mtime 超过 `REVIEW_STATE_STALE_MS`（默认 `2 × REVIEW_TIMEOUT_MS_MAX`，可用同名环境变量覆盖）时视为陈旧；`owner` 缺失（只可能来自旧版本崩溃残留）时，超过 1s 宽限期才按陈旧处理，否则一律放手。活跃锁目录不得被其他进程写入。
+- **跨主机**：`host` 与本机不同时无法核验对方存活，只有认领 mtime 超过 `REVIEW_STATE_STALE_MS` 才可抢占，并必须落 `event=claim_takeover reason=foreign_host_stale` 审计行；共享临时目录下新鲜的外机认领一律不得抢占。
+- **新建目录同样认领**：新建运行子目录时也发布 `owner.lock`，与复用目录共用同一套所有权口径；按目录名 `pid` 判活只作兜底（`pid` 复用或目录 mtime 超 `REVIEW_STATE_STALE_MS` 时视为陈旧可接管/可清理）。
+- **抢占原子性**：陈旧认领只允许用 `rename` 搬走（两个进程只有一个能搬走）后再重新发布，禁止先 `unlink` 再创建——那会让两个进程同时认为自己持有。
+- **清理所有权**：只删本进程认领的子目录（自有认领或认领持有者已死）；发现候选目录必须跳过活跃认领；父目录 `review-pr<N>/` 的删除仅限「已空」。
 
 ### D5：三层复用语义分工，结论有效性只认原生
 
