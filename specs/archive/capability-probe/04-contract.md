@@ -150,3 +150,12 @@ node --test tests/unit/capability-probe.test.js tests/unit/capability-gate-dispa
 ## 依赖顺序
 
 `Story-1`（探针核心）→ `Story-2`（矩阵投影）→ `Story-3`（dispatch 门）→ `Story-4`（负向与金丝雀）
+
+## 交付后修订（Issue #84，2026-11-28）
+
+> 本节是**追加**记录，不修改上面的历史断言与前序审批内容。断言 #6 的原文保留为交付时口径；实现口径自此节生效。
+
+- **背景**：argparse 在 80 列终端下会把取值枚举折到下一行（`--operation` 与 `{stop,resume}` 分离）。断言 #6 的「同一行内」让折行帮助被判为「`--operation` 缺少取值」，进而误阻断 `merge` / `review`。
+- **新口径**：choices 归属到**同一 usage 段落内它前面的那个 Flag**；段落以空行分界，跨空行不再归属，仍不得退化为全文词表匹配。就近归属不变：同一段落里有更近的 Flag 时，choices 归更近的那个。
+- **验证**：`tests/unit/capability-probe.test.js` 新增三条（折行正向、跨空行负向、折行后相邻 Flag 各归其主），并保留既有 P2 false-pass 回归用例。
+- **审批影响**：本节改变了已冻结断言的判定口径，按仓库规程需 Owner 重新 Gate1 确认；在此之前该修订为 `Proposed`。
