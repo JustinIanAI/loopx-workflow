@@ -312,3 +312,46 @@ test('real CLI canary: loopx 2.3.x satisfies every BLOCK capability', { skip: ((
   assert.ok(blockRows.length > 0);
   for (const entry of blockRows) assert.strictEqual(entry.status, 'PASS', `${entry.id}: ${entry.detail}`);
 });
+
+test('Issue #84：折行的 choices 归属同一 usage 段落的 Flag（80 列 argparse 换行）', () => {
+  // argparse 在 80 列下会把取值枚举折到下一行：`--operation` 与 `{stop,resume}` 不再同行。
+  const help = [
+    'usage: loopx goal-lifecycle [-h] --goal-id GOAL_ID --operation',
+    '                            {stop,resume} [--reason REASON]',
+    '                            [--state-file STATE_FILE]'
+  ].join('\n');
+  const signature = probe.extractSignature(help);
+  assert.deepStrictEqual([...signature.choices.get('--operation')].sort(), ['resume', 'stop']);
+  assert.strictEqual(signature.choices.get('--reason'), undefined, 'choices 不得外溢到相邻 Flag');
+
+  const bin = makeFakeCli({ help: withHelp({ 'goal-lifecycle --help': help }) });
+  const ok = runModule(['require', '--scope', 'merge', '--loopx-bin', bin]);
+  assert.strictEqual(ok.status, 0, `折行 choices 不应阻断 merge：${ok.stderr}`);
+});
+
+test('Issue #84：跨空行的 choices 不归属任何 Flag（不退化为全文词表匹配）', () => {
+  const help = [
+    'usage: loopx goal-lifecycle [-h] --goal-id GOAL_ID --operation OPERATION',
+    '',
+    '{stop,resume}   Subcommands, not an option value.'
+  ].join('\n');
+  const signature = probe.extractSignature(help);
+  assert.ok(signature.words.has('stop'), '前置：词表仍收录该词');
+  assert.strictEqual(signature.choices.get('--operation'), undefined, '空行之后不得回填归属');
+
+  const bin = makeFakeCli({ help: withHelp({ 'goal-lifecycle --help': help }) });
+  const r = runModule(['require', '--scope', 'merge', '--loopx-bin', bin]);
+  assert.strictEqual(r.status, 1, '无归属的 choices 必须继续阻断');
+  assert.match(r.stderr, /--operation 缺少取值 stop/);
+});
+
+test('Issue #84：折行后相邻 Flag 的 choices 各归其主（同段落内就近归属）', () => {
+  const help = [
+    'usage: loopx goal-lifecycle [-h] --goal-id GOAL_ID --operation OPERATION',
+    '                            --reason',
+    '                            {stop,resume,suspend}'
+  ].join('\n');
+  const signature = probe.extractSignature(help);
+  assert.strictEqual(signature.choices.get('--operation'), undefined, '近邻 Flag 是 --reason，不是 --operation');
+  assert.deepStrictEqual([...signature.choices.get('--reason')].sort(), ['resume', 'stop', 'suspend']);
+});
