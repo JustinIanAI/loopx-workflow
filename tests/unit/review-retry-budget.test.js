@@ -63,13 +63,17 @@ async function runWith(sbx, { delayMs, timeoutMs, env }) {
 test('慢轮次耗尽总预算：停止重试并标记 retry_budget_exhausted', async () => {
   const sbx = sandbox('retry-budget-slow-');
   try {
-    // timeoutMs=100 → 默认总预算 200ms；单轮就花掉 ~120ms，再来一轮会超限。
+    // timeoutMs=100 → 默认总预算 200ms；首轮花掉 ~120ms，还剩 ~80ms：
+    // 必须真的起第二轮，且第二轮的超时被裁到剩余额度，总耗时不得越过 200ms 上限。
     const r = await runWith(sbx, { delayMs: 120, timeoutMs: 100 });
     assert.strictEqual(r.ok, false);
     assert.strictEqual(r.retry_budget_exhausted, true);
-    assert.strictEqual(r.attempts, 1, '超出总预算时不得再起第二轮');
+    assert.strictEqual(r.attempts, 2, '还剩额度时必须起第二轮；第二轮耗尽后才停机');
     const log = fs.readFileSync(pipelineLogPath(sbx.dir, 42), 'utf8');
     assert.match(log, /event=retry_budget_exhausted/);
+    const second = log.match(/attempt=2\b[^\n]*event=start[^\n]*timeout_ms=(\d+)/);
+    assert.ok(second, '第二轮必须留下 start 记录');
+    assert.strictEqual(Number(second[1]), 100, '每次尝试仍用完整单次预算，上限由「是否还有剩余额度」控制');
   } finally { sbx.restore(); }
 });
 

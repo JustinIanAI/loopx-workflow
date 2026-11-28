@@ -570,13 +570,16 @@ async function runStageWithState(options) {
 
     if (errorClass !== 'ETIMEDOUT' || attempt >= maxAttempts) break;
 
-    // 总预算闸门：再来一轮最多再花 budgetMs；超出上限就停机，不把 3× 模型预算当成默认。
+    // 总预算闸门：以「还剩多少总额」判定，而不是拿一次满额预算去比。
+    // 真实超时后 elapsedTotal 必然包含毫秒级开销，用 `elapsedTotal + budgetMs > retryBudgetMs`
+    // 会让「首轮 + 一轮完整重试」在开销 > 0 时永远不成立——差几毫秒就从重试变成停机。
     const elapsedTotal = Date.now() - stageStartedMs;
-    if (elapsedTotal + budgetMs > retryBudgetMs) {
+    const remainingBudgetMs = retryBudgetMs - elapsedTotal;
+    if (remainingBudgetMs <= 0) {
       retryBudgetExhausted = true;
       writeStageState(repoRoot, pr, stage, { status: 'failed', error_class: errorClass, error_detail: detail, elapsed_ms: elapsed });
       appendPipelineLog(repoRoot, pr,
-        `stage=${stage} attempt=${attempt} event=retry_budget_exhausted elapsed_total_ms=${elapsedTotal} retry_budget_ms=${retryBudgetMs} next_budget_ms=${budgetMs} reason=would_exceed_total_budget`);
+        `stage=${stage} attempt=${attempt} event=retry_budget_exhausted elapsed_total_ms=${elapsedTotal} retry_budget_ms=${retryBudgetMs} next_budget_ms=0 reason=no_remaining_budget`);
       break;
     }
 
