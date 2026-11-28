@@ -78,11 +78,11 @@ function timeoutResult() {
   };
 }
 
-test('超时耗尽：重试 3 次仍失败 → ETIMEDOUT 诊断 + state 落 failed', () => {
+test('超时耗尽：重试 3 次仍失败 → ETIMEDOUT 诊断 + state 落 failed', async () => {
   const s = sandbox();
   try {
     let calls = 0;
-    const r = runStageWithState(params(s, {
+    const r = await runStageWithState(params(s, {
       runFn: () => { calls += 1; return timeoutResult(); },
     }));
     assert.strictEqual(calls, 3);
@@ -115,11 +115,11 @@ test('超时耗尽：重试 3 次仍失败 → ETIMEDOUT 诊断 + state 落 fail
   }
 });
 
-test('超时后重试成功（红→绿）：日志保留 retry→ok，state 输出可复用', () => {
+test('超时后重试成功（红→绿）：日志保留 retry→ok，state 输出可复用', async () => {
   const s = sandbox();
   try {
     let calls = 0;
-    const r = runStageWithState(params(s, {
+    const r = await runStageWithState(params(s, {
       runFn: () => {
         calls += 1;
         return calls === 1 ? timeoutResult() : { stdout: OK_JSON, stderr: '', rawStdout: OK_JSON };
@@ -144,28 +144,28 @@ test('超时后重试成功（红→绿）：日志保留 retry→ok，state 输
   }
 });
 
-test('可接续：同 head/同 prompt/同 agent 复用已成功输出；prompt 变化则丢弃状态重跑', () => {
+test('可接续：同 head/同 prompt/同 agent 复用已成功输出；prompt 变化则丢弃状态重跑', async () => {
   const s = sandbox();
   try {
     let calls = 0;
     const okRun = () => { calls += 1; return { stdout: OK_JSON, stderr: '', rawStdout: OK_JSON }; };
-    assert.strictEqual(runStageWithState(params(s, { runFn: okRun })).ok, true);
+    assert.strictEqual((await runStageWithState(params(s, { runFn: okRun }))).ok, true);
     assert.strictEqual(calls, 1);
 
-    const again = runStageWithState(params(s, { runFn: okRun }));
+    const again = await runStageWithState(params(s, { runFn: okRun }));
     assert.strictEqual(again.ok, true);
     assert.strictEqual(again.resumed, true);
     assert.strictEqual(calls, 1, '同身份不得再次调用模型');
     assert.match(fs.readFileSync(pipelineLogPath(s.dir, 73), 'utf8'), /event=resume action=skip_model_call/);
 
-    const changed = runStageWithState(params(s, { runFn: okRun, prompt: 'different prompt' }));
+    const changed = await runStageWithState(params(s, { runFn: okRun, prompt: 'different prompt' }));
     assert.strictEqual(changed.ok, true);
     assert.strictEqual(changed.resumed, undefined);
     assert.strictEqual(calls, 2);
     assert.match(fs.readFileSync(pipelineLogPath(s.dir, 73), 'utf8'), /event=state_discard reason=head_or_prompt_changed/);
 
     // agentBin 变化同样视为身份变化（交叉核验换执行器时不能复用旧输出）
-    const otherAgent = runStageWithState(params(s, { runFn: okRun, prompt: 'different prompt', agentBin: 'claude' }));
+    const otherAgent = await runStageWithState(params(s, { runFn: okRun, prompt: 'different prompt', agentBin: 'claude' }));
     assert.strictEqual(otherAgent.ok, true);
     assert.strictEqual(calls, 3);
   } finally {
@@ -173,11 +173,11 @@ test('可接续：同 head/同 prompt/同 agent 复用已成功输出；prompt �
   }
 });
 
-test('结构性失败不重试：CLI 不可用 / 截断 / stdin 超限各一次即终', () => {
+test('结构性失败不重试：CLI 不可用 / 截断 / stdin 超限各一次即终', async () => {
   const s = sandbox();
   try {
     let calls = 0;
-    const unavailable = runStageWithState(params(s, {
+    const unavailable = await runStageWithState(params(s, {
       runFn: () => { calls += 1; return { unavailable: true }; },
     }));
     assert.strictEqual(unavailable.ok, false);
@@ -185,7 +185,7 @@ test('结构性失败不重试：CLI 不可用 / 截断 / stdin 超限各一次�
     assert.strictEqual(unavailable.error_class, 'OTHER');
     assert.strictEqual(calls, 1);
 
-    const trunc = runStageWithState(params(s, {
+    const trunc = await runStageWithState(params(s, {
       runFn: () => { calls += 1; return { truncated: true, error: 'host truncation marker in model output' }; },
       prompt: 'p2',
     }));
@@ -203,10 +203,10 @@ test('结构性失败不重试：CLI 不可用 / 截断 / stdin 超限各一次�
   }
 });
 
-test('心跳：阶段进行中由独立子进程按间隔追加 heartbeat 行', () => {
+test('心跳：阶段进行中由独立子进程按间隔追加 heartbeat 行', async () => {
   const s = sandbox();
   try {
-    const r = runStageWithState(params(s, {
+    const r = await runStageWithState(params(s, {
       heartbeatIntervalMs: 40,
       runFn: () => {
         // 模拟一次耗时调用（同步阻塞主进程，心跳必须来自子进程）
@@ -222,7 +222,7 @@ test('心跳：阶段进行中由独立子进程按间隔追加 heartbeat 行', 
   }
 });
 
-test('真实 fake 二进制：spawnSync 超时被归类为 ETIMEDOUT 并给出预算值', () => {
+test('真实 fake 二进制：spawnSync 超时被归类为 ETIMEDOUT 并给出预算值', async () => {
   const s = sandbox();
   const stateDir = path.join(s.dir, 'tmp', 'review-pr73');
   const bin = path.join(s.dir, 'bin');
@@ -232,7 +232,7 @@ test('真实 fake 二进制：spawnSync 超时被归类为 ETIMEDOUT 并给出�
   const prevPath = process.env.PATH;
   process.env.PATH = `${bin}${path.delimiter}${prevPath}`;
   try {
-    const r = runStageWithState(params(s, { timeoutMs: 200 }));
+    const r = await runStageWithState(params(s, { timeoutMs: 200 }));
     assert.strictEqual(r.ok, false);
     assert.strictEqual(r.error_class, 'ETIMEDOUT');
     assert.match(r.error, /^ETIMEDOUT after 200ms/);
@@ -245,7 +245,7 @@ test('真实 fake 二进制：spawnSync 超时被归类为 ETIMEDOUT 并给出�
   }
 });
 
-test('失败归类与超时诊断', () => {
+test('失败归类与超时诊断', async () => {
   assert.strictEqual(classifyStageFailure({ timed_out: true }), 'ETIMEDOUT');
   assert.strictEqual(classifyStageFailure({ error_code: 'ETIMEDOUT' }), 'ETIMEDOUT');
   assert.strictEqual(classifyStageFailure({ error: 'exit 1: boom' }), 'OTHER');
@@ -254,14 +254,14 @@ test('失败归类与超时诊断', () => {
   assert.strictEqual(formatStageError({ error: 'exit 1: boom' }, 600000, 1, 3), 'exit 1: boom');
 });
 
-test('R2 REVIEW_TIMEOUT_MS 默认 600000，上限 7200000，可调预算直达 spawnSync', () => {
+test('R2 REVIEW_TIMEOUT_MS 默认 600000，上限 7200000，可调预算直达 spawnSync', async () => {
   const ar = require(SRC);
   assert.strictEqual(ar.TIMEOUT_MS, 600000);
   assert.strictEqual(ar.MAX_TIMEOUT_MS, 7200000);
   assert.strictEqual(ar.BUDGET_MS, ar.TIMEOUT_MS, 'REVIEW_TIMEOUT_MS 未设置时预算即默认 600000');
 });
 
-test('R2 子进程校验：预算非法 Fail-Closed 超限 Fail-Closed，超限且无上浮 MAX 不放行', () => {
+test('R2 子进程校验：预算非法 Fail-Closed 超限 Fail-Closed，超限且无上浮 MAX 不放行', async () => {
   const { spawnSync } = require('node:child_process');
   const run = (env) => spawnSync(process.execPath, ['-e',
     'require(process.argv[1])',
@@ -276,32 +276,32 @@ test('R2 子进程校验：预算非法 Fail-Closed 超限 Fail-Closed，超限�
   assert.strictEqual(big.status, 0, big.stderr);
 });
 
-test('红线守卫：默认预算未被放宽（TIMEOUT_MS 仍 600000）', () => {
+test('红线守卫：默认预算未被放宽（TIMEOUT_MS 仍 600000）', async () => {
   const src = fs.readFileSync(SRC, 'utf8');
   assert.match(src, /const TIMEOUT_MS = 600000;/);
   assert.strictEqual(MAX_STAGE_ATTEMPTS, 3);
 });
 
-test('Stage B P0-2：仅切换 model/effort 时必须重跑（selection_hash 隔离）', () => {
+test('Stage B P0-2：仅切换 model/effort 时必须重跑（selection_hash 隔离）', async () => {
   const s = sandbox();
   try {
     const ok = () => ({ stdout: OK_JSON, stderr: '', rawStdout: OK_JSON });
-    const a = runStageWithState(params(s, { runFn: ok, selection: { model: 'm-a', reasoningEffort: 'medium' }, timeoutMs: 1000 }));
+    const a = await runStageWithState(params(s, { runFn: ok, selection: { model: 'm-a', reasoningEffort: 'medium' }, timeoutMs: 1000 }));
     assert.strictEqual(a.ok, true);
     assert.strictEqual(Boolean(a.resumed), false);
-    const b = runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'medium' }, timeoutMs: 1000 }));
+    const b = await runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'medium' }, timeoutMs: 1000 }));
     assert.strictEqual(b.ok, true);
     assert.strictEqual(Boolean(b.resumed), false, '切换 model 不得复用旧输出');
-    const c = runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'high' }, timeoutMs: 1000 }));
+    const c = await runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'high' }, timeoutMs: 1000 }));
     assert.strictEqual(Boolean(c.resumed), false, '切换 effort 不得复用旧输出');
-    const d = runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'high' }, timeoutMs: 1000 }));
+    const d = await runStageWithState(params(s, { runFn: ok, selection: { model: 'm-b', reasoningEffort: 'high' }, timeoutMs: 1000 }));
     assert.strictEqual(d.resumed, true, '同 model/effort 仍可续跑');
   } finally {
     s.restore();
   }
 });
 
-test('Stage B P0-3：并发隔离——不同 pid 落不同目录', () => {
+test('Stage B P0-3：并发隔离——不同 pid 落不同目录', async () => {
   const s = sandbox();
   try {
     const ar = require(SRC);
@@ -322,7 +322,7 @@ test('Stage B P0-3：并发隔离——不同 pid 落不同目录', () => {
   }
 });
 
-test('Stage B 成功清理：空父目录一并清除、并发非空父目录保留', () => {
+test('Stage B 成功清理：空父目录一并清除、并发非空父目录保留', async () => {
   const s = sandbox();
   try {
     const ar = require(SRC);
@@ -349,7 +349,7 @@ test('Stage B 成功清理：空父目录一并清除、并发非空父目录保
   }
 });
 
-test('Stage B P0：跨进程续跑——新进程发现上一轮候选目录并锁定，不新建目录', () => {
+test('Stage B P0：跨进程续跑——新进程发现上一轮候选目录并锁定，不新建目录', async () => {
   const s = sandbox();
   try {
     const ar = require(SRC);
@@ -382,7 +382,7 @@ test('Stage B P0：跨进程续跑——新进程发现上一轮候选目录并�
       for (const k of Object.keys(ar.reviewStateDir._memo)) delete ar.reviewStateDir._memo[k];
     }
     let calls = 0;
-    const r = runStageWithState(params(s, {
+    const r = await runStageWithState(params(s, {
       runFn: () => { calls += 1; return { stdout: OK_JSON, stderr: '', rawStdout: OK_JSON }; },
     }));
     assert.strictEqual(r.ok, true);

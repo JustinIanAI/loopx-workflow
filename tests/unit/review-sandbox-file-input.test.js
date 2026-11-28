@@ -59,7 +59,7 @@ test('host truncation marker matches only the bracketed byte form', () => {
   assert.strictEqual(hostOutputTruncated('no numeric [... bytes omitted ...] form'), false);
 });
 
-test('oversized stdin is rejected before the agent process starts', () => {
+test('oversized stdin is rejected before the agent process starts', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-bin-'));
   const log = path.join(dir, 'spawned');
   fs.writeFileSync(path.join(dir, 'codex'), `#!/bin/sh\necho spawned > ${JSON.stringify(log)}\nexit 0\n`, { mode: 0o755 });
@@ -68,7 +68,7 @@ test('oversized stdin is rejected before the agent process starts', () => {
   process.env.REVIEW_STDIN_BYTE_LIMIT = '1024';
   process.env.PATH = `${dir}:${prevPath}`;
   try {
-    const result = runReviewAgent('codex', 'y'.repeat(2048), 5000, makeRunDir(dir));
+    const result = await runReviewAgent('codex', 'y'.repeat(2048), 5000, makeRunDir(dir));
     assert.strictEqual(result.stdinRejected, true);
     assert.strictEqual(fs.existsSync(log), false);
   } finally {
@@ -92,7 +92,7 @@ test('codex stays read-only and claude is limited to Read on the sandbox', () =>
   assert.deepStrictEqual(claude, ['-p', '--tools', 'Read', '--permission-mode', 'dontAsk', '--add-dir', runDir.dir]);
 });
 
-test('runReviewAgent spawns both backends with the read-only argv and flags truncation', () => {
+test('runReviewAgent spawns both backends with the read-only argv and flags truncation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-args-'));
   const writeBin = (name, body) => {
     fs.writeFileSync(path.join(dir, name), body, { mode: 0o755 });
@@ -104,14 +104,14 @@ test('runReviewAgent spawns both backends with the read-only argv and flags trun
   const runDir = makeRunDir(path.join(dir, 'run'));
   fs.mkdirSync(runDir.dir, { recursive: true });
   try {
-    const codexRun = runReviewAgent('codex', 'compact prompt', 5000, runDir, undefined, { env: {} });
+    const codexRun = await runReviewAgent('codex', 'compact prompt', 5000, runDir, undefined, { env: {} });
     assert.strictEqual(codexRun.stdout.trim(), 'ok');
     const codexArgs = fs.readFileSync(path.join(dir, 'codex.args'), 'utf8');
     assert.match(codexArgs, /exec --sandbox read-only/);
     assert.match(codexArgs, /-C /);
     assert.doesNotMatch(codexArgs, /--add-dir/);
     assert.doesNotMatch(codexArgs, /(^| )-m /);
-    const claudeRun = runReviewAgent('claude', 'compact prompt', 5000, runDir, undefined, { env: {} });
+    const claudeRun = await runReviewAgent('claude', 'compact prompt', 5000, runDir, undefined, { env: {} });
     assert.strictEqual(claudeRun.truncated, true);
     const claudeArgs = fs.readFileSync(path.join(dir, 'claude.args'), 'utf8');
     assert.match(claudeArgs, /-p --tools Read --permission-mode dontAsk --add-dir /);
@@ -121,7 +121,7 @@ test('runReviewAgent spawns both backends with the read-only argv and flags trun
   }
 });
 
-test('codex -o keeps stdout diagnostics and does not treat diff literals as truncation', () => {
+test('codex -o keeps stdout diagnostics and does not treat diff literals as truncation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sandbox-codex-'));
   const runDir = makeRunDir(path.join(dir, 'run'));
   fs.mkdirSync(runDir.dir, { recursive: true });
@@ -133,16 +133,16 @@ test('codex -o keeps stdout diagnostics and does not treat diff literals as trun
   const write = (body) => fs.writeFileSync(path.join(dir, 'codex'), `#!/bin/sh\nout=""; p=""\nfor a in "$@"; do [ "$p" = "-o" ] && out="$a"; p="$a"; done\ncat >/dev/null\n${body}\n`, { mode: 0o755 });
   try {
     write(`printf '%s' '{"ok":1}' > "$out"; echo '${marker}' >&2; exit 0`);
-    const echo = runReviewAgent('codex', 'p', 5000, runDir, diff);
+    const echo = await runReviewAgent('codex', 'p', 5000, runDir, diff);
     assert.notStrictEqual(echo.truncated, true);
     assert.match(echo.stdout, /\{"ok":1\}/);
     write(`printf '%s' '{"b":"${novel}"}' > "$out"; exit 0`);
-    assert.notStrictEqual(runReviewAgent('codex', 'p', 5000, runDir, novel).truncated, true);
-    assert.strictEqual(runReviewAgent('codex', 'p', 5000, runDir, diff).truncated, true);
+    assert.notStrictEqual((await runReviewAgent('codex', 'p', 5000, runDir, novel)).truncated, true);
+    assert.strictEqual((await runReviewAgent('codex', 'p', 5000, runDir, diff)).truncated, true);
     write(`printf '%s' '{"ok":1}' > "$out"; echo '${novel}'; exit 0`);
-    assert.strictEqual(runReviewAgent('codex', 'p', 5000, runDir, diff).truncated, true);
+    assert.strictEqual((await runReviewAgent('codex', 'p', 5000, runDir, diff)).truncated, true);
     write(`: > "$out"; echo stdout-error-token; exit 3`);
-    assert.match(runReviewAgent('codex', 'p', 5000, runDir).error, /stdout-error-token/);
+    assert.match((await runReviewAgent('codex', 'p', 5000, runDir)).error, /stdout-error-token/);
   } finally {
     process.env.PATH = prevPath;
     fs.rmSync(dir, { recursive: true, force: true });
