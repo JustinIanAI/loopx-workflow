@@ -287,6 +287,16 @@ PR 正文的逐文件说明来自真实 diff hunk/符号或模型输出；无法
 
 `--with-ocr` 只影响 `check` 里的扫描脚本，不改变 `review` 的发布条件。
 
+### 8.1 纯文档 PR 的审查豁免与静态三项自检 (ADR-0006)
+
+当 PR 为纯 Markdown 变动（如全局架构规范治理、docs-only 决策批）时，触发双轨流转中的纯文档路径：
+- **豁免 L2 代码对抗审查**：不调用 `authentic-review.js` 跑模型审查，不要求 `### 关键代码讲解`，不阻塞于缺失的 CI 状态（启用 `--no-pr-review-wait-for-ci`），不强制生成代码质量收据。
+- **替代门禁：文档静态三项核验**：
+  1. ADR 元数据完整（包含 `Status: Accepted`、审批人与决策日期）。
+  2. 需求与设计交叉引用无死链（所引用的 `REQ-*`、`ADR-*` 存在且一致）。
+  3. Markdown 语法合规。
+- **合入依据**：以线下/线上研讨纪要或 `design-grill` 决策记录为准，人类 Maintainer 在 PR 页面直接 Approve 后 Squash 合入。日常特性研发采用契约与代码同分支单 PR 交付。
+
 ### 8.2 证据契约与新鲜度 (ADR-0011)
 
 `05-evidence.md` 由 `ingest` 生成：Evidence Ref 用既有 REQ/Story/AC/Test 拼接，不新开编号；六状态 `passed/failed/blocked/not_run/not_applicable/deferred`；四门禁不得标 `not_applicable`。`ingest` 只消费 `check` 的退出码，缺结果拒绝写 `passed`。
@@ -299,15 +309,45 @@ LoopX `validation.status` 只映射 `passed/failed/skipped`：`not_run/blocked/d
 
 Stage 2 的超时、非 0、截断标记、JSON 不可解析一律 `[NOT_VERIFIED]`、非 0 退出、保留 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 留证，且禁止调用 `gh` 发布；补证由 `check-result` 报错驱动按内聚域分批（≤3 域、≤2 轮有界收敛）。`gates()` 与 `buildEvidenceGraph` 锚定 `runDir/repo/` 的精确 `headRefOid` 只读代码树；本机 HEAD 不匹配时跳过本地实测并将对应 validation 行标 `unverified`。INV2/INV4/INV5 不变量分别挂靠 `REQ-RESPOND-1`/`REQ-EVIDENCE-1`/`REQ-REVIEW-2`（见 ADR-0013 增补决策 4），不新开编号体系。
 
-### 8.1 纯文档 PR 的审查豁免与静态三项自检 (ADR-0006)
+#### 8.2.2 审查管线可靠性契约（ADR-0017）
 
-当 PR 为纯 Markdown 变动（如全局架构规范治理、docs-only 决策批）时，触发双轨流转中的纯文档路径：
-- **豁免 L2 代码对抗审查**：不调用 `authentic-review.js` 跑模型审查，不要求 `### 关键代码讲解`，不阻塞于缺失的 CI 状态（启用 `--no-pr-review-wait-for-ci`），不强制生成代码质量收据。
-- **替代门禁：文档静态三项核验**：
-  1. ADR 元数据完整（包含 `Status: Accepted`、审批人与决策日期）。
-  2. 需求与设计交叉引用无死链（所引用的 `REQ-*`、`ADR-*` 存在且一致）。
-  3. Markdown 语法合规。
-- **合入依据**：以线下/线上研讨纪要或 `design-grill` 决策记录为准，人类 Maintainer 在 PR 页面直接 Approve 后 Squash 合入。日常特性研发采用契约与代码同分支单 PR 交付。
+以下契约以 ADR-0017（Proposed）为准；`REVIEW_MAX_TOTAL_ATTEMPTS`、`REVIEW_MAX_TOTAL_MS`、`REVIEW_STATE_STALE_MS`、`owner.lock` 与三件齐全 salvage 判据为提案项，ADR 接受并实现前不改变现有行为与失败条件。
+
+**阶段状态**：`loopx_flow_review_stage_state_v1` 是本地运行状态，不是证据。身份组（`pr`/`stage`/`head_oid`/`prompt_sha256`/`agent_bin`/`selection_hash`）任一变化即作废旧状态；`attempts_total` 跨进程累计；产物只落本进程运行目录；`pipeline.log` 写失败只告警，不阻断审查。
+
+**预算**：单次 `REVIEW_TIMEOUT_MS` 默认 600000、硬上限 `REVIEW_TIMEOUT_MS_MAX` 默认 7200000，非法值 fail-closed；单 head 总尝试 `REVIEW_MAX_TOTAL_ATTEMPTS` 默认 3、硬上限 6，总时间 `REVIEW_MAX_TOTAL_MS` 默认 `REVIEW_TIMEOUT_MS × 总尝试上限`，两者必须跨进程累计，达上限即停止重试；只有 `ETIMEDOUT` 可重试，CLI 缺失、stdin 超限、截断一次即终。
+
+**salvage**：只有 `review_body` + `verdict` + `declaration` 三件齐全且可解析才按成功恢复；缺一即按 `TRUNCATED` fail-closed。被接受的 salvage 必须在 `## 我的整体评价` 机械披露恢复字段清单，并写入 `05-evidence.md`，`Status` 不得因 salvage 升为 `passed`。
+
+**并发与续跑**：运行子目录 `review-pr<N>/<pid>-<random>/` 创建时原子写 `owner.lock`（`O_EXCL`）；发现候选目录必须跳过活跃锁；`pid` 不存在或 mtime 超过 `REVIEW_STATE_STALE_MS`（默认 `2 × REVIEW_TIMEOUT_MS_MAX`）视为陈旧；只删本进程子目录，父目录仅在已空时删除。
+
+**复用分工**：阶段状态只复用"同 head + 同 prompt + 同模型身份"的模型输出；`.loopx/cache/reviews` 只做整轮短路且命中必须重跑 `--check-result`；结论是否仍有效只由原生 `--fresh-audit-exact-head` 判定。三者都不得替代发布前的 `--check-result ok === true`。
+
+**Goal 身份**：`review` 必须解析 `<feature>-goal` 或显式 `--goal-id`，并以 `--goal-id` 传给 `loopx pr-review`；拉包与 `--check-result` 必须使用同一 Goal 配置与同一 packet；无法解析时 fail-closed，不得回落机器默认。
+
+**证据交叉**：`05-evidence.md` 必须同时记录本轮 `check-result` 摘要（`ok`、`approval_blockers` 计数、`reviewed_head`）与 `change-quality` receipt 标识（goal、diff SHA、receipt 路径/ID），两者绑定同一 `headRefOid` 与 `scope_fingerprint`。
+
+### 8.3 原生 pr-review 能力消费矩阵（ADR-0017）
+
+编排层只做绑定、校验与投影；审查队列与结论有效性以 `loopx pr-review` 为准。新增消费项必须先在本节登记并写明失败条件。
+
+| 原生能力 | 当前状态 | 消费约束 |
+| :--- | :--- | :--- |
+| `--target-exact-head` 评审包 | 已消费 | 只按精确 head 拉包；命令失败 `NOT_VERIFIED` |
+| `review_template` 五段 | 已消费 | 版式唯一来源；缺失 `NOT_VERIFIED`，不自造五段 |
+| `agent_response_contract.review_execution_contract` | 已消费 | 证据项由主机装配，模型不手写全量 JSON |
+| `review_plan.required_evidence_ids` / `evidence_commands` | 已消费 | 只执行清单内命令；输出落沙箱 |
+| `--check-result` | 已消费（硬门禁） | `ok === true` 才允许发布；封顶时投影 `approval_blockers` |
+| `--check-merge-readiness` | 已消费 | Mode A/B/默认三种判定；exact head + 二次 HEAD 校验 |
+| `--goal-id` | 待实现（D6） | 当前 `review` 未传；实现后 `review` 与 `merge` 都必须传，缺失 fail-closed |
+| `--fresh-audit-exact-head` | 待收敛（D5） | 结论有效性唯一权威；`--force-recheck` 必须对齐，不得只清本地缓存 |
+| `--check-approval-closeout` | 未消费 | 归 ADR-0012；Mode A/B 审批事实源待从 `gh pr view` 收敛 |
+| 队列 `--state` / `--review-order` / `--since` / `--limit` | 未消费 | 当前单 PR 定向；他人 PR 优先无执行保障 |
+| `--autonomous-observation` 系列 | 未消费 | 自主巡检未启用；启用前登记状态目录与幂等键 |
+| `loopx review-batch` | 未消费 | 批量审查走独立 Issue；禁止自建第三套批量逻辑 |
+| `loopx review-packet` | 未消费 | Goal 交付包，与本管线不同层；需要时显式接入 |
+
+**写权限边界**：原生 skill 是只读入口，不 comment / approve / merge。`loopx-flow review` 发布 formal review 的前提是：PR 非 Draft、精确 head、`check-result ok === true`、人类断点授权（Mode A 非作者 Approve / Mode B `release-approve`）。Agent 只发 COMMENT / REQUEST_CHANGES，不生成 author-owned 批准标题。`respond` 与复审 carryover 复用同一五段，不另立报告格式。
 
 ## 9. 资产
 
