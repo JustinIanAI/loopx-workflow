@@ -2539,7 +2539,14 @@ async function main() {
   process.exit(0);
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+  // ADR-0017 Stage 1 起 main 为 async：入口统一收口 rejection，
+  // 避免未捕获拒绝以崩溃栈退出而丢失 [NOT_VERIFIED] 诊断标记。
+  main().catch((err) => {
+    console.error(`[NOT_VERIFIED] authentic review pipeline aborted: ${err && err.message ? err.message : String(err)}`);
+    process.exit(1);
+  });
+}
 
 module.exports = {
   finalizeReviewBody,
