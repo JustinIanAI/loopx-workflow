@@ -96,7 +96,7 @@ Node 侧对应 `fs.mkdtempSync` + `process.on('exit', code => ...)`（以及 `SI
 |---|---|---|
 | `WORKFLOW_ROOT` | 工作流代码/技能资产所在 | 脚本自身位置（`pwd -P` 规范化） |
 | `REPO_ROOT` | 被操作的目标仓库（当前 worktree） | 惰性求值：`git -C "$PWD" rev-parse --show-toplevel`；非 Git 仓时返回空，由命令按需调用 `require_repo_root` fail-closed（避免误伤 `help` 与 `preflight-check.sh --fix` 的首次 `git init`） |
-| `LOOPX_REGISTRY` | LoopX 项目注册表 | 全局 `--registry <path>` > `LOOPX_REGISTRY` env > `$REPO_ROOT/.loopx/registry.json`；按命令矩阵在入口 fail-closed（D1） |
+| `LOOPX_REGISTRY` | LoopX 项目注册表 | 全局 `--registry <path>` > `LOOPX_REGISTRY` env > `$REPO_ROOT/.loopx/registry.json` > LoopX 自报的运行时 registry（`loopx --format json status` 的 `registry`，仅非附属 worktree；[ADR-0024](../adr/0024-resolve-runtime-registry-from-loopx.md)）；按命令矩阵在入口 fail-closed（D1） |
 | `LOOPX_TMP_DIR` | 临时沙箱 | env > `$REPO_ROOT/.loopx/tmp`（每个 worktree 各自一份，天然隔离；非 Git 仓的 `preflight` 等场景安全回退到 `$WORKFLOW_ROOT/.loopx/tmp` 或变量捕获） |
 
 资产读取用 `WORKFLOW_ROOT`；一切数据读写（`.loopx/*`、`specs/*`、git 操作、`--repo-path`、`npm --prefix` / `cd "$REPO_ROOT"`）用 `REPO_ROOT`。`bin/loopx-flow` 中 85 处 `PROJECT_ROOT` 逐一归类；CWD 相对路径一律改为基于 `REPO_ROOT`。

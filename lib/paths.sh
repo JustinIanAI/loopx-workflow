@@ -110,6 +110,32 @@ wf_main_checkout_registry_hint() {
     return 1
 }
 
+# ADR-0024：向 LoopX 索取它自己解析出的 registry 路径。
+# D1 迁移后权威 registry 位于 runtime_root（默认 ~/.loopx/registry.global.json），
+# <repo>/.loopx/registry.json 只是旧的 per-project 位置。编排器不猜路径、也不拼兜底：
+# `loopx --format json status` 回显当前生效的 registry。取不到（loopx 缺失、JSON 不可解析、
+# 路径不存在）时返回 1，调用方保持原有 fail-closed 语义。
+wf_loopx_default_registry() {
+    local json="" resolved=""
+    command -v loopx >/dev/null 2>&1 || return 1
+    # `loopx status` 在 `ok:false`（如 registry 内存在既有契约错误）时仍输出含 `registry`
+    # 的合法 JSON，但退出码为 1——因此只看输出能否解析，不看退出码。
+    json="$(loopx --format json status 2>/dev/null || true)"
+    [[ -n "$json" ]] || return 1
+    resolved="$(printf '%s' "$json" | node -e '
+let buf = "";
+process.stdin.on("data", (chunk) => { buf += chunk; });
+process.stdin.on("end", () => {
+    try {
+        const registry = JSON.parse(buf).registry;
+        if (typeof registry === "string" && registry) process.stdout.write(registry);
+    } catch (_) { /* 不可解析 → 输出空，交由调用方 fail-closed */ }
+});
+' 2>/dev/null)" || return 1
+    [[ -n "$resolved" && -f "$resolved" ]] || return 1
+    printf '%s' "$resolved"
+}
+
 # D1: 强制校验 LoopX registry 存在；附属 worktree 缺 registry 一律 fail-closed，
 # 只提示主 checkout 候选路径，绝不自动回指。
 wf_require_registry() {
@@ -128,6 +154,23 @@ wf_require_registry() {
         else
             echo "          (2) 显式指定 --registry <主 checkout>/.loopx/registry.json 或导出 LOOPX_REGISTRY" >&2
         fi
+        exit 1
+    fi
+    # ADR-0024：非附属 worktree 且未显式指定时，改用 LoopX 自报的运行时 registry。
+    # 这不是放松 fail-closed —— 只有 LoopX 报出一个真实存在的 registry 才放行；
+    # 解析不出就落到下面的原有阻断。
+    if [[ "$LOOPX_REGISTRY_EXPLICIT" -eq 0 ]]; then
+        local resolved=""
+        if resolved="$(wf_loopx_default_registry)" && [[ -n "$resolved" ]]; then
+            LOOPX_REGISTRY_PATH="$resolved"
+            REGISTRY_ARGS=(--registry "$resolved")
+            echo "[i] 本地 .loopx/registry.json 缺失，改用 LoopX 运行时 registry: $resolved" >&2
+            return 0
+        fi
+    fi
+    if [[ "$LOOPX_REGISTRY_EXPLICIT" -eq 1 ]]; then
+        echo "[-] [FAIL-CLOSED] 显式指定的 LoopX registry 不存在: $LOOPX_REGISTRY_PATH" >&2
+        echo "    修复指令: 检查 --registry / LOOPX_REGISTRY 指向的路径，或运行 loopx bootstrap --project \"$REPO_ROOT\"" >&2
         exit 1
     fi
     echo "[-] [FAIL-CLOSED] 本地 LoopX registry 缺失: $LOOPX_REGISTRY_PATH" >&2
