@@ -75,6 +75,22 @@ if (!_budgetValid) {
   process.exit(1);
 }
 const REVIEW_CACHE_SCHEMA_V1 = 'loopx_flow_review_cache_v1';
+
+// ADR-0017：阶段重试总预算上限。单次预算 × 最大重试次数会让最长等待放大到 3×（默认 30 分钟）。
+// 默认只允许「首轮 + 至多一轮完整重试」；仍可通过 REVIEW_RETRY_BUDGET_MS 显式放宽，非法值 Fail-Closed。
+const _retryBudgetRaw = process.env.REVIEW_RETRY_BUDGET_MS;
+if (_retryBudgetRaw !== undefined && _retryBudgetRaw !== '') {
+  const parsed = Number(_retryBudgetRaw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.error(`[-] [FAIL-CLOSED] REVIEW_RETRY_BUDGET_MS 必须是正有限毫秒数（当前值: ${_retryBudgetRaw}）。`);
+    process.exit(1);
+  }
+}
+function resolveRetryBudgetMs(budgetMs) {
+  const override = Number(process.env.REVIEW_RETRY_BUDGET_MS);
+  if (Number.isFinite(override) && override > 0) return override;
+  return budgetMs * 2;
+}
 let _legacyCacheNoticePrinted = false;
 
 // 评审缓存目录（D2：锚定目标仓库 REPO_ROOT/.loopx/cache/reviews，可丢弃缓存，非权威状态）
@@ -438,6 +454,9 @@ async function runStageWithState(options) {
 
   let lastFailure = null;
   let attemptsUsed = 0;
+  let retryBudgetExhausted = false;
+  const retryBudgetMs = resolveRetryBudgetMs(budgetMs);
+  const stageStartedMs = Date.now();
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     attemptsUsed = attempt;
     const startedMs = Date.now();
@@ -551,6 +570,16 @@ async function runStageWithState(options) {
 
     if (errorClass !== 'ETIMEDOUT' || attempt >= maxAttempts) break;
 
+    // 总预算闸门：再来一轮最多再花 budgetMs；超出上限就停机，不把 3× 模型预算当成默认。
+    const elapsedTotal = Date.now() - stageStartedMs;
+    if (elapsedTotal + budgetMs > retryBudgetMs) {
+      retryBudgetExhausted = true;
+      writeStageState(repoRoot, pr, stage, { status: 'failed', error_class: errorClass, error_detail: detail, elapsed_ms: elapsed });
+      appendPipelineLog(repoRoot, pr,
+        `stage=${stage} attempt=${attempt} event=retry_budget_exhausted elapsed_total_ms=${elapsedTotal} retry_budget_ms=${retryBudgetMs} next_budget_ms=${budgetMs} reason=would_exceed_total_budget`);
+      break;
+    }
+
     const backoff = Math.min(backoffBaseMs * Math.pow(2, attempt - 1), RETRY_BACKOFF_CAP_MS);
     writeStageState(repoRoot, pr, stage, {
       status: 'retried',
@@ -568,6 +597,8 @@ async function runStageWithState(options) {
     error_class: lastFailure ? lastFailure.error_class : 'OTHER',
     error: lastFailure ? lastFailure.error : 'unknown stage failure',
     attempts: attemptsUsed,
+    retry_budget_exhausted: retryBudgetExhausted,
+    retry_budget_ms: retryBudgetMs,
   };
 }
 
@@ -1002,6 +1033,15 @@ function gates(opts = {}) {
   }
   if (!opts.noCache) GATES_CACHE = out;
   return out;
+}
+
+// P0（G2 锚定纠偏）：仅当本地 HEAD 与审查目标精确 headRefOid 一致时才允许本地四门禁实测；
+// 否则跳过本地实测（保留远端 CI 证据），validation 行保持 unverified（宁缺毋假）。
+function localGateAnchor(repoRoot, headOid) {
+  const r = sh('git', ['-C', repoRoot, 'rev-parse', 'HEAD']);
+  const localHead = r.status === 0 ? String(r.stdout || '').trim() : '';
+  const target = String(headOid || '').trim();
+  return { match: Boolean(localHead && target && localHead === target), localHead, headOid: target };
 }
 
 // ---------------------------------------------------------------------------
@@ -2176,7 +2216,18 @@ async function main() {
   });
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
-    try { validation = buildValidationMatrix(gates(), { headOid, remoteChecks }); } catch (e) { validation = []; }
+    try {
+      const anchor = localGateAnchor(repoRoot, headOid);
+      if (anchor.match) {
+        validation = buildValidationMatrix(gates(), { headOid, remoteChecks });
+      } else {
+        console.warn(`[WARN] 本地 HEAD (${anchor.localHead || 'unknown'}) != 审查目标 headRefOid (${anchor.headOid || 'unknown'})；跳过本地四门禁实测，仅保留远端 CI 证据，本地门禁行标 unverified（宁缺毋假）。`);
+        validation = buildValidationMatrix({}, { headOid, remoteChecks });
+      }
+    } catch (e) {
+      console.warn(`[WARN] 四门禁实测/validation 构建失败：${e && e.message ? e.message : e}；validation 行标 unverified。`);
+      validation = [];
+    }
   }
 
   // --- 3. 构建提示词：原生 review_template（透传，不重写）---
@@ -2278,6 +2329,7 @@ async function main() {
     plan: pkt.reviewPlan || {},
     diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
     modelEvidence: mergedModelEvidence,
+    repoRoot,
   });
 
   // ADR-0013 阶段 2（两阶段解耦）：当模型阶段 1 主观 verdict=APPROVE 但仍有未对齐的判断类证据行时，
@@ -2360,6 +2412,7 @@ async function main() {
           plan: pkt.reviewPlan || {},
           diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
           modelEvidence: mergedModelEvidence,
+          repoRoot,
         });
       }
     }
@@ -2539,7 +2592,14 @@ async function main() {
   process.exit(0);
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+  // ADR-0017 Stage 1 起 main 为 async：入口统一收口 rejection，
+  // 避免未捕获拒绝以崩溃栈退出而丢失 [NOT_VERIFIED] 诊断标记。
+  main().catch((err) => {
+    console.error(`[NOT_VERIFIED] authentic review pipeline aborted: ${err && err.message ? err.message : String(err)}`);
+    process.exit(1);
+  });
+}
 
 module.exports = {
   finalizeReviewBody,
@@ -2578,4 +2638,5 @@ module.exports = {
   formatStageError,
   STAGE_STATE_SCHEMA,
   MAX_STAGE_ATTEMPTS,
+  localGateAnchor,
 };
