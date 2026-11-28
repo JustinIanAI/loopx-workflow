@@ -24,9 +24,11 @@ if [[ "$args" == *"sync-global"* ]]; then exit 0; fi
 
 function approveGhMock(dir, commentsFile) {
   if (!fs.existsSync(commentsFile)) fs.writeFileSync(commentsFile, '[]');
+  const prJson = h.prViewJson(dir);
   h.mockGh(dir, `if [[ "$1" == "api" && "$2" == "user" ]]; then echo "executor"; exit 0; fi
 if [[ "$1" == "repo" && "$2" == "view" ]]; then echo "owner/repo"; exit 0; fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then echo "7"; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then printf '%s\\n' '${prJson}'; exit 0; fi
 if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then cat "$COMMENTS_FILE"; exit 0; fi
 exit 0
 `.replace('$COMMENTS_FILE', commentsFile));
@@ -51,6 +53,7 @@ test('T1 single_owner 非 TTY approve 必须失败且不写批准标记', () => 
   const dir = sandboxWithConfig('single_owner', { accepted_by: 'owner', accepted_at: '2026-11-12T00:00:00Z' });
   try {
     h.writeCapsule(dir, FEATURE);
+    h.publishSpecPackage(dir, FEATURE);
     approveLoopxMock(dir);
     approveGhMock(dir, path.join(dir, 'comments.json'));
     const r = h.run(dir, ['approve', 'contract', FEATURE]);
@@ -64,6 +67,7 @@ test('T2 single_owner approve --yes 必须失败', () => {
   const dir = sandboxWithConfig('single_owner', { accepted_by: 'owner', accepted_at: '2026-11-12T00:00:00Z' });
   try {
     h.writeCapsule(dir, FEATURE);
+    h.publishSpecPackage(dir, FEATURE);
     approveLoopxMock(dir);
     approveGhMock(dir, path.join(dir, 'comments.json'));
     const r = h.run(dir, ['approve', 'contract', FEATURE, '--yes']);
@@ -101,6 +105,7 @@ test('T5a independent 无第二账号 gate=1 评论必须失败', () => {
   const dir = sandboxWithConfig('independent');
   try {
     h.writeCapsule(dir, FEATURE);
+    h.publishSpecPackage(dir, FEATURE);
     approveLoopxMock(dir);
     approveGhMock(dir, path.join(dir, 'comments.json'));
     const r = h.run(dir, ['approve', 'contract', FEATURE]);
@@ -116,6 +121,7 @@ test('T5b independent 评论 SHA == configure-goal 锁定 SHA == 最终落盘 SH
     const capsule = h.writeCapsule(dir, FEATURE);
     // 评论必须绑定最终落盘字节（含固定批准标记行）的 SHA，而不是加标记前的 SHA
     const lockedSha = h.lockedShaFile(capsule.contractPath);
+    h.publishSpecPackage(dir, FEATURE);
     approveLoopxMock(dir);
     approveGhMock(dir, gateComments(dir, lockedSha));
     const r = h.run(dir, ['approve', 'contract', FEATURE]);
@@ -306,6 +312,7 @@ test('P1-1 & P2-1：gate1_spec_complete 拒绝仅含 Contract 字样而无 AC �
     // Valid contract updates bold **Contract Status**: and **Current Status**: in 00-INDEX.md
     const capsule = h.writeCapsule(dir, FEATURE);
     const lockedSha = h.lockedShaFile(capsule.contractPath);
+    h.publishSpecPackage(dir, FEATURE);
     approveGhMock(dir, gateComments(dir, lockedSha));
     const ok = h.run(dir, ['approve', 'contract', FEATURE]);
     assert.strictEqual(ok.status, 0, ok.stdout + ok.stderr);

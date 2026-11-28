@@ -815,16 +815,121 @@ if (missing.length) {
     return 0
 }
 
-find_gate1_independent_comment() {
-    local feature="$1" pre_sha="$2" executor="$3" spec_commit="$4" branch="feature/$1" repo pr comments
-    repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
-    [[ -n "$repo" ]] || return 1
-    pr="$(gh pr list --head "$branch" --state open --json number,isDraft --jq '.[0] | select(.isDraft == true) | .number' 2>/dev/null || true)"
-    [[ -n "$pr" && "$pr" != "null" ]] || return 1
-    comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null || true)"
+# presentation 状态文件（阶段 4 pr create --draft 的持久投影，位于不入 Git 的 .loopx/）
+presentation_state_file() {
+    printf '%s/presentation/%s.json' "$PROJECT_ROOT/.loopx" "$1"
+}
+
+# Gate1 发布前置（REQ-PR-LIFECYCLE-1 / ADR-0012 决策 3）：规格包必须已提交、已推送，
+# 且存在可读 PR。任何一项不满足即 fail-closed，禁止审批人在无法从远端审阅规格包时盲签。
+gate1_publication_preflight() {
+    local feature="$1"
+    local spec_dir="specs/features/$feature"
+    local f missing=()
+
+    command -v gh >/dev/null 2>&1 || {
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 未检测到 gh CLI，无法核验远端 PR。" >&2
+        return 1
+    }
+
+    for f in 01-decisions.md 03-stories.md 04-contract.md; do
+        if ! git -C "$PROJECT_ROOT" ls-files --error-unmatch "$spec_dir/$f" >/dev/null 2>&1; then
+            missing+=("$spec_dir/$f")
+        fi
+    done
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 规格包未被 Git 跟踪: ${missing[*]}" >&2
+        echo "💡 为什么阻断？审批人不在执行 Agent 的机器上，只有被跟踪并推送的规格包才能进入 PR 被审阅。" >&2
+        echo "🛠️ 修复指令: git add $spec_dir && git commit -m \"docs($feature): publish spec package\" && git push" >&2
+        return 1
+    fi
+
+    local marker
+    marker="$(presentation_state_file "$feature")"
+    if [[ -f "$marker" ]]; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 存在 presentation=pending 标记 ($marker)。" >&2
+        echo "💡 为什么阻断？阶段 4 的 pr create --draft 失败后没有恢复，PR 不是可读的审阅载体（旧语义只 WARN，现已 BLOCK）。" >&2
+        echo "🛠️ 修复指令: 修复 gh 认证/网络后重跑 loopx-flow pr create $feature --draft，成功后再 approve。" >&2
+        return 1
+    fi
+
+    local pending
+    pending="$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=all -- "$spec_dir" 2>/dev/null || true)"
+    if [[ -n "$pending" ]]; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 规格包存在未提交或未跟踪文件:" >&2
+        printf '%s\n' "$pending" | sed 's/^/    /' >&2
+        echo "🛠️ 修复指令: git add $spec_dir && git commit && git push" >&2
+        return 1
+    fi
+
+    local branch head_sha remote_sha
+    branch="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 当前处于 detached HEAD，无法绑定远端分支。" >&2
+        return 1
+    fi
+    head_sha="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true)"
+    remote_sha="$(git -C "$PROJECT_ROOT" ls-remote --heads origin "refs/heads/$branch" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+    if [[ -z "$remote_sha" ]]; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 分支 $branch 尚未推送到 origin。" >&2
+        echo "🛠️ 修复指令: git push -u origin $branch" >&2
+        return 1
+    fi
+    if [[ "$remote_sha" != "$head_sha" ]]; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 本地 HEAD ($head_sha) 与 origin/$branch ($remote_sha) 不一致。" >&2
+        echo "💡 为什么阻断？审批人审阅的远端提交必须就是被锁定的 spec_commit；本地领先或落后都禁止签署。" >&2
+        echo "🛠️ 修复指令: git pull --rebase origin $branch 或 git push origin $branch 对齐后再 approve" >&2
+        return 1
+    fi
+
+    local pr_json pr_meta pr_number pr_head
+    if ! pr_json="$(cd "$PROJECT_ROOT" && gh pr view "$branch" --json number,state,isDraft,url,headRefOid 2>/dev/null)"; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 分支 $branch 没有可读的 PR。" >&2
+        echo "🛠️ 修复指令: loopx-flow pr create $feature --draft" >&2
+        return 1
+    fi
+    if ! pr_meta="$(printf '%s' "$pr_json" | node -e '
+let d = {};
+try { d = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch (_) { process.exit(1); }
+const number = Number(d.number || 0);
+if (!number || !d.url) process.exit(1);
+if (String(d.state || "").toUpperCase() !== "OPEN") process.exit(1);
+process.stdout.write(number + " " + String(d.headRefOid || ""));
+')"; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: 分支 $branch 的 PR 不可读或不是 OPEN 状态。" >&2
+        echo "🛠️ 修复指令: loopx-flow pr create $feature --draft" >&2
+        return 1
+    fi
+    pr_number="${pr_meta%% *}"
+    pr_head="${pr_meta#* }"
+    if [[ -n "$pr_head" && "$pr_head" != "$head_sha" ]]; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置失败: PR #$pr_number head ($pr_head) 与本地 HEAD ($head_sha) 不一致。" >&2
+        echo "🛠️ 修复指令: git push origin $branch 让 PR head 对齐后再 approve" >&2
+        return 1
+    fi
+    echo "[✓] Gate1 发布前置通过: PR #$pr_number ($branch@${head_sha:0:12}) 可读，规格包已跟踪并推送。" >&2
+}
+
+# 统一解析 Gate 授权评论（Gate1 independent / Gate1 single_owner / Gate2 Mode B）。
+#
+#   gate_comment_author <comments-json> <marker> <eq|neq> <login> <self-key|-> <key=value>...
+#
+# 输出匹配评论的作者 login；无匹配返回 1；分页载荷不可读返回 2。
+#   <eq|neq>    身份条件：评论作者 == login / != login
+#   <self-key>  要求该字段值等于评论作者（approver / principal），"-" 表示不校验
+#   <key=value> 其余必须逐字相等的字段
+#
+# 三处调用点只传 marker、身份条件与必需字段，分页拆段、字段解析与自洽校验只有这一份。
+gate_comment_author() {
+    local comments="$1"
+    shift
     node -e '
 const fs = require("fs");
-const executor = process.argv[1], feature = process.argv[2], preSha = process.argv[3], specCommit = process.argv[4];
+const [marker, idMode, idLogin, selfKey, ...required] = process.argv.slice(1);
+const need = Object.fromEntries(required.map((pair) => {
+  const i = pair.indexOf("=");
+  return [pair.slice(0, i), pair.slice(i + 1)];
+}));
 const raw = fs.readFileSync(0, "utf8").trim();
 const rows = [];
 try {
@@ -832,7 +937,7 @@ try {
   while (i < raw.length) {
     while (i < raw.length && /\s/.test(raw[i])) i++;
     if (i >= raw.length) break;
-    if (raw[i] !== "[") process.exit(1);
+    if (raw[i] !== "[") process.exit(2);
     let depth = 0, inStr = false, esc = false, start = i;
     for (; i < raw.length; i++) {
       const c = raw[i];
@@ -841,20 +946,40 @@ try {
       if (c === "[") depth++;
       else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
     }
-    if (depth !== 0) process.exit(1);
+    if (depth !== 0) process.exit(2);
     rows.push(...JSON.parse(raw.slice(start, i)));
   }
-} catch (_) { process.exit(1); }
-const marker = "<!-- loopx-flow:gate1-authorization:" + feature + "@" + preSha + " -->";
+} catch (_) { process.exit(2); }
 for (const row of rows) {
   const body = String(row.body || ""), login = String((row.user || {}).login || "");
-  if (!body.includes(marker) || !login || login === executor) continue;
+  if (!login || !body.includes(marker)) continue;
+  if (idMode === "eq" ? login !== idLogin : login === idLogin) continue;
   const fields = {};
-  for (const part of body.split(/[;\n]/)) { const i = part.indexOf("="); if (i <= 0) continue; const k = part.slice(0, i).trim(); if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim(); }
-  if (fields.gate === "1" && fields.mode === "independent" && fields.contract_sha === preSha && fields.spec_commit === specCommit && fields.approver === login) { process.stdout.write(login); process.exit(0); }
+  for (const part of body.split(/[;\n]/)) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    const k = part.slice(0, i).trim();
+    if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim();
+  }
+  if (selfKey !== "-" && fields[selfKey] !== login) continue;
+  if (!Object.entries(need).every(([k, v]) => fields[k] === v)) continue;
+  process.stdout.write(login);
+  process.exit(0);
 }
 process.exit(1);
-' "$executor" "$feature" "$pre_sha" "$spec_commit" <<< "$comments"
+' "$@" <<< "$comments"
+}
+
+find_gate1_independent_comment() {
+    local feature="$1" pre_sha="$2" executor="$3" spec_commit="$4" branch="feature/$1" repo pr comments
+    repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    [[ -n "$repo" ]] || return 1
+    pr="$(gh pr list --head "$branch" --state open --json number,isDraft --jq '.[0] | select(.isDraft == true) | .number' 2>/dev/null || true)"
+    [[ -n "$pr" && "$pr" != "null" ]] || return 1
+    comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null || true)"
+    gate_comment_author "$comments" "<!-- loopx-flow:gate1-authorization:$feature@$pre_sha -->" \
+        neq "$executor" approver \
+        gate=1 mode=independent contract_sha="$pre_sha" spec_commit="$spec_commit"
 }
 
 # ADR-0019：当前分支对应的 open PR（Gate1/Gate2 GitHub 签名路径使用）。
@@ -886,42 +1011,9 @@ find_gate1_single_owner_comment() {
     pr="$(current_branch_pr)" || return 1
     [[ -n "$pr" && "$pr" != "null" ]] || return 1
     comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null || true)"
-    node -e '
-const fs = require("fs");
-const acceptedBy = process.argv[1], feature = process.argv[2], preSha = process.argv[3], specCommit = process.argv[4];
-const raw = fs.readFileSync(0, "utf8").trim();
-const rows = [];
-try {
-  let i = 0;
-  while (i < raw.length) {
-    while (i < raw.length && /\s/.test(raw[i])) i++;
-    if (i >= raw.length) break;
-    if (raw[i] !== "[") process.exit(1);
-    let depth = 0, inStr = false, esc = false, start = i;
-    for (; i < raw.length; i++) {
-      const c = raw[i];
-      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
-      if (c === "\"") { inStr = true; continue; }
-      if (c === "[") depth++;
-      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
-    }
-    if (depth !== 0) process.exit(1);
-    rows.push(...JSON.parse(raw.slice(start, i)));
-  }
-} catch (_) { process.exit(1); }
-const marker = "<!-- loopx-flow:gate1-authorization:" + feature + "@" + preSha + " -->";
-for (const row of rows) {
-  const body = String(row.body || ""), login = String((row.user || {}).login || "");
-  if (!body.includes(marker) || !login || login !== acceptedBy) continue;
-  const fields = {};
-  for (const part of body.split(/[;\n]/)) { const i = part.indexOf("="); if (i <= 0) continue; const k = part.slice(0, i).trim(); if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim(); }
-  if (fields.gate === "1" && fields.mode === "single_owner" && fields.contract_sha === preSha && fields.spec_commit === specCommit && fields.approver === acceptedBy) {
-    process.stdout.write(login);
-    process.exit(0);
-  }
-}
-process.exit(1);
-' "$accepted_by" "$feature" "$pre_sha" "$spec_commit" <<< "$comments"
+    gate_comment_author "$comments" "<!-- loopx-flow:gate1-authorization:$feature@$pre_sha -->" \
+        eq "$accepted_by" approver \
+        gate=1 mode=single_owner contract_sha="$pre_sha" spec_commit="$spec_commit"
 }
 
 gate1_user_gate_evidence() {
@@ -1083,40 +1175,10 @@ release_authorization_ok() {
     repo="$(github_repo)"
     [[ -n "$repo" ]] || return 1
     comments="$(gh api "repos/$repo/issues/$pr_id/comments" --paginate 2>/dev/null || true)"
-    node -e '
-const fs = require("fs");
-const pr = process.argv[1], head = process.argv[2], acceptedBy = process.argv[3], contractSha = process.argv[4], risk = process.argv[5];
-const raw = fs.readFileSync(0, "utf8").trim();
-const rows = [];
-try {
-  let i = 0;
-  while (i < raw.length) {
-    while (i < raw.length && /\s/.test(raw[i])) i++;
-    if (i >= raw.length) break;
-    if (raw[i] !== "[") process.exit(1);
-    let depth = 0, inStr = false, esc = false, start = i;
-    for (; i < raw.length; i++) {
-      const c = raw[i];
-      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
-      if (c === "\"") { inStr = true; continue; }
-      if (c === "[") depth++;
-      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
-    }
-    if (depth !== 0) process.exit(1);
-    rows.push(...JSON.parse(raw.slice(start, i)));
-  }
-} catch (_) { process.exit(1); }
-const marker = "<!-- loopx-flow:release-authorization:" + pr + "@" + head + " -->";
-for (const row of rows) {
-  const body = String(row.body || ""), login = String((row.user || {}).login || "");
-  if (!body.includes(marker) || login !== acceptedBy) continue;
-  const fields = {};
-  for (const part of body.split(/[;\n]/)) { const i = part.indexOf("="); if (i <= 0) continue; const k = part.slice(0, i).trim(); if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim(); }
-  const ok = fields.gate === "2" && fields.mode === "single_owner" && fields.head === head && fields.principal === acceptedBy && fields.contract_sha === contractSha && fields.risk_acceptance === risk;
-  if (ok) process.exit(0);
-}
-process.exit(1);
-' "$pr_id" "$head_oid" "$accepted_by" "$contract_sha" "$risk" <<< "$comments"
+    # 输出被丢弃：本函数只回 0/1，匹配到的 login 不进入调用方 stdout。
+    gate_comment_author "$comments" "<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->" \
+        eq "$accepted_by" principal \
+        gate=2 mode=single_owner head="$head_oid" contract_sha="$contract_sha" risk_acceptance="$risk" >/dev/null
 }
 
 # Mode A：非作者 formal review APPROVED 且 review commit == 当前 head，PR 非 Draft（ADR-0012 决策 2②）
@@ -1253,11 +1315,25 @@ cmd_approve() {
     if ! gate1_spec_complete "$feature"; then
         echo "[-] [FAIL-CLOSED] 规格不完整: 04-contract 需含 AC/Scope/Verification Plan/依赖顺序/REQ或ADR，且每个 story id 在 AC 矩阵中有一行" >&2; exit 1
     fi
+    # 纯参数校验先于发布前置：--yes 永远拒绝，--interactive 的 TTY 能力也不依赖远端发布状态。
+    if [[ "$yes" == "true" ]]; then
+        echo "[-] [FAIL-CLOSED] 不支持 --yes：授权必须来自 accepted_by 的 GitHub 评论或 --interactive TTY" >&2
+        exit 1
+    fi
+    if [[ "$interactive" == "true" && ! -t 0 ]]; then
+        echo "[-] [FAIL-CLOSED] --interactive 需要 TTY 交互确认" >&2
+        exit 1
+    fi
 
     local principal="" executor="" spec_commit=""
 
     # 先落最终字节：批准标记行固定，不把审批人/时间写进参与哈希的正文。
-    local temp_contract="$contract_file.tmp.$$"
+    # 临时字节写到项目沙箱而非胶囊目录：否则 Gate1 发布前置的「胶囊内无未跟踪文件」检查
+    # 会把编排器自己的临时文件当成未跟踪规格包而自我阻断。文件名不含 feature，
+    # 避免任意 feature 名（含路径分隔符/引号）参与文件路径构造。
+    local temp_contract
+    mkdir -p "$LOOPX_TMP_DIR"
+    temp_contract="$(mktemp "$LOOPX_TMP_DIR/contract.XXXXXX")"
     wf_register_temp_file "$temp_contract"
     node -e '
 const fs = require("fs");
@@ -1314,6 +1390,13 @@ fs.writeFileSync(dst, text);
             echo "gate=1;mode=independent;contract_sha=$contract_sha;spec_commit=$spec_commit;approver=<第二 GitHub 账号 login>"
         fi
         exit 0
+    fi
+
+    # 发布前置先于任何授权确认：审批人无法从远端审阅规格包时不得进入签字环节（REQ-PR-LIFECYCLE-1）。
+    # 放在 --prepare 之后：生成签名模板是零写入动作，不构成授权。
+    if ! gate1_publication_preflight "$feature"; then
+        echo "[-] [FAIL-CLOSED] Gate1 发布前置未满足，禁止写批准标记。" >&2
+        exit 1
     fi
 
     if [[ "$mode" == "single_owner" ]]; then
@@ -1504,7 +1587,7 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
 ' "$gate_results_file" "$gate_name"
             continue
         fi
-        if gate_out="$(cd "$PROJECT_ROOT" && npm run "$gate_name" 2>&1)"; then
+        if gate_out="$(cd "$PROJECT_ROOT" && gate_child_env npm run "$gate_name" 2>&1)"; then
             gate_code=0; gate_status="passed"
         else
             gate_code=$?; gate_status="failed"
@@ -1749,25 +1832,25 @@ HELPTXT
 
     # 真实执行验证，失败一票熔断 (Fail-Closed)
     echo -e "    [1/5] 执行 Typecheck..."
-    if ! npm run typecheck >/dev/null 2>&1; then
+    if ! gate_child_env npm run typecheck >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] Typecheck 失败，阻断回复发布！${NC}" >&2
         exit 1
     fi
 
     echo -e "    [2/5] 执行 Lint..."
-    if ! npm run lint >/dev/null 2>&1; then
+    if ! gate_child_env npm run lint >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] Lint 失败，阻断回复发布！${NC}" >&2
         exit 1
     fi
 
     echo -e "    [3/5] 执行 Build..."
-    if ! npm run build >/dev/null 2>&1; then
+    if ! gate_child_env npm run build >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] Build 失败，阻断回复发布！${NC}" >&2
         exit 1
     fi
 
     echo -e "    [4/5] 执行 Test..."
-    if ! npm test >/dev/null 2>&1; then
+    if ! gate_child_env npm test >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] Test 失败，阻断回复发布！${NC}" >&2
         exit 1
     fi
@@ -1939,13 +2022,44 @@ HELPTXT
             pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
 
             echo -e "${BLUE}==> [PR 提交] 正在通过 GitHub CLI 创建 PR (对齐 PR #7545 双语 4-Part 体系)...${NC}"
-            local pr_url
+            local pr_url pr_err_file pr_err marker draft_hint=""
             local -a draft_args=()
-            [[ "$draft" == "true" ]] && draft_args=(--draft)
-            if pr_url="$(printf '%s' "$pr_body" | gh pr create --title "$title" --base "$base" --body-file - ${draft_args[@]+"${draft_args[@]}"} ${passthru_args[@]+"${passthru_args[@]}"})"; then
+            if [[ "$draft" == "true" ]]; then
+                draft_args=(--draft)
+                draft_hint=" --draft"
+            fi
+            marker="$(presentation_state_file "$feature")"
+            wf_run_dir pr-create
+            pr_err_file="$WF_RUN_DIR/gh-pr-create.err"
+            wf_register_temp_file "$pr_err_file"
+            if pr_url="$(printf '%s' "$pr_body" | gh pr create --title "$title" --base "$base" --body-file - ${draft_args[@]+"${draft_args[@]}"} ${passthru_args[@]+"${passthru_args[@]}"} 2>"$pr_err_file")"; then
+                wf_unregister_temp_file "$pr_err_file"
+                rm -f "$pr_err_file" "$marker"
                 echo -e "${GREEN}[✓] PR 创建成功: ${pr_url}${NC}"
+                echo "presentation=published"
             else
-                echo -e "${RED}[-] PR 创建失败。${NC}" >&2
+                pr_err="$(tr '\n' ' ' < "$pr_err_file" 2>/dev/null | cut -c1-400 || true)"
+                wf_unregister_temp_file "$pr_err_file"
+                rm -f "$pr_err_file"
+                # presentation=pending 必须可观测且持久：Gate1 approve 读取该标记并 BLOCK（不再是 WARN）。
+                mkdir -p "$(dirname "$marker")"
+                node -e '
+const fs = require("fs");
+const [file, feature, draft, reason] = process.argv.slice(1);
+fs.writeFileSync(file, JSON.stringify({
+  schema_version: "loopx_flow_presentation_v0",
+  feature,
+  presentation: "pending",
+  draft: draft === "true",
+  reason,
+  recorded_at: new Date().toISOString()
+}, null, 2) + "\n");
+' "$marker" "$feature" "$draft" "${pr_err:-gh pr create failed}"
+                echo -e "${RED}[-] PR 创建失败（presentation=pending）。${NC}" >&2
+                if [[ -n "$pr_err" ]]; then
+                    echo -e "    gh 输出: ${pr_err}${NC}" >&2
+                fi
+                echo -e "🛠️ 修复指令: 修复 gh 认证/网络后重跑 loopx-flow pr create $feature${draft_hint}；presentation=pending 会阻断 Gate1 approve。${NC}" >&2
                 exit 1
             fi
             ;;

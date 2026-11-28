@@ -187,6 +187,7 @@ describe('loopx-flow 现码止血', () => {
       'set -euo pipefail',
       'STUB_GH="$1"; export ARGV_OUT="$2"; shift 2',
       'title="feat(x): y"; base="main"; pr_body="BODY"',
+      'pr_err_file="${ARGV_OUT}.err"',
       'draft_args=(); passthru_args=()',
       'if [ "${1:-}" = "populated" ]; then draft_args=(--draft); passthru_args=(--label keep --assignee me); fi',
       `if pr_url="$(${command})"; then echo "URL:$pr_url"; else echo "FAILED"; exit 1; fi`,
