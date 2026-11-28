@@ -9,6 +9,14 @@ on:
 permissions:
   contents: read
 
+# 双版本覆盖：engines.node 为 >=22.22.3，Node 22 与 Node 25 都在声明支持范围内，
+# 默认 test reporter 的输出格式却随主版本漂移（Node 22 TAP `# fail 0`，Node 25 spec
+# `ℹ fail 0`），因此两条主版本都必须跑一次门禁。
+#
+# 注意：main 的 required status check context 固定为 "Four Gates"
+# （scripts/setup-branch-protection.sh），所以主线作业保持该名字；Node 25 用独立作业，
+# 若改成 matrix leg，check 名会变成 "Four Gates (22)"/"Four Gates (25)"，
+# required check 将永远等不到而卡死合并。
 jobs:
   four-gates:
     name: Four Gates
@@ -24,6 +32,36 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm run test
+
+  four-gates-node25:
+    name: Four Gates (Node 25)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '25'
           cache: npm
 
       - name: Install dependencies

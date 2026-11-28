@@ -64,7 +64,7 @@
 
 | ADR 编号 | 目标文件 | 触发节点 | 命中准入矩阵的原因 | 同步修订正文 |
 |---|---|---|---|---|
-| **ADR-0017** | `docs/adr/0017-review-pipeline-reliability.md` | **W13（P0，插入在 Issue #6「持续封装」相关 ADR 之前）** | 改变审查管线默认行为与非纯增量本地状态：`loopx_flow_review_stage_state_v1` 阶段状态、`REVIEW_TIMEOUT_MS` 超时预算、重试 / salvage 接受策略、并发隔离与跨进程续跑；这些语义此前由 PR #73 夹带引入，无 REQ/ADR 承接 | 修订 `docs/prd/loopx-workflow.md`（`REQ-REVIEW-2` 增补阶段状态与超时契约）、`docs/design/loopx-workflow-design.md`（审查管线章节）；在 [ADR-0013](../adr/0013-align-review-architecture-with-loopx-philosophy.md) 标注衔接关系 |
+| **ADR-0017** | `docs/adr/0017-review-pipeline-reliability.md`（已起草，Proposed） | **W13（P0，插入在 Issue #6「持续封装」相关 ADR 之前）** | 改变审查管线默认行为与非纯增量本地状态：`loopx_flow_review_stage_state_v1` 阶段状态、`REVIEW_TIMEOUT_MS` 超时预算、重试 / salvage 接受策略、并发隔离与跨进程续跑；这些语义此前由 PR #73 夹带引入，无 REQ/ADR 承接 | 修订 `docs/prd/loopx-workflow.md`（`REQ-REVIEW-2` 增补阶段状态与超时契约）、`docs/design/loopx-workflow-design.md`（审查管线章节）；在 [ADR-0013](../adr/0013-align-review-architecture-with-loopx-philosophy.md) 标注衔接关系；新增设计 §8.2.2 可靠性契约与 §8.3 能力消费矩阵 |
 
 **优先级（2026-11-27 拍板）**：ADR-0017 排期**前置**于 Issue #6「持续封装 loopx-flow 仍暴露的 LoopX 原生命令」所涉 ADR。理由：审查管线是 PR 生命周期证据的生产者，其可靠性缺陷会让后续所有 PR 的评审证据失真（Issue #78 已实证 stage1 超时导致证据缺失），属「先修工具、再修产品」。跟踪单：[#79](https://github.com/JustinIanAI/loopx-workflow/issues/79)。
 

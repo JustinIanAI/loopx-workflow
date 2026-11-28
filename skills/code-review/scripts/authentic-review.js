@@ -1004,6 +1004,15 @@ function gates(opts = {}) {
   return out;
 }
 
+// P0（G2 锚定纠偏）：仅当本地 HEAD 与审查目标精确 headRefOid 一致时才允许本地四门禁实测；
+// 否则跳过本地实测（保留远端 CI 证据），validation 行保持 unverified（宁缺毋假）。
+function localGateAnchor(repoRoot, headOid) {
+  const r = sh('git', ['-C', repoRoot, 'rev-parse', 'HEAD']);
+  const localHead = r.status === 0 ? String(r.stdout || '').trim() : '';
+  const target = String(headOid || '').trim();
+  return { match: Boolean(localHead && target && localHead === target), localHead, headOid: target };
+}
+
 // ---------------------------------------------------------------------------
 // 原生 LoopX pr-review 能力接入（版式与提示词的唯一来源）
 // ---------------------------------------------------------------------------
@@ -2176,7 +2185,18 @@ async function main() {
   });
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
-    try { validation = buildValidationMatrix(gates(), { headOid, remoteChecks }); } catch (e) { validation = []; }
+    try {
+      const anchor = localGateAnchor(repoRoot, headOid);
+      if (anchor.match) {
+        validation = buildValidationMatrix(gates(), { headOid, remoteChecks });
+      } else {
+        console.warn(`[WARN] 本地 HEAD (${anchor.localHead || 'unknown'}) != 审查目标 headRefOid (${anchor.headOid || 'unknown'})；跳过本地四门禁实测，仅保留远端 CI 证据，本地门禁行标 unverified（宁缺毋假）。`);
+        validation = buildValidationMatrix({}, { headOid, remoteChecks });
+      }
+    } catch (e) {
+      console.warn(`[WARN] 四门禁实测/validation 构建失败：${e && e.message ? e.message : e}；validation 行标 unverified。`);
+      validation = [];
+    }
   }
 
   // --- 3. 构建提示词：原生 review_template（透传，不重写）---
@@ -2278,6 +2298,7 @@ async function main() {
     plan: pkt.reviewPlan || {},
     diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
     modelEvidence: mergedModelEvidence,
+    repoRoot,
   });
 
   // ADR-0013 阶段 2（两阶段解耦）：当模型阶段 1 主观 verdict=APPROVE 但仍有未对齐的判断类证据行时，
@@ -2360,6 +2381,7 @@ async function main() {
           plan: pkt.reviewPlan || {},
           diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
           modelEvidence: mergedModelEvidence,
+          repoRoot,
         });
       }
     }
@@ -2578,4 +2600,5 @@ module.exports = {
   formatStageError,
   STAGE_STATE_SCHEMA,
   MAX_STAGE_ATTEMPTS,
+  localGateAnchor,
 };
