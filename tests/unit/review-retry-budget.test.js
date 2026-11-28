@@ -35,7 +35,7 @@ function timedOutStage(delayMs) {
   };
 }
 
-async function runWith(sbx, { delayMs, timeoutMs, env }) {
+async function runWith(sbx, { delayMs, timeoutMs, env, backoffBaseMs = 1 }) {
   const prev = process.env.REVIEW_RETRY_BUDGET_MS;
   if (env === undefined) delete process.env.REVIEW_RETRY_BUDGET_MS;
   else process.env.REVIEW_RETRY_BUDGET_MS = env;
@@ -52,7 +52,7 @@ async function runWith(sbx, { delayMs, timeoutMs, env }) {
       headOid: HEAD,
       timeoutMs,
       maxAttempts: 3,
-      backoffBaseMs: 1,
+      backoffBaseMs,
       heartbeatIntervalMs: 0,
       force: true,
       runFn: timedOutStage(delayMs),
@@ -116,4 +116,22 @@ test('非法 REVIEW_RETRY_BUDGET_MS 在加载期 Fail-Closed', () => {
   });
   assert.strictEqual(r.status, 1);
   assert.match(r.stderr, /REVIEW_RETRY_BUDGET_MS/);
+});
+
+test('退避计入总预算硬上限：剩余额度按 elapsed + backoff 裁剪', async () => {
+  const sbx = sandbox('retry-budget-backoff-');
+  try {
+    // timeoutMs=100 → 总预算 200ms；首轮花 ~100ms，退避 40ms 也占预算：
+    // 第二轮超时必须 ≤ 200 - 100 - 40 ≈ 60ms，而不是 100ms。
+    const r = await runWith(sbx, { delayMs: 200, timeoutMs: 100, backoffBaseMs: 40 });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.attempts, 2);
+    const log = fs.readFileSync(pipelineLogPath(sbx.dir, 42), 'utf8');
+    assert.match(log, /attempt=1\b[^\n]*event=retry[^\n]*backoff_ms=40/);
+    const second = log.match(/attempt=2\b[^\n]*event=start[^\n]*timeout_ms=(\d+)/);
+    assert.ok(second, '第二轮必须留下 start 记录');
+    assert.ok(Number(second[1]) <= 60, `第二轮超时必须扣掉退避，实际 ${second[1]}ms`);
+    const exhausted = log.match(/event=retry_budget_exhausted[^\n]*backoff_ms=(\d+)/);
+    assert.ok(exhausted, '预算耗尽事件必须记录退避');
+  } finally { sbx.restore(); }
 });

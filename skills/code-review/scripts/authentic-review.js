@@ -579,17 +579,17 @@ async function runStageWithState(options) {
     // 同时把下一轮超时裁到剩余额度：`retryBudgetMs` 仍是硬上限（ADR-0017 D2），
     // 而不是「剩余为正就再发一整份预算」。
     const elapsedTotal = Date.now() - stageStartedMs;
-    const remainingBudgetMs = retryBudgetMs - elapsedTotal;
+    // 退避发生在下一轮之前，必须计入硬上限；否则真实墙钟会越过 retryBudgetMs。
+    const backoff = Math.min(backoffBaseMs * Math.pow(2, attempt - 1), RETRY_BACKOFF_CAP_MS);
+    const remainingBudgetMs = retryBudgetMs - elapsedTotal - backoff;
     if (remainingBudgetMs <= 0) {
       retryBudgetExhausted = true;
       writeStageState(repoRoot, pr, stage, { status: 'failed', error_class: errorClass, error_detail: detail, elapsed_ms: elapsed });
       appendPipelineLog(repoRoot, pr,
-        `stage=${stage} attempt=${attempt} event=retry_budget_exhausted elapsed_total_ms=${elapsedTotal} retry_budget_ms=${retryBudgetMs} next_budget_ms=0 reason=no_remaining_budget`);
+        `stage=${stage} attempt=${attempt} event=retry_budget_exhausted elapsed_total_ms=${elapsedTotal} retry_budget_ms=${retryBudgetMs} backoff_ms=${backoff} next_budget_ms=0 reason=no_remaining_budget`);
       break;
     }
     attemptTimeoutMs = Math.min(budgetMs, remainingBudgetMs);
-
-    const backoff = Math.min(backoffBaseMs * Math.pow(2, attempt - 1), RETRY_BACKOFF_CAP_MS);
     writeStageState(repoRoot, pr, stage, {
       status: 'retried',
       error_class: errorClass,
