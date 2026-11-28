@@ -263,7 +263,7 @@ squash 不可回滚，merge 只做前向补偿；补偿以 PR/Goal/目录的可�
    - `--execute`：要求 `--goal-id` 或 `--init-goal`；调 `issue-fix caller-repo-branch --repo-path <root> --issue-branch fix/issue-<id> --validation-command "npm run test" --execute --format json`，建/领分支。
    - `ordered_loopx_todo_writeback_preview` 是 preview-only（`would_write=false`），不得直接当 Todo 写入。
 7. `comment_only` / `triage_only` 只打印响应建议，不建 Goal/分支。
-8. R0/R1/R2：R0 纯文档 0 Goal、不跑 `check`；R1/R2 绑定每 Issue Goal，先 red test，再修复、`loopx-flow check --goal-id`、`pr create --issue`、`review`、Gate2、`merge --goal-id`。Issue 路径不写 `05-evidence.md`。R2 留在 Issue 管线；只有 `contract_impact=changed` 才要求 Accepted ADR。Fast Path 不得绕过 Gate2；`scripts/fast-fix-push.sh` 不得直推 `main`。
+8. R0/R1/R2：R0 纯文档 0 Goal、不跑 `check`；R1/R2 绑定每 Issue Goal，先 red test，再修复、`loopx-flow check --goal-id`、`pr create --issue`、`review`、Gate2、`merge --goal-id`。Issue 路径不写 `05-evidence.md`。R2 留在 Issue 管线；只有 `contract_impact=changed` 才要求 Accepted ADR，被本 PR 新增/修改的 ADR 还需 Owner 的 `adr-accepted: <path>` + `head=<oid>` 授权评论（自证无效）。`merge` 解析 PR body 时按分支 Issue 编号选取 `loopx-impact` 标记（Issue 正文自带标记不参与判定），issue 字段与分支不一致 fail-closed。Fast Path 不得绕过 Gate2；`scripts/fast-fix-push.sh` 不得直推 `main`。
 
 AGENTS 管线 B 的规程必须在 `REQ-ISSUE-PIPELINE-1` 内执行，不能把 Fast-Path 当作绕过 Gate2 的例外。`fix_pr` 进入 Review 时，审查输入遵循 §8：大 Diff 落在运行沙箱并以只读路径传给审查者，stdin 超限或宿主截断标记一律 Fail-Closed，不在本管线内联大 Diff。
 

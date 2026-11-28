@@ -24,6 +24,7 @@
 4. **R2 Critical**：触及 Gate、授权、状态机、持久化、并发或公共契约。
    - **留在 Issue 管线**，不强制 Feature 胶囊；必须有回归证据、回滚说明、LoopX readiness 与 review-thread 检查。
    - 只有 `contract_impact=changed` 时才要求 Accepted ADR；`contract_impact=none` 允许无 ADR，但必须在 PR 中书面说明为何不改契约。
+   - 被 PR 自身新增/修改的 ADR 不能自证：除 head 上为 `Accepted` 外，还必须由 Owner（`accepted_by`）在 PR 上发布含 `adr-accepted: <path>` 与 `head=<oid>` 的授权评论（`release-approve --prepare` 自动生成该行）；作者自写 `Accepted` 不构成授权。
    - R2 不额外要求第二个 GitHub 账号；`independent` 模式的 Gate2 审批要求仍由 `authorization_mode` 决定。
 5. **机器可读标记**：Issue 与 PR body 使用
    `<!-- loopx-impact: {"level":"R1","issue":123,"contract_impact":"none","adrs":[],"regression":["tests/unit/issues/issue-123.test.js"],"rollback":"revert the fix commit"} -->`。

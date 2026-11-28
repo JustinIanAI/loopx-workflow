@@ -78,7 +78,7 @@
 ### 影响分级（impact，不是路线命名）
 - **R0 Isolated**：纯文档 / Typo / 错误日志 / 模板 / 无行为影响的隔离配置。纯文档 PR 按 ADR-0006 不建 Goal、不跑 `check`，但仍必须 Gate2；出现任何代码文件即回到 R1。
 - **R1 Behavioral**：有行为变化但未触及 Gate/授权/状态机/持久化/并发/公共契约。必须有每 Issue Goal、先 FAIL 的复现测试、`loopx-flow check --goal-id` Receipt、Gate2。
-- **R2 Critical**：Gate/授权/状态机/持久化/并发/公共契约。留在 Issue 管线，不强制 Feature 胶囊；必须有回归证据、回滚说明、LoopX readiness 与 review-thread 检查；只有 `contract_impact=changed` 时才要求 Accepted ADR。R2 不额外要求第二个 GitHub 账号。
+- **R2 Critical**：Gate/授权/状态机/持久化/并发/公共契约。留在 Issue 管线，不强制 Feature 胶囊；必须有回归证据、回滚说明、LoopX readiness 与 review-thread 检查；只有 `contract_impact=changed` 时才要求 Accepted ADR；被本 PR 自身新增/修改的 ADR 还需 Owner（`accepted_by`）在 PR 上发布含 `adr-accepted: <path>` 与 `head=<oid>` 的授权评论，作者自写 `Accepted` 不构成授权（`release-approve --prepare` 自动生成该行）。R2 不额外要求第二个 GitHub 账号。
 
 ### 执行命令（R1/R2 共用）
 1. 首次 `loopx-flow issue <id> --init-goal`，或显式 `--goal-id issue-<id>-goal`；不建 program Goal。
