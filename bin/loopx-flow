@@ -2596,7 +2596,10 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
                 fi
                 # 自证防护：本 PR 自己写的 Accepted 不构成授权证据（作者可以给自己盖章）。
                 # 变更的 ADR 必须另有 accepted_by 在 PR 上的授权评论，且该评论绑定当前 head。
-                if [[ ",$changed_adrs," == *",$adr,"* ]]; then
+                if [[ ",$changed_adrs," == *",$adr,"* && "$(auth_mode)" != "single_owner" ]]; then
+                    # independent 模式：非作者批准本身就是外部授权，ADR 接受由 Mode A 覆盖。
+                    echo -e "    ${YELLOW}[i] independent 模式：$adr 由本 PR 新增/修改，接受证据由非作者批准覆盖。${NC}"
+                elif [[ ",$changed_adrs," == *",$adr,"* ]]; then
                     local accepted_by comments_json
                     accepted_by="$(auth_accepted_by 2>/dev/null || true)"
                     if [[ -z "$accepted_by" ]]; then
