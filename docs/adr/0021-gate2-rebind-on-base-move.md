@@ -33,6 +33,7 @@
 
 - 授权对象从「commit」变为「改动内容」。指纹相同意味着**增删行文本（忽略 hunk 行号与上下文行、保留空白）**完全相同；空白与缩进敏感，因为四空格在 Markdown 里是代码块、在 YAML/Makefile 里能改变语义。
 - **不覆盖** commit message、提交作者、parent 拓扑、rebase 顺序；这是刻意选择——Gate 授权的是交付内容，不是提交流水。
+- **触发条件是「head 变了、改动指纹没变」，不校验 base 是否真的前进。** 因此同 base 上的 rebase / force-push（commit id 变、内容不变）同样可以重绑；本 ADR 的动机是 base 前进，但实现的判定面比动机更宽——这是有意为之的等价类（授权对象是内容），不是缺陷。
 - 仍然要求：评论作者 `== accepted_by`、`contract_sha` 一致、`risk_acceptance` 一致、`mode` 一致。任何一项不满足都不到达 patch-id 判定。
 - 冲突手工解决会改变 diff 文本 → 指纹改变 → 必须重新签字。仅空白/缩进调整同样改变指纹。这是设计意图，不是缺陷。
 - **边界：签名 head 必须仍能解析出该 PR 的改动。** 判定需要 signed head 在本机对象库中可从 `merge-base(base, signedHead)` 取到 diff；`gh pr update-branch` 的 merge commit 会保留旧 head 为祖先，主场景可用。若 Owner 采用 **rebase 后 force-push**，旧 head 可能已不可达且未 fetch → `isCommit` 失败 → 指纹不可得 → 静默退回「重新签字」（fail-closed，不会误放行）。这条路径上的签名雪崩未被消除。

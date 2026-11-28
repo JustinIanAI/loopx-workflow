@@ -97,7 +97,7 @@ L0 命令不是 LoopX 转发器，而是场景操作契约（遵循 [ADR-0010](.
 - **触发**：`release_authorization_ok` 在 `gate_comment_author` 精确匹配（标记 + `head`）失败后进入；仅当存在同一 PR、同一 `accepted_by` 作者、`gate=2`/`mode`/`principal`/`contract_sha`/`risk_acceptance` 全对齐而只有 `head` 不同的评论时才有候选。
 - **判定**：对每个候选 `head` 与当前 head，比较 `git patch-id --verbatim` 作用于 `git diff -U0 merge-base(base, <sha>) <sha>` 的指纹（`lib/gate2-rebind.js`，`same-change <baseRef> <signedHead> <currentHead>`）；`-U0` 剥 hunk 上下文使改动位移不变、`--verbatim` 保留空白使空白改动必变；base 用 `gh pr view --json baseRefName` 读到的分支名加 `origin/`。
 - **通过**：指纹一致 → `[WARN] Gate2 重绑（ADR-0021）：head <old> -> <new>` 后复用既有签名；**不写新评论、不改 PR**。
-- **拒绝**：指纹不等（内容改动、冲突手工解决、仅空白/缩进调整、空 diff、未知提交、`git` 失败）或读不到 base → 非 0，`merge` 不调用 `gh pr merge`。重绑只覆盖"换 base 导致的换 head"，不覆盖内容授权。
+- **拒绝**：指纹不等（内容改动、冲突手工解决、仅空白/缩进调整、空 diff、未知提交、`git` 失败）或读不到 base → 非 0，`merge` 不调用 `gh pr merge`。重绑只覆盖"head 变化且改动指纹不变"（不校验 base 是否前进，rebase / force-push 同样适用），不覆盖内容授权。
 
 **上游契约锚点与三层能力探针矩阵（`REQ-CAPABILITY-1` / [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md)）**：
 
@@ -321,7 +321,7 @@ Stage 2 的超时、非 0、截断标记、JSON 不可解析一律 `[NOT_VERIFIE
 
 #### 8.2.2 审查管线可靠性契约（ADR-0017）
 
-以下契约以 ADR-0017（Proposed）为准；`REVIEW_MAX_TOTAL_ATTEMPTS`、`REVIEW_MAX_TOTAL_MS` 与三件齐全 salvage 判据为提案项（`owner.lock` 认领与 `REVIEW_STATE_STALE_MS` 陈旧判定已随并发隔离落地），ADR 接受并实现前不改变现有行为与失败条件。
+以下契约以 ADR-0017（Proposed）为准；`REVIEW_MAX_TOTAL_ATTEMPTS`、`REVIEW_MAX_TOTAL_MS` 与三件齐全 salvage 判据为提案项（`owner.lock` 认领与 `REVIEW_STATE_STALE_MS` 陈旧判定已随并发隔离落地，不再属于提案项；仍为提案的是 `REVIEW_MAX_TOTAL_ATTEMPTS`、`REVIEW_MAX_TOTAL_MS` 与 salvage 判据），ADR 接受并实现前不改变现有行为与失败条件。
 
 **阶段状态**：`loopx_flow_review_stage_state_v1` 是本地运行状态，不是证据。身份组（`pr`/`stage`/`head_oid`/`prompt_sha256`/`agent_bin`/`selection_hash`）任一变化即作废旧状态；`attempts_total` 跨进程累计；产物只落本进程运行目录；`pipeline.log` 写失败只告警，不阻断审查。
 

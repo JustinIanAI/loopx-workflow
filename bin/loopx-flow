@@ -1248,7 +1248,12 @@ release_authorization_ok() {
     fi
     # ADR-0021（默认关闭）：head 不匹配时，若其余字段全对齐且改动指纹一致，复用既有签名。
     [[ "$(gate2_rebind_mode)" == "patch_id" ]] || return 1
-    candidates="$(gate2_rebind_candidates "$comments" "$pr_id" "$head_oid" "$accepted_by" "$contract_sha" "$risk")"
+    # `|| true`：本脚本是 set -euo pipefail，解析器遇到非 JSON（如代理返回 HTML 错误页）
+    # 会非 0 退出；不加兜底会让整个 merge 以裸退出码 2 结束，丢掉下面的 fail-closed 文案。
+    if ! candidates="$(gate2_rebind_candidates "$comments" "$pr_id" "$head_oid" "$accepted_by" "$contract_sha" "$risk")"; then
+        echo "[i] Gate2 重绑候选解析失败（评论不是合法 JSON），按 fail-closed 处理。" >&2
+        return 1
+    fi
     [[ -n "$candidates" ]] || return 1
     base_ref="$(gh pr view "$pr_id" --json baseRefName --jq .baseRefName 2>/dev/null || true)"
     [[ -n "$base_ref" ]] || return 1

@@ -395,6 +395,22 @@ test('Mode B + gate2_rebind：签署后改动内容 → 指纹不同，仍 fail-
   } finally { h.cleanup(dir); }
 });
 
+test('Mode B + gate2_rebind：评论不是合法 JSON → fail-closed 有文案，不得裸退出 2', () => {
+  const { dir } = setup({
+    mode: 'single_owner',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] }),
+    prepareRepo: (d) => h.withRebindHistory(d),
+  });
+  try {
+    enableRebind(dir);
+    fs.writeFileSync(path.join(dir, 'comments.json'), '<html>proxy error</html>');
+    const r = h.run(dir, ['merge', '1', FEATURE], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.notStrictEqual(r.status, 0, '解析失败必须非 0');
+    assert.match(r.stderr + r.stdout, /fail-closed|FAIL-CLOSED/i, '不得以裸退出码结束而丢掉 fail-closed 文案');
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), '', '失败路径不得调用 gh pr merge');
+  } finally { h.cleanup(dir); }
+});
+
 test('Mode B + gate2_rebind：contract_sha 不符的评论永不进入指纹判定', () => {
   const { dir, signedHead } = setup({
     mode: 'single_owner',
