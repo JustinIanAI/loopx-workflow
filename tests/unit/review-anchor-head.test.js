@@ -21,6 +21,7 @@ const { spawnSync } = require('node:child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const {
   localGateAnchor,
+  buildSkippedValidation,
 } = require(path.join(PROJECT_ROOT, 'skills/code-review/scripts/authentic-review.js'));
 const {
   buildEvidenceGraph,
@@ -154,5 +155,69 @@ describe('P0/B buildEvidenceGraph：repoRoot 锚定 invariant 测试路径解析
     const row = invariantRow(graph);
     assert.ok(row);
     assert.strictEqual(row.status, 'unverified', 'cwd 解析不到该文件时必须 unverified，证明锚定对象确实改变');
+  });
+});
+
+describe('C. 跳过本地门禁时的 validation 行（#74 评审 P0）', () => {
+  test('HEAD 不匹配 → 四门禁行必须是 unverified/NOT_RUN，不得伪造 failed 与 exit_code', () => {
+    const headOid = 'b'.repeat(40);
+    const rows = buildSkippedValidation(headOid, [{ name: 'Four Gates', bucket: 'in_progress' }]);
+    const gateRows = rows.filter((r) => ['typecheck', 'lint', 'build', 'test'].includes(r.case_id));
+    assert.strictEqual(gateRows.length, 4, '四个门禁行必须都在（缺行等于隐瞒「未运行」这一事实）');
+    for (const row of gateRows) {
+      assert.strictEqual(row.status, 'unverified', `${row.case_id} 未运行时必须 unverified`);
+      assert.strictEqual(row.result, 'NOT_RUN');
+      assert.strictEqual(row.exit_code, undefined, `${row.case_id} 未运行不得携带 exit_code`);
+    }
+  });
+});
+
+describe('D. evidence graph 的精确 head 守卫（#74 评审 P1）', () => {
+  const CONTRACT = {
+    evidence_requirements: [
+      {
+        evidence_id: 'validation_matrix',
+        items_field: 'items',
+        item_fields: ['case_id', 'invariant_or_case', 'command_or_check', 'status', 'result', 'required', 'skip_or_failure_reason'],
+      },
+    ],
+  };
+  const PLAN = { required_evidence_ids: ['validation_matrix'] };
+
+  function runWith(headAnchored) {
+    let executed = 0;
+    const graph = buildEvidenceGraph({
+      contract: CONTRACT,
+      plan: PLAN,
+      diff: '',
+      headOid: 'd'.repeat(40),
+      pr: 1,
+      motivation: 'evidence graph head guard',
+      validation: [],
+      modelEvidence: {
+        validation_matrix: {
+          items: [{ case_id: 'changed_invariant_positive', test_path: ['tests/unit/review-anchor-head.test.js'] }],
+        },
+      },
+      repoRoot: PROJECT_ROOT,
+      runNodeTest: () => { executed += 1; return { status: 0 }; },
+      headAnchored,
+    });
+    const row = graph.validation_matrix.items.find((it) => it && it.case_id === 'changed_invariant_positive');
+    return { row, executed };
+  }
+
+  test('headAnchored=false 时即使测试路径存在也不执行，行必须 unverified', () => {
+    const { row, executed } = runWith(false);
+    assert.ok(row, '应产出 changed_invariant_positive 行');
+    assert.strictEqual(executed, 0, 'HEAD 未锚定时禁止在任何本地代码上执行测试');
+    assert.strictEqual(row.status, 'unverified', '非被审查提交上的结果不能算 passed');
+    assert.strictEqual(row.exit_code, undefined);
+  });
+
+  test('headAnchored=true 时照常执行，作为上一条的对照', () => {
+    const { row, executed } = runWith(true);
+    assert.strictEqual(executed, 1, '锚定一致时必须真的执行');
+    assert.strictEqual(row.status, 'passed');
   });
 });
