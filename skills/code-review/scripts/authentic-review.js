@@ -261,14 +261,60 @@ function resumeMemo(repoRoot, pr) {
 
 // 跨进程发现：本 PR 父目录下，挑选包含 stage 状态文件、且按 mtime 最新的候选子目录。
 // 进程崩溃/中断时，每轮都会把 attempts_total 带_forward —— 正是依赖这个可发现的目录。
+//
+// 原子认领（ADR-0021 follow_up #1）：所有者已死的残留目录在事故后「立刻重试两次」时
+// 会被两个新进程同时 discover。若不排他认领，两者会共同写同名的 attempt 输出、
+// 先结束的再把目录整删 —— 原 ENOENT 竞态在这一支路重现。
+// 认领用 mkdir 抢占（原子且失败即 EEXIST），抢占陈旧认领用 rename 搬走（同样原子），
+// 因此任意时刻只有一个进程赢，输的一方必须放手。
+const RESUME_CLAIM_DIR = '.resume-claim';
+
+function claimHolderPid(claimDir) {
+  try {
+    const text = fs.readFileSync(path.join(claimDir, 'owner'), 'utf8');
+    const m = /^(\d+)/.exec(text.trim());
+    const pid = m ? Number(m[1]) : NaN;
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function claimPriorStateDir(dir) {
+  if (!dir) return false;
+  const claimDir = path.join(dir, RESUME_CLAIM_DIR);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      fs.mkdirSync(claimDir);
+      fs.writeFileSync(path.join(claimDir, 'owner'), `${process.pid}\n${new Date().toISOString()}\n`, 'utf8');
+      stateDirOwnedSet().add(dir);
+      return true;
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') return false;
+    }
+    const holder = claimHolderPid(claimDir);
+    if (holder === process.pid) {
+      stateDirOwnedSet().add(dir);
+      return true;
+    }
+    if (holder !== null && pidIsAlive(holder)) return false;
+    // 陈旧认领：搬走再抢建。rename 原子，两个进程只有一个能把目录搬走，输家下一轮照常竞争。
+    const stale = `${claimDir}.stale.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
+    try {
+      fs.renameSync(claimDir, stale);
+    } catch (_) { /* 已被别人搬走，回到竞争 */ }
+    try { fs.rmSync(stale, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+  }
+  return false;
+}
+
 function discoverPriorStateDir(repoRoot, pr) {
   const base = path.join(resolveTmpDir(repoRoot), `review-pr${pr}`);
   let entries;
   try {
     entries = fs.readdirSync(base, { withFileTypes: true });
   } catch (_) { return null; }
-  let best = null;
-  let bestMtime = -1;
+  const candidates = [];
   for (const ent of entries) {
     if (!ent.isDirectory()) continue;
     const dir = path.join(base, ent.name);
@@ -283,11 +329,24 @@ function discoverPriorStateDir(repoRoot, pr) {
       const files = fs.readdirSync(dir);
       const hasState = files.some((f) => f.endsWith('.state.json'));
       if (!hasState) continue;
-      const m = fs.statSync(dir).mtimeMs;
-      if (m > bestMtime) { bestMtime = m; best = dir; }
+      candidates.push({ dir, mtime: fs.statSync(dir).mtimeMs });
     } catch (_) { /* ignore */ }
   }
-  return best;
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  for (const cand of candidates) {
+    if (claimPriorStateDir(cand.dir)) return cand.dir;
+    skippedClaimedDirs().push({ dir: cand.dir, holder: claimHolderPid(path.join(cand.dir, RESUME_CLAIM_DIR)) });
+  }
+  return null;
+}
+
+// 认领失败（另一进程正持有）的目录（供 runStageWithState 落日志）。
+function skippedClaimedDirs() {
+  if (!Object.prototype.hasOwnProperty.call(discoverPriorStateDir, '_claimed')) {
+    Object.defineProperty(discoverPriorStateDir, '_claimed', { value: [], writable: true, enumerable: false, configurable: true });
+  }
+  if (!Array.isArray(discoverPriorStateDir._claimed)) discoverPriorStateDir._claimed = [];
+  return discoverPriorStateDir._claimed;
 }
 
 // 被跳过的活进程目录（供 runStageWithState 落日志，满足"跳过必须留痕"）。
@@ -479,6 +538,12 @@ async function runStageWithState(options) {
     const skipped = skippedDirs.shift();
     appendPipelineLog(repoRoot, pr,
       `event=resume_skipped reason=owner_process_alive dir=${path.basename(skipped.dir)} owner_pid=${skipped.owner} adopted_dir=${path.basename(stateDir)}`);
+  }
+  const claimedDirs = skippedClaimedDirs();
+  while (claimedDirs.length > 0) {
+    const skipped = claimedDirs.shift();
+    appendPipelineLog(repoRoot, pr,
+      `event=resume_skipped reason=claimed_by_live_process dir=${path.basename(skipped.dir)} holder_pid=${skipped.holder ?? '-'} adopted_dir=${path.basename(stateDir)}`);
   }
   const prior = readStageState(repoRoot, pr, stage);
   const sameIdentity = Boolean(prior)
@@ -2655,8 +2720,14 @@ async function main() {
       // 父目录已空时一并移除（保持 tmpDir 零残留）；并发 sibling 目录存在时 rmdir 抛 ENOTEMPTY → ignore
       try { fs.rmdirSync(path.dirname(stateDir)); } catch (_) { /* ignore */ }
     } else {
-      appendPipelineLog(repoRoot, o.pr,
-        'event=cleanup_skipped reason=state_dir_owned_by_live_process');
+      // 只有「确实有一个可续跑目录、但无权删除」时才留痕；
+      // 压根没有目录（本进程从未创建或复用）不需要日志——为写日志新建目录本身就是残留。
+      const memo = resumeMemo(repoRoot, o.pr);
+      const candidate = memo ? memo[`${repoRoot || ''}|${o.pr}`] : null;
+      if (candidate) {
+        appendPipelineLog(repoRoot, o.pr,
+          'event=cleanup_skipped reason=state_dir_owned_by_live_process');
+      }
     }
   }
   console.log(`\n[PASSED] Authentic review pipeline complete (verdict=${verdict}).`);
@@ -2705,6 +2776,8 @@ module.exports = {
   discoverPriorStateDir,
   // 并发隔离：目录所有权（活进程目录不接管、不删除）
   removableStateDir,
+  claimPriorStateDir,
+  skippedClaimedDirs,
   stateDirOwnerPid,
   pidIsAlive,
   pipelineLogPath,
