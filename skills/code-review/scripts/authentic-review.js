@@ -350,9 +350,40 @@ function formatStageError(run, budgetMs, attempt, maxAttempts) {
   return run && run.error ? run.error : 'unknown stage failure';
 }
 
-// 部分输出挽救：被杀进程的 -o 文件通常为空；只有能解析出完整 JSON 才接受，
+// 部分输出挽救的接受判据（ADR-0017 D3）：只有能恢复成「可核验件」才接受。
+//  - 评审类阶段（stage1 / cross-validate）三件齐全：review_body + verdict + 模型声明；
+//  - 证据类阶段（stage2）必须有非空 evidence 对象；
+//  - 未知阶段一律不 salvage（fail-closed），宁可 NOT_VERIFIED 也不猜。
+const SALVAGE_REQUIRED_FIELDS = {
+  stage1: ['review_body', 'verdict', 'declaration'],
+  stage2: ['evidence'],
+  'cross-validate': ['review_body', 'verdict', 'declaration'],
+};
+
+function salvageFieldCheck(parsed, stage) {
+  const required = SALVAGE_REQUIRED_FIELDS[stage];
+  if (!required) return null;
+  const present = [];
+  for (const key of required) {
+    if (key === 'review_body') {
+      if (!(typeof parsed.review_body === 'string' && parsed.review_body.trim())) return null;
+    } else if (key === 'verdict') {
+      if (!(typeof parsed.verdict === 'string' && parsed.verdict.trim())) return null;
+    } else if (key === 'declaration') {
+      const decl = parsed.declaration && typeof parsed.declaration === 'object' ? parsed.declaration : null;
+      const rev = parsed.reviewer && typeof parsed.reviewer === 'object' && Object.keys(parsed.reviewer).length ? parsed.reviewer : null;
+      if (!(decl && typeof decl.declaration === 'string' && decl.declaration.trim()) && !rev) return null;
+    } else if (key === 'evidence') {
+      if (!(parsed.evidence && typeof parsed.evidence === 'object' && Object.keys(parsed.evidence).length)) return null;
+    }
+    present.push(key);
+  }
+  return present;
+}
+
+// 部分输出挽救：被杀进程的 -o 文件通常为空；只有能恢复出可核验件才接受，
 // 否则如实记录路径与字节数，绝不把半截内容当结果。
-function readPartialStageOutput(run) {
+function readPartialStageOutput(run, stage) {
   const candidates = [];
   if (run && run.tmp_msg) candidates.push(run.tmp_msg);
   let text = '';
@@ -370,11 +401,12 @@ function readPartialStageOutput(run) {
   if (bytes > 0) {
     let parsed = null;
     try { parsed = extractJson(text); } catch (_) { parsed = null; }
-    if (parsed && typeof parsed === 'object' && (parsed.review_body || parsed.evidence)) {
-      return { path: file, bytes, salvaged: true, text };
+    if (parsed && typeof parsed === 'object') {
+      const fields = salvageFieldCheck(parsed, stage);
+      if (fields) return { path: file, bytes, salvaged: true, fields, text };
     }
   }
-  return { path: file, bytes, salvaged: false, text: '' };
+  return { path: file, bytes, salvaged: false, fields: [], text: '' };
 }
 
 /**
@@ -537,7 +569,7 @@ async function runStageWithState(options) {
     }
 
     const errorClass = classifyStageFailure(run);
-    const partial = readPartialStageOutput(run);
+    const partial = readPartialStageOutput(run, stage);
     const detail = formatStageError(run, budgetMs, attempt, maxAttempts);
     lastFailure = { error_class: errorClass, error: detail, attempts: attempt };
 
@@ -559,13 +591,18 @@ async function runStageWithState(options) {
       writeStageState(repoRoot, pr, stage, {
         status: 'ok',
         salvage: true,
+        salvage_fields: partial.fields,
         elapsed_ms: elapsed,
         output_path: outputPath,
         output_bytes: Buffer.byteLength(partial.text),
       });
       appendPipelineLog(repoRoot, pr,
-        `stage=${stage} attempt=${attempt} event=salvage action=accept_partial_output trigger=${errorClass} why=complete_json_recovered elapsed_ms=${elapsed} partial_output=${partial.path || '-'} partial_bytes=${partial.bytes}`);
-      return { ok: true, stdout: partial.text, salvaged: true, attempt, elapsed_ms: elapsed };
+        `stage=${stage} attempt=${attempt} event=salvage action=accept_partial_output trigger=${errorClass} why=verifiable_fields_recovered fields=${partial.fields.join(',')} elapsed_ms=${elapsed} partial_output=${partial.path || '-'} partial_bytes=${partial.bytes}`);
+      return { ok: true, stdout: partial.text, salvaged: true, salvage_fields: partial.fields, error_class: errorClass, attempt, elapsed_ms: elapsed };
+    }
+    if (partial.bytes > 0) {
+      appendPipelineLog(repoRoot, pr,
+        `stage=${stage} attempt=${attempt} event=salvage_rejected trigger=${errorClass} why=verifiable_fields_missing required=${(SALVAGE_REQUIRED_FIELDS[stage] || ['unknown_stage']).join(',')} partial_output=${partial.path || '-'} partial_bytes=${partial.bytes}`);
     }
 
     if (errorClass !== 'ETIMEDOUT' || attempt >= maxAttempts) break;
@@ -1172,6 +1209,24 @@ function buildCarryoverSection(carryover, priorFindings) {
     return `- #${c.finding_index} [${p.severity || 'P3'}] \`${p.file || 'unknown'}\` — ${p.summary || ''} → **${c.status}**${c.evidence ? `（${c.evidence}）` : ''}`;
   });
   return `### 上轮 findings 裁决 (Carryover)\n${rows.join('\n')}`;
+}
+
+// ADR-0017 D3：被接受的 salvage 必须机械披露进正文，不允许静默把恢复结果当完整评审发布。
+// 传入 [{ stage, attempt, error_class, fields }]，无 salvage 时返回空串（正文零污染）。
+function buildSalvageDisclosure(notes) {
+  const items = Array.isArray(notes) ? notes.filter(n => n && n.stage) : [];
+  if (!items.length) return '';
+  const scope = items.map(n => `${n.stage}:${(Array.isArray(n.fields) ? n.fields : []).join('/') || '-'}`).join('；');
+  const lines = items.map(n => `- 阶段 \`${n.stage}\` 第 ${n.attempt || '-'} 次调用未正常返回${n.error_class ? `（${n.error_class}）` : ''}，宿主从部分输出中恢复出可核验件：${(Array.isArray(n.fields) ? n.fields : []).join('、') || '-'}`);
+  return [
+    '### 部分输出恢复披露 (Salvage)',
+    '',
+    `本次结果由超时/中断后的部分输出恢复，恢复范围：${scope}。`,
+    '',
+    ...lines,
+    '',
+    '恢复结果已按「可核验件齐全」判据校验（缺 review_body / verdict / 声明 / evidence 一律 NOT_VERIFIED），但它不是一次完整无中断的模型调用；判读强度据此折算，原始字节与路径见 `pipeline.log`。',
+  ].join('\n');
 }
 
 function formatEvidenceRequirementsForPrompt(evidenceContract, reviewPlan) {
@@ -1790,7 +1845,7 @@ const AUTHOR_OWNED_REVIEW_TITLES = {
   REQUEST_CHANGES: 'Request changes conclusion (author-owned PR; GitHub blocks formal self-review)',
 };
 
-function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, problemContext, carryoverSection, authorOwned }) {
+function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, problemContext, carryoverSection, salvageDisclosure, authorOwned }) {
   let text = String(body || '');
   const modelName = String((reviewer && reviewer.declared_model) || 'codex').replace(/[\/:@]/g, '-');
   const provider = String((reviewer && reviewer.declared_provider) || 'openai').replace(/[\/:@]/g, '-');
@@ -1850,6 +1905,15 @@ function finalizeReviewBody(body, { headOid, verdict, reviewer, motivation, prob
       if (refs.length > 0 && /##\s*具体改动/.test(text)) {
         text = text.replace(/(##\s*具体改动[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n> 规格映射引用：${refs.join(' · ')}`);
       }
+    }
+  }
+
+  // salvage 披露放在 carryover 之前：它是本轮「证据强度」的一部分，不该被上轮裁决压到末尾
+  if (salvageDisclosure && String(salvageDisclosure).trim() && !text.includes('### 部分输出恢复披露')) {
+    if (/##\s*我的整体评价/.test(text)) {
+      text = text.replace(/(##\s*我的整体评价[\s\S]*?)(?=\n##\s|$)/, (m) => `${m}\n\n${salvageDisclosure}`);
+    } else {
+      text += `\n\n${salvageDisclosure}`;
     }
   }
 
@@ -2278,7 +2342,11 @@ async function main() {
     process.exit(1);
   }
   if (stage1Run.resumed) console.log('[i] 阶段 1 命中同 head/同 prompt 状态，复用已完成输出（未重跑模型）。');
-  if (stage1Run.salvaged) console.log('[i] 阶段 1 从部分输出中恢复出完整 JSON，按成功继续（详见 pipeline.log）。');
+  const salvageNotes = [];
+  if (stage1Run.salvaged) {
+    salvageNotes.push({ stage: 'stage1', attempt: stage1Run.attempt, error_class: stage1Run.error_class, fields: stage1Run.salvage_fields });
+    console.log(`[i] 阶段 1 从部分输出中恢复出可核验件（${(stage1Run.salvage_fields || []).join(',')}），按成功继续并将披露进正文（详见 pipeline.log）。`);
+  }
 
   const modelOut = acceptModelOutput(extractJson(agentRun.stdout));
   if (!modelOut) {
@@ -2381,6 +2449,10 @@ async function main() {
       process.exit(1);
     }
     if (!stage2Run.unavailable && !stage2Run.error) {
+      if (stage2Run.salvaged) {
+        salvageNotes.push({ stage: 'stage2', attempt: stage2Run.attempt, error_class: stage2Run.error_class, fields: stage2Run.salvage_fields });
+        console.log(`[i] 阶段 2 从部分输出中恢复出可核验件（${(stage2Run.salvage_fields || []).join(',')}），按成功继续并将披露进正文。`);
+      }
       const parsedStage2 = extractJson(stage2Run.stdout || '');
       const stage2Evidence = parsedStage2 && parsedStage2.evidence && typeof parsedStage2.evidence === 'object'
         ? parsedStage2.evidence
@@ -2422,6 +2494,7 @@ async function main() {
   const carryoverSection = buildCarryoverSection(carryover, priorFindings);
   let reviewBody = finalizeReviewBody(modelOut.review_body, {
     headOid, verdict, reviewer, motivation: pkt.motivation, problemContext, carryoverSection,
+    salvageDisclosure: buildSalvageDisclosure(salvageNotes),
     authorOwned: pkt.authorOwned,
   });
   // 发布 architecture_assessment 的 reason/current_pr_boundary（原生 check-result 要求可读）
@@ -2486,6 +2559,11 @@ async function main() {
       }
     } else {
       console.log(`[CROSS_VALIDATION_UNAVAILABLE] ${secondaryAgent} unavailable; continuing without cross check.`);
+    }
+    // 交叉核验在正文定稿之后才跑，披露直接追加到已定稿正文，不能指望 finalize 阶段回收
+    if (cv.salvaged) {
+      reviewBody += `\n\n${buildSalvageDisclosure([{ stage: 'cross-validate', attempt: cv.attempt, error_class: cv.error_class, fields: cv.salvage_fields }])}`;
+      console.log(`[i] 交叉核验从部分输出中恢复出可核验件（${(cv.salvage_fields || []).join(',')}），已披露进正文。`);
     }
   }
 
@@ -2603,6 +2681,10 @@ if (require.main === module) {
 
 module.exports = {
   finalizeReviewBody,
+  buildSalvageDisclosure,
+  readPartialStageOutput,
+  salvageFieldCheck,
+  SALVAGE_REQUIRED_FIELDS,
   buildNativePrompt,
   buildStage2Prompt,
   formatEvidenceRequirementsForPrompt,
