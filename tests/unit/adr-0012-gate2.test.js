@@ -484,6 +484,40 @@ test('本 PR 新增/修改的 ADR 不能自证：需 accepted_by 的 adr-accepte
   } finally { h.cleanup(authed.dir); }
 });
 
+test('Goal 门与 impact 校验共用同一标记解析：尾部追加无 issue 的 R0 不能绕过 Goal 与收据', () => {
+  const { dir } = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  const generated = {
+    level: 'R1', issue: 19, contract_impact: 'none',
+    adrs: [], regression: ['tests/unit/issues/issue-19.test.js'], rollback: 'revert'
+  };
+  const body = '<!-- loopx-impact: ' + JSON.stringify(generated) + ' -->\n\n<!-- loopx-impact: {"level":"R0"} -->';
+  fs.writeFileSync(path.join(dir, 'impact.json'), JSON.stringify({
+    body, files: [{ path: 'tests/unit/issues/issue-19.test.js' }]
+  }));
+  fs.writeFileSync(path.join(dir, 'pr-body.txt'), body);
+  try {
+    const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /未登记/, 'R1 PR 缺 Goal 必须 fail-closed');
+    assert.doesNotMatch(r.stdout, /跳过 Goal 补偿步骤/, '不能被尾部伪造的 R0 标记降级为免 Goal');
+  } finally { h.cleanup(dir); }
+});
+
+test('issue_goal_registered 认 CODEX_HOME 下的全局 registry（与 doctor 同源）', () => {
+  const { dir } = setup({
+    mode: 'single_owner',
+    headRef: 'fix/issue-19',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  h.write(dir, 'codexhome/loopx/registry.global.json', JSON.stringify({ schema_version: '0.1', goals: [{ id: 'issue-19-goal' }] }));
+  fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment('none'));
+  try {
+    const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1', CODEX_HOME: path.join(dir, 'codexhome') });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), /merged/);
+  } finally { h.cleanup(dir); }
+});
+
 test('set -u 下无参调用 status --next / release-approve 不会报 unbound variable', () => {
   const root = path.resolve(__dirname, '../..');
   const r1 = h.run(root, ['status', '--next']);

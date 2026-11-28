@@ -2018,7 +2018,7 @@ HELPTXT
         create)
             local base="main"
             local draft="false"
-            local issue_id="" goal_id="" impact=""
+            local issue_id="" goal_id="" impact="" impact_explicit="false"
             local contract_impact="none"
             local -a adrs=()
             local passthru_args=()
@@ -2047,6 +2047,7 @@ HELPTXT
                     --impact)
                         [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --impact 需要取值 R0|R1|R2${NC}" >&2; exit 1; }
                         impact="$2"
+                        impact_explicit="true"
                         shift 2
                         ;;
                     --contract-impact)
@@ -2087,6 +2088,21 @@ HELPTXT
                     exit 1
                 fi
                 [[ -n "$goal_id" ]] || goal_id="issue-${issue_id}-goal"
+                # 未显式传 --impact 时从 Issue 正文读取（loopx-impact 标记或 Impact: 行），
+                # 与 cmd_issue 同一解析，避免 R0 纯文档 Issue 被静默写成 R1。
+                if [[ "$impact_explicit" != "true" ]]; then
+                    local issue_impact_probe issue_impact_parsed
+                    issue_impact_probe="$(gh issue view "$issue_id" --json body --jq '.body // ""' 2>/dev/null || true)"
+                    if [[ -n "$issue_impact_probe" ]]; then
+                        issue_impact_parsed="$(printf '%s' "$issue_impact_probe" | issue_impact_from_body)"
+                        case "$issue_impact_parsed" in
+                            R0|R1|R2) impact="$issue_impact_parsed" ;;
+                            INVALID:*)
+                                echo -e "${RED}[-] [FAIL-CLOSED] Issue #$issue_id 的 impact 分级非法（${issue_impact_parsed#INVALID:}），只接受 R0|R1|R2。${NC}" >&2
+                                exit 1 ;;
+                        esac
+                    fi
+                fi
                 [[ -n "$impact" ]] || impact="R1"
                 if [[ ! "$impact" =~ ^R[012]$ ]]; then
                     echo -e "${RED}[-] [FAIL-CLOSED] 非法影响分级 --impact ${impact}（只接受 R0|R1|R2）${NC}" >&2
@@ -2154,28 +2170,31 @@ HELPTXT
             fi
 
             echo -e "${BLUE}==> [PR 提交] 正在通过 GitHub CLI 创建 PR (对齐 PR #7545 双语 4-Part 体系)...${NC}"
-            local pr_url pr_err_file pr_err marker draft_hint=""
+            local pr_url pr_err_file pr_err marker="" draft_hint=""
             local -a draft_args=()
             if [[ "$draft" == "true" ]]; then
                 draft_args=(--draft)
                 draft_hint=" --draft"
             fi
-            marker="$(presentation_state_file "$feature")"
+            # Issue 修复没有 Feature 胶囊，也没有 Gate1，因此不落 presentation 标记。
+            if [[ -n "$feature" ]]; then marker="$(presentation_state_file "$feature")"; fi
             wf_run_dir pr-create
             pr_err_file="$WF_RUN_DIR/gh-pr-create.err"
             wf_register_temp_file "$pr_err_file"
             if pr_url="$(printf '%s' "$pr_body" | gh pr create --title "$title" --base "$base" --body-file - ${draft_args[@]+"${draft_args[@]}"} ${passthru_args[@]+"${passthru_args[@]}"} 2>"$pr_err_file")"; then
                 wf_unregister_temp_file "$pr_err_file"
-                rm -f "$pr_err_file" "$marker"
+                rm -f "$pr_err_file"
+                if [[ -n "$marker" ]]; then rm -f "$marker"; fi
                 echo -e "${GREEN}[✓] PR 创建成功: ${pr_url}${NC}"
                 echo "presentation=published"
             else
                 pr_err="$(tr '\n' ' ' < "$pr_err_file" 2>/dev/null | cut -c1-400 || true)"
                 wf_unregister_temp_file "$pr_err_file"
                 rm -f "$pr_err_file"
-                # presentation=pending 必须可观测且持久：Gate1 approve 读取该标记并 BLOCK（不再是 WARN）。
-                mkdir -p "$(dirname "$marker")"
-                node -e '
+                if [[ -n "$marker" ]]; then
+                    # presentation=pending 必须可观测且持久：Gate1 approve 读取该标记并 BLOCK（不再是 WARN）。
+                    mkdir -p "$(dirname "$marker")"
+                    node -e '
 const fs = require("fs");
 const [file, feature, draft, reason] = process.argv.slice(1);
 fs.writeFileSync(file, JSON.stringify({
@@ -2187,11 +2206,18 @@ fs.writeFileSync(file, JSON.stringify({
   recorded_at: new Date().toISOString()
 }, null, 2) + "\n");
 ' "$marker" "$feature" "$draft" "${pr_err:-gh pr create failed}"
-                echo -e "${RED}[-] PR 创建失败（presentation=pending）。${NC}" >&2
+                    echo -e "${RED}[-] PR 创建失败（presentation=pending）。${NC}" >&2
+                else
+                    echo -e "${RED}[-] PR 创建失败（Issue 修复路径无 Feature 胶囊，不写 presentation 标记）。${NC}" >&2
+                fi
                 if [[ -n "$pr_err" ]]; then
                     echo -e "    gh 输出: ${pr_err}${NC}" >&2
                 fi
-                echo -e "🛠️ 修复指令: 修复 gh 认证/网络后重跑 loopx-flow pr create $feature${draft_hint}；presentation=pending 会阻断 Gate1 approve。${NC}" >&2
+                if [[ -n "$issue_id" ]]; then
+                    echo -e "🛠️ 修复指令: 修复 gh 认证/网络后重跑 loopx-flow pr create --issue $issue_id --goal-id ${goal_id} --impact ${impact}${draft_hint}。${NC}" >&2
+                else
+                    echo -e "🛠️ 修复指令: 修复 gh 认证/网络后重跑 loopx-flow pr create $feature${draft_hint}；presentation=pending 会阻断 Gate1 approve。${NC}" >&2
+                fi
                 exit 1
             fi
             ;;
@@ -2482,6 +2508,59 @@ cmd_status_next() {
     echo "Reason: 契约已批准、证据存在；进入交付审查（Gate2 未授权）。"
 }
 
+# Issue 正文的 impact 分级（唯一实现）：优先 loopx-impact 机器标记，其次 `Impact:` 行。
+# 空输出 = 未声明；INVALID:<值> = 声明了非法值。cmd_issue 与 pr create --issue 共用。
+issue_impact_from_body() {
+    node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  const tag = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/.exec(raw);
+  if (tag) {
+    try {
+      const marker = JSON.parse(tag[1]);
+      if (marker && typeof marker.level === "string") {
+        const level = marker.level.toUpperCase();
+        process.stdout.write(/^R[012]$/.test(level) ? level : `INVALID:${marker.level}`);
+        return;
+      }
+    } catch (e) { /* 落到人读行 */ }
+  }
+  const line = /(?:^|\n)[ \t]*(?:[-*][ \t]*)?\**[ \t]*impact[ \t]*\**[ \t]*[:：][ \t]*`?\**[ \t]*([A-Za-z0-9]+)/i.exec(raw);
+  if (line) {
+    const value = String(line[1] || "").toUpperCase();
+    process.stdout.write(/^R[012]$/.test(value) ? value : `INVALID:${line[1]}`);
+  }
+});
+'
+}
+
+# impact 标记等级解析（唯一实现）：与 merge_enforce_issue_impact 同一规则——
+# 按本分支 Issue 编号优先匹配，匹配不到才兜底取最后一条；避免两处解析各读一条
+# 标记导致「校验按 R1、Goal 门读 R0」的自相矛盾。
+pr_impact_level() {
+    local pr_id="$1" issue_id="$2" body
+    body="$(gh pr view "$pr_id" --json body --jq '.body // ""' 2>/dev/null || true)"
+    [[ -n "$body" ]] || return 0
+    printf '%s' "$body" | node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  const issueId = String(process.argv[1] || "");
+  const re = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/g;
+  const found = [];
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    try { found.push(JSON.parse(m[1])); } catch (e) { found.push(null); }
+  }
+  let pick = null;
+  for (let i = found.length - 1; i >= 0; i -= 1) {
+    if (found[i] && String(found[i].issue || "") === issueId) { pick = found[i]; break; }
+  }
+  if (!pick) pick = found.length ? found[found.length - 1] : null;
+  if (pick && typeof pick.level === "string") process.stdout.write(pick.level.toUpperCase());
+});
+' "$issue_id"
+}
+
 # Issue 修复 PR 的影响分级检查（ADR-0023）：只对 fix/issue-<id> 分支生效。
 # R0 免 Goal/Receipt 但出现任何代码文件即取消豁免；R1 必须有随 PR 变更的复现测试；
 # R2 额外要求 rollback，contract_impact=changed 时要求 ADR 在 PR head 上为 Accepted。
@@ -2594,12 +2673,14 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
                     echo -e "${RED}[-] [FAIL-CLOSED] impact:R2 要求 $adr 在 PR head 上为 Accepted。${NC}" >&2
                     return 1
                 fi
-                # 自证防护：本 PR 自己写的 Accepted 不构成授权证据（作者可以给自己盖章）。
-                # 变更的 ADR 必须另有 accepted_by 在 PR 上的授权评论，且该评论绑定当前 head。
-                if [[ ",$changed_adrs," == *",$adr,"* && "$(auth_mode)" != "single_owner" ]]; then
+                # 自证防护：本 PR 自己新增/修改的 ADR，head 上的 Accepted 必须另有
+                # accepted_by 在 PR 上绑定当前 head 的授权评论佐证，否则只是作者单方面声明。
+                if [[ ",$changed_adrs," != *",$adr,"* ]]; then
+                    :
+                elif [[ "$(auth_mode)" != "single_owner" ]]; then
                     # independent 模式：非作者批准本身就是外部授权，ADR 接受由 Mode A 覆盖。
                     echo -e "    ${YELLOW}[i] independent 模式：$adr 由本 PR 新增/修改，接受证据由非作者批准覆盖。${NC}"
-                elif [[ ",$changed_adrs," == *",$adr,"* ]]; then
+                else
                     local accepted_by comments_json
                     accepted_by="$(auth_accepted_by 2>/dev/null || true)"
                     if [[ -z "$accepted_by" ]]; then
@@ -2738,9 +2819,9 @@ cmd_merge() {
     # Goal 才要求已登记，避免为 R0 凭空补偿一个不存在的 Goal。
     if [[ -z "$goal_id_flag" && -n "$merge_goal_id" && "$head_ref" =~ ^fix/issue-[0-9]+ ]] \
         && ! issue_goal_registered "$merge_goal_id"; then
-        local derived_level
-        derived_level="$(gh pr view "$pr_id" --json body --jq '.body' 2>/dev/null \
-            | sed -n 's/.*"level"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        local derived_level derived_issue="${head_ref#fix/issue-}"
+        derived_issue="${derived_issue%%[!0-9]*}"
+        derived_level="$(pr_impact_level "$pr_id" "$derived_issue" || true)"
         if [[ "$derived_level" == "R0" ]]; then
             echo -e "    ${YELLOW}[i] impact:R0 不建 Goal，跳过 Goal 补偿步骤。${NC}"
             merge_goal_id=""
@@ -3276,7 +3357,9 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const gid = process.argv[1];
-const files = [process.argv[2], path.join(os.homedir(), ".loopx", "registry.global.json")].filter(Boolean);
+// 与 doctor 同源：显式 registry、~/.loopx 全局 registry、CODEX_HOME 下的全局 registry 都要认。
+const files = [process.argv[2], path.join(os.homedir(), ".loopx", "registry.global.json"),
+  process.argv[3] ? path.join(process.argv[3], "loopx", "registry.global.json") : ""].filter(Boolean);
 for (const file of files) {
   let data = {};
   try { data = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { continue; }
@@ -3284,7 +3367,7 @@ for (const file of files) {
   if (hit) process.exit(0);
 }
 process.exit(1);
-' "$gid" "$LOOPX_REGISTRY_PATH"
+' "$gid" "$LOOPX_REGISTRY_PATH" "$(wf_codex_home)"
 }
 
 # 为 Issue 修复创建（或幂等复用）每 Issue Goal，并启用 change-quality 严格收据。
@@ -3435,28 +3518,7 @@ try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {}
 process.stdout.write(String(d.title ?? ""));
 ' <<< "$issue_json")"
     # 影响分级：优先读机器标记 loopx-impact，其次读正文的 Impact: 行；缺省 R1，非法值非 0。
-    issue_impact_raw="$(node -e '
-const fs = require("fs");
-let d = {};
-try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {}
-const body = String(d.body || "");
-const tag = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/.exec(body);
-if (tag) {
-  try {
-    const marker = JSON.parse(tag[1]);
-    if (marker && typeof marker.level === "string") {
-      const level = marker.level.toUpperCase();
-      process.stdout.write(/^R[012]$/.test(level) ? level : `INVALID:${marker.level}`);
-      process.exit(0);
-    }
-  } catch (e) { /* fall through to the human-readable line */ }
-}
-const line = /(?:^|\n)[ \t]*(?:[-*][ \t]*)?\**[ \t]*impact[ \t]*\**[ \t]*[:：][ \t]*`?\**[ \t]*([A-Za-z0-9]+)/i.exec(body);
-if (line) {
-  const value = String(line[1] || "").toUpperCase();
-  process.stdout.write(/^R[012]$/.test(value) ? value : `INVALID:${line[1]}`);
-}
-' <<< "$issue_json")"
+    issue_impact_raw="$(node -e 'const d = JSON.parse(require("fs").readFileSync(0, "utf8")); process.stdout.write(String(d.body || ""))' <<< "$issue_json" | issue_impact_from_body)"
 
     if [[ "$issue_impact_raw" == INVALID:* ]]; then
         echo -e "${RED}[-] [FAIL-CLOSED] Issue #$issue_id 的影响分级非法: ${issue_impact_raw#INVALID:}（只接受 R0|R1|R2）。${NC}" >&2

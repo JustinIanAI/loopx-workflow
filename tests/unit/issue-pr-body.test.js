@@ -93,6 +93,36 @@ test('Issue 正文自带的 loopx-meta / loopx-impact 标记不会混入 PR 正�
   }
 });
 
+test('pr create --issue 从 Issue 正文读取 impact；失败提示指向 Issue 模式且不写 presentation', () => {
+  const dir = sandbox.makeSandbox('issue-pr-impact-');
+  try {
+    const bodyFile = path.join(dir, 'pr-body.txt');
+    // sandbox 只复制 bin/lib/scripts；Issue 模式正文由 code-review 脚本及其依赖生成。
+    fs.cpSync(
+      path.join(sandbox.PROJECT_ROOT, 'skills/code-review/scripts'),
+      path.join(dir, 'skills/code-review/scripts'),
+      { recursive: true }
+    );
+    sandbox.mockGh(dir, [
+      'if [[ "$1" == "issue" && "$2" == "view" ]]; then',
+      '  printf "%s" \'<!-- loopx-impact: {"level":"R0","contract_impact":"none","adrs":[],"regression":[],"rollback":""} -->\'',
+      '  exit 0',
+      'fi',
+      'if [[ "$1" == "pr" && "$2" == "create" ]]; then cat > "' + bodyFile + '"; exit 1; fi',
+      'exit 0'
+    ].join('\n'));
+    execFileSync('git', ['checkout', '-q', '-b', 'fix/issue-49'], { cwd: dir });
+    const res = sandbox.run(dir, ['pr', 'create', '--issue', '49']);
+    assert.strictEqual(res.status, 1, `${res.stdout}${res.stderr}`);
+    const body = fs.readFileSync(bodyFile, 'utf8');
+    assert.match(body, /"level":"R0"/, '未传 --impact 时必须沿用 Issue 的分级，不能静默默认为 R1');
+    assert.match(res.stderr, /pr create --issue 49/);
+    assert.doesNotMatch(res.stderr, /presentation=pending/);
+  } finally {
+    sandbox.cleanup(dir);
+  }
+});
+
 test('pr update --issue: 非法 --issue/--contract-impact 与 changed 缺 --adr 均 fail-closed', () => {
   const dir = sandbox.makeSandbox('issue-pr-update-');
   try {

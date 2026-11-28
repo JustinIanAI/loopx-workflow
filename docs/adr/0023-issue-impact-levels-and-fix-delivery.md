@@ -1,6 +1,6 @@
 # ADR-0023：Issue 修复的影响分级与交付检查
 
-- **状态**：Accepted（JustinIanAI，2026-11-28：Owner 明确接受本 ADR 的 impact 分级与 Issue 交付检查；随 PR #115 的 Gate2 合入生效）
+- **状态**：Accepted（JustinIanAI，2026-11-28：Owner 明确接受本 ADR 的 impact 分级与 Issue 交付检查。本 ADR 由同一 PR 引入，因此 Accepted 的生效证据不是这行作者声明，而是 Owner 在 PR #115 发布的 `gate=2` 授权评论中的 `adr-accepted: docs/adr/0023-issue-impact-levels-and-fix-delivery.md` 行与 `head=<oid>` 绑定；`loopx-flow merge` 合入前强制核验该评论，缺评论即 fail-closed）
 - **日期**：2026-11-28
 - **关联**：[ADR-0006](0006-document-code-change-governance.md)、[ADR-0011](0011-evidence-traceability-and-quality.md)、[ADR-0012](0012-delivery-authorization-and-recovery.md)、[ADR-0022](0022-merge-requires-quality-receipt.md)、`REQ-ISSUE-PIPELINE-1`
 
