@@ -43,7 +43,7 @@ flowchart LR
   loopx -->|route_lease_receipt_lock| flow
 ```
 
-编排器是 `bin/loopx-flow`（bash），Conductor 以 Skill + Agent 指令 + 少量确定性脚本实现；Conductor 只读回状态、计算下一步、路由领域 Skill、校验产物并在 Gate 停，不拥有权威状态。编排器在仓库根解析 `.loopx/registry.json`，存在则给 LoopX 命令加上 `--registry`。事实来源分三类：Git（规格/决策）、LoopX（执行控制）、GitHub/CI（交付/审批）。`review` 与 PR 正文调用 `skills/code-review/scripts/authentic-review.js`。`respond` 调用 `skills/code-review/scripts/respond-report.js`。质量收据适配在 `skills/code-review/scripts/ingest-to-loopx-quality.js`。
+编排器是 `bin/loopx-flow`（bash），Conductor 以 Skill + Agent 指令 + 少量确定性脚本实现；Conductor 只读回状态、计算下一步、路由领域 Skill、校验产物并在 Gate 停，不拥有权威状态。编排器在仓库根解析 `.loopx/registry.json`，存在则给 LoopX 命令加上 `--registry`；本地不存在时向 LoopX 探询其运行时 registry（`loopx --format json status` 的 `registry` 字段）再传 `--registry`，探询失败保持 fail-closed（[ADR-0024](../adr/0024-resolve-runtime-registry-from-loopx.md)）。事实来源分三类：Git（规格/决策）、LoopX（执行控制）、GitHub/CI（交付/审批）。`review` 与 PR 正文调用 `skills/code-review/scripts/authentic-review.js`。`respond` 调用 `skills/code-review/scripts/respond-report.js`。质量收据适配在 `skills/code-review/scripts/ingest-to-loopx-quality.js`。
 
 ## 3. 命令与需求
 
