@@ -1,6 +1,6 @@
 # Architecture Decisions: verification-harness
 
-- **Status**: PROPOSED (Aligned with Approved Implementation Plan Decision 4 & ADR-0011)
+- **Status**: APPROVED (Aligned with Approved Implementation Plan Decision 4 & ADR-0011)
 - **Feature**: `verification-harness`
 - **Linked ADRs**: [ADR-0007](../../../docs/adr/0007-environment-governance.md), [ADR-0008](../../../docs/adr/0008-application-orchestration-layer.md), [ADR-0011](../../../docs/adr/0011-evidence-traceability-and-quality.md), [ADR-0014](../../../docs/adr/0014-temp-artifact-path-remediation-and-history-sanitization.md)
 
