@@ -171,3 +171,53 @@ describe('C. 跳过本地门禁时的 validation 行（#74 评审 P0）', () => 
     }
   });
 });
+
+describe('D. evidence graph 的精确 head 守卫（#74 评审 P1）', () => {
+  const CONTRACT = {
+    evidence_requirements: [
+      {
+        evidence_id: 'validation_matrix',
+        items_field: 'items',
+        item_fields: ['case_id', 'invariant_or_case', 'command_or_check', 'status', 'result', 'required', 'skip_or_failure_reason'],
+      },
+    ],
+  };
+  const PLAN = { required_evidence_ids: ['validation_matrix'] };
+
+  function runWith(headAnchored) {
+    let executed = 0;
+    const graph = buildEvidenceGraph({
+      contract: CONTRACT,
+      plan: PLAN,
+      diff: '',
+      headOid: 'd'.repeat(40),
+      pr: 1,
+      motivation: 'evidence graph head guard',
+      validation: [],
+      modelEvidence: {
+        validation_matrix: {
+          items: [{ case_id: 'changed_invariant_positive', test_path: ['tests/unit/review-anchor-head.test.js'] }],
+        },
+      },
+      repoRoot: PROJECT_ROOT,
+      runNodeTest: () => { executed += 1; return { status: 0 }; },
+      headAnchored,
+    });
+    const row = graph.validation_matrix.items.find((it) => it && it.case_id === 'changed_invariant_positive');
+    return { row, executed };
+  }
+
+  test('headAnchored=false 时即使测试路径存在也不执行，行必须 unverified', () => {
+    const { row, executed } = runWith(false);
+    assert.ok(row, '应产出 changed_invariant_positive 行');
+    assert.strictEqual(executed, 0, 'HEAD 未锚定时禁止在任何本地代码上执行测试');
+    assert.strictEqual(row.status, 'unverified', '非被审查提交上的结果不能算 passed');
+    assert.strictEqual(row.exit_code, undefined);
+  });
+
+  test('headAnchored=true 时照常执行，作为上一条的对照', () => {
+    const { row, executed } = runWith(true);
+    assert.strictEqual(executed, 1, '锚定一致时必须真的执行');
+    assert.strictEqual(row.status, 'passed');
+  });
+});

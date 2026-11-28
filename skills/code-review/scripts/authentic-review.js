@@ -2222,10 +2222,13 @@ async function main() {
     'evidence-output.md': String(evidenceText || ''),
     'remote-checks.txt': remoteChecksText,
   });
+  // 精确 head 锚定只解析一次，供「四门禁是否实测」与「evidence graph 是否允许执行仓库测试」共用。
+  // 两处必须同一个事实：本地检出不是被审查的提交时，任何在本地跑出来的 passed 都不是它的证据。
+  const headAnchor = localGateAnchor(repoRoot, headOid);
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
     try {
-      const anchor = localGateAnchor(repoRoot, headOid);
+      const anchor = headAnchor;
       if (anchor.match) {
         validation = buildValidationMatrix(gates(), { headOid, remoteChecks });
       } else {
@@ -2338,6 +2341,7 @@ async function main() {
     diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
     modelEvidence: mergedModelEvidence,
     repoRoot,
+    headAnchored: headAnchor.match,
   });
 
   // ADR-0013 阶段 2（两阶段解耦）：当模型阶段 1 主观 verdict=APPROVE 但仍有未对齐的判断类证据行时，
@@ -2421,6 +2425,7 @@ async function main() {
           diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
           modelEvidence: mergedModelEvidence,
           repoRoot,
+          headAnchored: headAnchor.match,
         });
       }
     }
