@@ -223,6 +223,8 @@ usage() {
                           三层能力探针：--help 签名 / schema_version 白名单 / 版本软提示（doctor 视图不阻断）
   gc [--days N] [--force] 并发安全清理 .loopx/cache/reviews/ 与 .loopx/tmp/ 过期工件（默认 14 天，1h 活跃保护）
   init                    初始化项目工作流骨架、依赖及本地 LoopX 连接
+  config set authorization-mode <independent|single_owner>
+                          受支持地切换授权模式（TTY 显式确认；切换后既有 Gate 授权失效，需重签）
   status                  查看当前 Goal 进度、任务看板与注意力队列 (loopx status)
   status --next [feature] 只读投影 + 下一步建议（不写 Goal/Todo/Lease/Gate，不是 resume）
   todo list [goal_id]     列出指定或当前 Goal 下的全部 Agent / User Todos
@@ -433,15 +435,66 @@ init_authorization_config() {
         [[ "$confirm" == "YES" ]] || { echo -e "[-] [FAIL-CLOSED] 未接受 single_owner 风险，配置未写入" >&2; exit 1; }
         accepted_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     fi
-    node -e '
-const fs = require("fs");
-const mode = process.argv[1], file = process.argv[2], by = process.argv[3] || "", at = process.argv[4] || "";
-const d = { schema_version: "loopx_workflow_config_v0", authorization_mode: mode };
-if (mode === "single_owner") d.single_owner_risk_acceptance = { accepted_by: by, accepted_at: at };
-fs.writeFileSync(file, JSON.stringify(d, null, 2) + "\n");
-' "$mode" "$f" "$accepted_by" "$accepted_at"
+    write_auth_config "$mode" "$accepted_by" "$accepted_at" || exit 1
     auth_require_config
     echo -e "${GREEN}[✓] 已写入授权配置: $f (authorization_mode=$mode)${NC}"
+}
+
+# W14 / Issue #81：受支持的 authorization_mode 切换。
+# 与 init 同一人闸：TTY 显式确认，不静默默认；非 TTY 一律 Fail-Closed。
+cmd_config() {
+    local scope="${1:-}" key="${2:-}" value="${3:-}"
+    if [[ "$scope" != "set" || "$key" != "authorization-mode" ]]; then
+        echo "[-] 用法: loopx-flow config set authorization-mode <independent|single_owner>" >&2
+        return 2
+    fi
+    case "$value" in
+        independent|single_owner) ;;
+        *)
+            echo "[-] [FAIL-CLOSED] 非法 authorization_mode: ${value:-<empty>}（仅 independent | single_owner）" >&2
+            return 1
+        ;;
+    esac
+
+    local f prev="none"
+    f="$(auth_config_path)"
+    if [[ -f "$f" ]]; then
+        auth_require_config
+        prev="$(auth_mode)"
+    fi
+    if [[ "$prev" == "$value" ]]; then
+        echo "[i] authorization_mode 已是 ${value}，无需切换。"
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        echo "[-] [FAIL-CLOSED] 切换 authorization_mode 需要 TTY 显式确认；非 TTY 拒绝静默切换。" >&2
+        echo "🛠️ 请在交互终端运行: loopx-flow config set authorization-mode $value" >&2
+        return 1
+    fi
+
+    local accepted_by="" accepted_at="" confirm=""
+    if [[ "$value" == "single_owner" ]]; then
+        command -v gh >/dev/null 2>&1 || { echo "[-] [FAIL-CLOSED] single_owner 需要 gh 读取 accepted_by login" >&2; return 1; }
+        accepted_by="$(gh_login)"
+        [[ -n "$accepted_by" ]] || { echo "[-] [FAIL-CLOSED] 无法读取 gh api user login" >&2; return 1; }
+        read -r -p "风险接受：single_owner 不提供自然人分离，确认接受？输入 YES: " confirm
+        [[ "$confirm" == "YES" ]] || { echo "[-] [FAIL-CLOSED] 未接受 single_owner 风险，配置未写入" >&2; return 1; }
+        accepted_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    else
+        read -r -p "确认切换到 independent？输入 independent: " confirm
+        [[ "$confirm" == "independent" ]] || { echo "[-] [FAIL-CLOSED] 确认输入不匹配，配置未写入" >&2; return 1; }
+    fi
+
+    write_auth_config "$value" "$accepted_by" "$accepted_at" || { echo "[-] [FAIL-CLOSED] 写入授权配置失败: $f" >&2; return 1; }
+
+    auth_require_config
+    if [[ "$(auth_mode)" != "$value" ]]; then
+        echo "[-] [FAIL-CLOSED] 配置写入后复验失败: 期望 $value，实际 $(auth_mode)" >&2
+        return 1
+    fi
+    echo "[✓] authorization_mode: $prev -> $value"
+    echo "[i] 既有 Gate 授权随模式切换失效：evidence 中的 authorization_mode 与当前配置不一致时 gate verify contract 会拒绝；请重新执行 approve contract / release-approve。"
 }
 
 cmd_doctor() {
@@ -710,6 +763,11 @@ STATEEOF
 }
 
 auth_config_path() { printf '%s\n' "$PROJECT_ROOT/loopx-workflow.config.json"; }
+
+# 唯一写入口（init 首次写入与 config 切换共用）：模式校验 + 原子落盘在 lib/auth-config.js。
+write_auth_config() {
+    node "$WORKFLOW_ROOT/lib/auth-config.js" set "$(auth_config_path)" "$@" >/dev/null
+}
 
 auth_require_config() {
     local f
@@ -3765,6 +3823,7 @@ case "$ACTION" in
     capabilities) probe_loopx_capabilities "$@" ;;
     gc) cmd_gc "$@" ;;
     init) cmd_init "$@" ;;
+    config) cmd_config "$@" ;;
     status)
         if [[ "${1:-}" == "--next" ]]; then shift; cmd_status_next "${1:-}"; else cmd_status "$@"; fi ;;
     todo) cmd_todo "$@" ;;
