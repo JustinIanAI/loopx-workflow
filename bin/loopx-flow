@@ -1504,7 +1504,7 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
 ' "$gate_results_file" "$gate_name"
             continue
         fi
-        if gate_out="$(cd "$PROJECT_ROOT" && npm run "$gate_name" 2>&1)"; then
+        if gate_out="$(cd "$PROJECT_ROOT" && gate_child_env npm run "$gate_name" 2>&1)"; then
             gate_code=0; gate_status="passed"
         else
             gate_code=$?; gate_status="failed"
@@ -1749,25 +1749,25 @@ HELPTXT
 
     # 真实执行验证，失败一票熔断 (Fail-Closed)
     echo -e "    [1/5] 执行 Typecheck..."
-    if ! npm run typecheck >/dev/null 2>&1; then
+    if ! gate_child_env npm run typecheck >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] Typecheck 失败，阻断回复发布！${NC}" >&2
         exit 1
     fi
 
     echo -e "    [2/5] 执行 Lint..."
-    if ! npm run lint >/dev/null 2>&1; then
+    if ! gate_child_env npm run lint >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] Lint 失败，阻断回复发布！${NC}" >&2
         exit 1
     fi
 
     echo -e "    [3/5] 执行 Build..."
-    if ! npm run build >/dev/null 2>&1; then
+    if ! gate_child_env npm run build >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] Build 失败，阻断回复发布！${NC}" >&2
         exit 1
     fi
 
     echo -e "    [4/5] 执行 Test..."
-    if ! npm test >/dev/null 2>&1; then
+    if ! gate_child_env npm test >/dev/null 2>&1; then
         echo -e "${RED}[-] [FAIL-CLOSED] Test 失败，阻断回复发布！${NC}" >&2
         exit 1
     fi
