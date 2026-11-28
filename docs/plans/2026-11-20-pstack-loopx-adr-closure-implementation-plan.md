@@ -60,6 +60,16 @@
 | **ADR-0015** | `docs/adr/0015-todo-managed-execution-and-capability-probe.md` | **W2（P0 / M0 前置）** | 改变共享执行契约与默认失败条件：`todo claim/done` 从手工 `task-lease` 迁移至受管 `loopx todo claim/complete` + 凭证缓存与双分流停机恢复；确立三层能力/`schema_version` Fail-Closed 探针 | 修订 `docs/prd/loopx-workflow.md`（`REQ-LEASE-1`、`REQ-CAPABILITY-1`）、`docs/design/loopx-workflow-design.md`（§3.1 补齐前置/后置与证据契约 2 列、新增 §3.2 L0 7 步执行协议及六结果语义、更新 §10）；在 [ADR-0010](../adr/0010-command-contracts-and-execution-protocol.md) `REQ-LEASE-1` 节标注 `Superseded by ADR-0015` |
 | **ADR-0016** | `docs/adr/0016-todo-sync-and-write-scope-boundary.md` | **W9（P3 / M3b 前置）** | 改变 L0 命令面、共享契约 Schema 与默认阻断条件：新增 `loopx-flow todo sync <feature>`；固化 `04-contract.md` Story 执行表；确立合同修订漂移阻断与**双层写范围越界 Fail-Closed**（`todo done` 核验单任务增量 vs `check` 核验本 Feature 所有已同步 Story 的 `required_write_scopes` 并集 ∪ `specs/features/<feature>/**`） | 修订 `docs/prd/loopx-workflow.md`（`REQ-FACADE-1`、新增 `REQ-TODO-SYNC-1`）、`docs/design/loopx-workflow-design.md`（§3、§3.1、§4、§10） |
 
+**2026-11-27 修订：ADR-0017 追加（P0，前置）**
+
+| ADR 编号 | 目标文件 | 触发节点 | 命中准入矩阵的原因 | 同步修订正文 |
+|---|---|---|---|---|
+| **ADR-0017** | `docs/adr/0017-review-pipeline-reliability.md`（已起草，Proposed） | **W13（P0，插入在 Issue #6「持续封装」相关 ADR 之前）** | 改变审查管线默认行为与非纯增量本地状态：`loopx_flow_review_stage_state_v1` 阶段状态、`REVIEW_TIMEOUT_MS` 超时预算、重试 / salvage 接受策略、并发隔离与跨进程续跑；这些语义此前由 PR #73 夹带引入，无 REQ/ADR 承接 | 修订 `docs/prd/loopx-workflow.md`（`REQ-REVIEW-2` 增补阶段状态与超时契约）、`docs/design/loopx-workflow-design.md`（审查管线章节）；在 [ADR-0013](../adr/0013-align-review-architecture-with-loopx-philosophy.md) 标注衔接关系；新增设计 §8.2.2 可靠性契约与 §8.3 能力消费矩阵 |
+
+**优先级（2026-11-27 拍板）**：ADR-0017 排期**前置**于 Issue #6「持续封装 loopx-flow 仍暴露的 LoopX 原生命令」所涉 ADR。理由：审查管线是 PR 生命周期证据的生产者，其可靠性缺陷会让后续所有 PR 的评审证据失真（Issue #78 已实证 stage1 超时导致证据缺失），属「先修工具、再修产品」。跟踪单：[#79](https://github.com/JustinIanAI/loopx-workflow/issues/79)。
+
+**编号让位**：W12 行预留的「未来升级为默认强制门禁时再立 `ADR-0017`」顺延为 **ADR-0018**。
+
 **明确不立 ADR 的模块（直接引用既有 ADR / REQ）**：
 - W1（Lint Fail-Open、现码 Bug 修复、`.gitignore`、`ACTIVE_STATE.md` 清理）→ 归属 `ADR-0014` / `ADR-0008` / `REQ-FAILCLOSED-1`
 - W5（M1 `skills/verification-harness/`）→ 归属 `ADR-0011`
@@ -68,7 +78,7 @@
 - W8（M3a `status --next` 纯只读聚合）→ 归属 `ADR-0010` / `REQ-STATUS-NEXT-1`
 - W11（管线 B `cmd_issue` 闭环、幂等重入与 `init --reconfigure`）→ 归属 `ADR-0012` / `ADR-0010` / `ADR-0014`
 - W11b（`cmd_merge` 可选 `goal-acceptance` 校验，独立小 PR）→ 归属 `ADR-0012` 决策 8 / `ADR-0015`
-- W12（M4 可选 `arena` / `interrogate` 与 CI 兼容矩阵）→ 归属 `ADR-0013` / `REQ-REVIEW-2`（仅未来升级为默认强制门禁时再立 `ADR-0017`）
+- W12（M4 可选 `arena` / `interrogate` 与 CI 兼容矩阵）→ 归属 `ADR-0013` / `REQ-REVIEW-2`（仅未来升级为默认强制门禁时再立 `ADR-0018`；原预留 `ADR-0017` 已让位给审查管线可靠性专项）
 
 ---
 

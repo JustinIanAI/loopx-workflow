@@ -7,6 +7,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execSync } = require('node:child_process');
 const h = require('./helpers/m0-sandbox');
 
 const FEATURE = 'gate1-auth';
@@ -15,17 +16,19 @@ function approveLoopxMock(dir, override = '') {
   h.mockLoopx(dir, `args="$*"
 if [[ "$args" == *"configure-goal"* ]]; then exit 0; fi
 if [[ "$args" == *"register-agent"* ]]; then exit 0; fi
-if [[ "$args" == *"todo add"* ]]; then echo '{"todo_id":"todo_gate1"}'; exit 0; fi
-if [[ "$args" == *"todo complete"* ]]; then exit 0; fi
+if [[ "$args" == *"todo add"* ]]; then echo '{"schema_version":"loopx_coordination_todo_create_result_v0","todo_id":"todo_gate1"}'; exit 0; fi
+if [[ "$args" == *"todo complete"* ]]; then echo '{"schema_version":"loopx_coordination_todo_terminal_lifecycle_result_v0"}'; exit 0; fi
 if [[ "$args" == *"sync-global"* ]]; then exit 0; fi
 ` + override);
 }
 
 function approveGhMock(dir, commentsFile) {
   if (!fs.existsSync(commentsFile)) fs.writeFileSync(commentsFile, '[]');
+  const prJson = h.prViewJson(dir);
   h.mockGh(dir, `if [[ "$1" == "api" && "$2" == "user" ]]; then echo "executor"; exit 0; fi
 if [[ "$1" == "repo" && "$2" == "view" ]]; then echo "owner/repo"; exit 0; fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then echo "7"; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then printf '%s\\n' '${prJson}'; exit 0; fi
 if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then cat "$COMMENTS_FILE"; exit 0; fi
 exit 0
 `.replace('$COMMENTS_FILE', commentsFile));
@@ -33,8 +36,9 @@ exit 0
 
 function gateComments(dir, sha) {
   const commentsFile = path.join(dir, 'comments.json');
+  const specCommit = execSync('git rev-parse HEAD', { cwd: dir }).toString().trim();
   const body = '<!-- loopx-flow:gate1-authorization:' + FEATURE + '@' + sha + ' -->\n' +
-    'gate=1;mode=independent;contract_sha=' + sha + ';spec_commit=' + 'b'.repeat(40) + ';approver=approver1';
+    'gate=1;mode=independent;contract_sha=' + sha + ';spec_commit=' + specCommit + ';approver=approver1';
   fs.writeFileSync(commentsFile, JSON.stringify([{ body, user: { login: 'approver1' } }]));
   return commentsFile;
 }
@@ -49,6 +53,7 @@ test('T1 single_owner 非 TTY approve 必须失败且不写批准标记', () => 
   const dir = sandboxWithConfig('single_owner', { accepted_by: 'owner', accepted_at: '2026-11-12T00:00:00Z' });
   try {
     h.writeCapsule(dir, FEATURE);
+    h.publishSpecPackage(dir, FEATURE);
     approveLoopxMock(dir);
     approveGhMock(dir, path.join(dir, 'comments.json'));
     const r = h.run(dir, ['approve', 'contract', FEATURE]);
@@ -62,6 +67,7 @@ test('T2 single_owner approve --yes 必须失败', () => {
   const dir = sandboxWithConfig('single_owner', { accepted_by: 'owner', accepted_at: '2026-11-12T00:00:00Z' });
   try {
     h.writeCapsule(dir, FEATURE);
+    h.publishSpecPackage(dir, FEATURE);
     approveLoopxMock(dir);
     approveGhMock(dir, path.join(dir, 'comments.json'));
     const r = h.run(dir, ['approve', 'contract', FEATURE, '--yes']);
@@ -99,6 +105,7 @@ test('T5a independent 无第二账号 gate=1 评论必须失败', () => {
   const dir = sandboxWithConfig('independent');
   try {
     h.writeCapsule(dir, FEATURE);
+    h.publishSpecPackage(dir, FEATURE);
     approveLoopxMock(dir);
     approveGhMock(dir, path.join(dir, 'comments.json'));
     const r = h.run(dir, ['approve', 'contract', FEATURE]);
@@ -114,6 +121,7 @@ test('T5b independent 评论 SHA == configure-goal 锁定 SHA == 最终落盘 SH
     const capsule = h.writeCapsule(dir, FEATURE);
     // 评论必须绑定最终落盘字节（含固定批准标记行）的 SHA，而不是加标记前的 SHA
     const lockedSha = h.lockedShaFile(capsule.contractPath);
+    h.publishSpecPackage(dir, FEATURE);
     approveLoopxMock(dir);
     approveGhMock(dir, gateComments(dir, lockedSha));
     const r = h.run(dir, ['approve', 'contract', FEATURE]);
@@ -166,6 +174,39 @@ test('T6 gate verify：evidence 缺键必须失败', () => {
     const r = h.run(dir, ['gate', 'verify', 'contract', FEATURE]);
     assert.strictEqual(r.status, 1, r.stdout + r.stderr);
     assert.match(r.stderr + r.stdout, /缺键|spec_commit/);
+  } finally { h.cleanup(dir); }
+});
+
+test('T6 gate verify：载荷合法但没有 matching user_gate 时必须仍报「缺少授权记录」', () => {
+  // 与 schema 漂移区分：schema 合法、todos=[] 只是没批准过，诊断必须是「缺少授权记录」。
+  const { dir } = gateVerifySandbox({});
+  const todosFile = path.join(dir, 'todos.json');
+  fs.writeFileSync(todosFile, JSON.stringify({
+    projection_envelope: { schema_version: 'loopx_projection_envelope_v0' },
+    todos: [],
+  }));
+  try {
+    const r = h.run(dir, ['gate', 'verify', 'contract', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /缺少当前 SHA 对应的 user_gate approve 授权记录/);
+    assert.doesNotMatch(r.stderr, /读取 user_gate 授权记录失败/);
+  } finally { h.cleanup(dir); }
+});
+
+test('T6 gate verify：todo list schema_version 漂移必须报读取失败，而不是「缺少授权记录」', () => {
+  // 授权记录真实存在，只是 LoopX 契约漂移（projection_envelope.schema_version 未知）。
+  const { dir, sha } = gateVerifySandbox({});
+  const todosFile = path.join(dir, 'todos.json');
+  const payload = JSON.parse(fs.readFileSync(todosFile, 'utf8'));
+  payload.projection_envelope = { schema_version: 'loopx_projection_envelope_v9' };
+  fs.writeFileSync(todosFile, JSON.stringify(payload));
+  try {
+    const r = h.run(dir, ['gate', 'verify', 'contract', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /读取 user_gate 授权记录失败/);
+    assert.match(r.stderr, /loopx_projection_envelope_v9/);
+    assert.doesNotMatch(r.stderr, /缺少当前 SHA 对应的 user_gate approve 授权记录/);
+    assert.ok(sha);
   } finally { h.cleanup(dir); }
 });
 
@@ -271,6 +312,7 @@ test('P1-1 & P2-1：gate1_spec_complete 拒绝仅含 Contract 字样而无 AC �
     // Valid contract updates bold **Contract Status**: and **Current Status**: in 00-INDEX.md
     const capsule = h.writeCapsule(dir, FEATURE);
     const lockedSha = h.lockedShaFile(capsule.contractPath);
+    h.publishSpecPackage(dir, FEATURE);
     approveGhMock(dir, gateComments(dir, lockedSha));
     const ok = h.run(dir, ['approve', 'contract', FEATURE]);
     assert.strictEqual(ok.status, 0, ok.stdout + ok.stderr);

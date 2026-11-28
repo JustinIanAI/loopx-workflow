@@ -54,6 +54,7 @@ test('1. feature does not pre-create ACTIVE_STATE.md before bootstrap (#17)', ()
   const originalBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: PROJECT_ROOT, encoding: 'utf8' }).trim();
   resetMock();
   writeScript('loopx', `#!/usr/bin/env bash
+${require('./helpers/capability-stub').HELP_PRELUDE}
 args="$*"
 if [[ "$args" == *"bootstrap"* ]]; then
   state=""; prev=""
@@ -114,6 +115,7 @@ test('3. approve configure-goal failure rolls back approval marker', () => {
   try {
     const { contractPath } = h.writeCapsule(dir, feature);
     h.writeConfig(dir, 'independent');
+    h.publishSpecPackage(dir, feature);
     h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
     h.mockLoopx(dir, 'if [[ "$*" == *"configure-goal"* ]]; then echo "configure boom" >&2; exit 1; fi\nexit 0');
     const before = fs.readFileSync(contractPath, 'utf8');
@@ -142,7 +144,7 @@ test('5. check without feature/goal exits 1 before gates', () => {
     fs.mkdirSync(path.join(tmp, '.loopx'), { recursive: true });
     fs.writeFileSync(path.join(tmp, '.loopx/registry.json'), JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
     resetMock();
-    writeScript('loopx', '#!/usr/bin/env bash\nexit 0\n');
+    writeScript('loopx', '#!/usr/bin/env bash\n' + require('./helpers/capability-stub').HELP_PRELUDE + 'exit 0\n');
     const r = runFlow(['check'], {}, tmp);
     assert.strictEqual(r.status, 1, r.stdout + r.stderr);
     assert.match(r.stderr + r.stdout, /无法解析 Goal 身份|--goal-id/);
@@ -155,12 +157,13 @@ test('6. sync-global failure after successful lock keeps the locked approval', (
   try {
     const { contractPath } = h.writeCapsule(dir, feature);
     h.writeConfig(dir, 'independent');
+    h.publishSpecPackage(dir, feature);
     h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
     h.mockLoopx(dir, `args="$*"
 if [[ "$args" == *"configure-goal"* ]]; then exit 0; fi
 if [[ "$args" == *"register-agent"* ]]; then exit 0; fi
-if [[ "$args" == *"todo add"* ]]; then echo '{"todo_id":"todo_syncfail"}'; exit 0; fi
-if [[ "$args" == *"todo complete"* ]]; then exit 0; fi
+if [[ "$args" == *"todo add"* ]]; then echo '{"schema_version":"loopx_coordination_todo_create_result_v0","todo_id":"todo_syncfail"}'; exit 0; fi
+if [[ "$args" == *"todo complete"* ]]; then echo '{"schema_version":"loopx_coordination_todo_terminal_lifecycle_result_v0"}'; exit 0; fi
 if [[ "$args" == *"sync-global"* ]]; then echo "sync boom" >&2; exit 1; fi
 exit 0`);
     const r = h.run(dir, ['approve', 'contract', feature]);
@@ -176,9 +179,11 @@ test('7. approve passes --registry to configure-goal', () => {
   try {
     const { contractPath } = h.writeCapsule(dir, feature);
     h.writeConfig(dir, 'independent');
+    h.publishSpecPackage(dir, feature);
     h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
     h.mockLoopx(dir, `args="$*"
-if [[ "$args" == *"todo add"* ]]; then echo '{"todo_id":"todo_reg"}'; exit 0; fi
+if [[ "$args" == *"todo add"* ]]; then echo '{"schema_version":"loopx_coordination_todo_create_result_v0","todo_id":"todo_reg"}'; exit 0; fi
+if [[ "$args" == *"todo complete"* ]]; then echo '{"schema_version":"loopx_coordination_todo_terminal_lifecycle_result_v0"}'; exit 0; fi
 if [[ "$args" == *"sync-global"* ]]; then exit 0; fi
 exit 0`);
     const r = h.run(dir, ['approve', 'contract', feature]);
@@ -197,8 +202,10 @@ test('8. approve feature name cannot inject shell through cleanup trap', () => {
   try {
     const { contractPath } = h.writeCapsule(dir, feature);
     h.writeConfig(dir, 'independent');
+    h.publishSpecPackage(dir, feature);
     h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
-    h.mockLoopx(dir, `if [[ "$*" == *"todo add"* ]]; then echo '{"todo_id":"todo_trap"}'; exit 0; fi
+    h.mockLoopx(dir, `if [[ "$*" == *"todo add"* ]]; then echo '{"schema_version":"loopx_coordination_todo_create_result_v0","todo_id":"todo_trap"}'; exit 0; fi
+if [[ "$*" == *"todo complete"* ]]; then echo '{"schema_version":"loopx_coordination_todo_terminal_lifecycle_result_v0"}'; exit 0; fi
 if [[ "$*" == *"sync-global"* ]]; then exit 0; fi
 exit 0`);
     const r = h.run(dir, ['approve', 'contract', feature]);

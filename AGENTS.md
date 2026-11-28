@@ -25,7 +25,7 @@
    - 规则来源是 `docs/adr/0001-product-source-of-truth.md`。**ADR 准入矩阵**：仅改变权威所有者/默认行为/非纯增量状态或 Schema/不可逆迁移/共享契约才立 ADR；普通 Feature/Bug/测试/文档不立，引用既有 `REQ-*`/ADR。`approve`/`gate verify contract` 已按 `REQ-TRACE-2` 检查契约至少引用一条 REQ/ADR；完整追溯按 `REQ-TRACE-3` 分级执行。
 3. **断点 1 契约冻结与审批先行 (Contract Freeze & Checkpoint 1 Approval)**：
    - 在 `specs/features/<feature>/04-contract.md` 顶部必须冻结不可变 TypeScript 接口签名与断言不变量。
-   - Gate1 = **Specification Authorization**：`loopx-flow approve contract <feature>` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；`single_owner` 需 TTY 确认 + 风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 story id 在契约 AC 矩阵中的一行、至少一条 REQ/ADR；锁定 04-contract SHA256（`configure-goal --progress-review-contract-revision`）并写 `user_gate` 授权记录后，才写 `Contract-Status: FROZEN & APPROVED`。任一步失败非 0，不得留批准标记。
+   - Gate1 = **Specification Authorization**：`loopx-flow approve contract <feature>` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；`single_owner` 默认核验 `accepted_by` 的 GitHub `gate=1` 评论（`--prepare` 打印模板，`--interactive` 回退 TTY）+ 风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 story id 在契约 AC 矩阵中的一行、至少一条 REQ/ADR；锁定 04-contract SHA256（`configure-goal --progress-review-contract-revision`）并写 `user_gate` 授权记录后，才写 `Contract-Status: FROZEN & APPROVED`。任一步失败非 0，不得留批准标记。
 4. **多 Agent 任务排他锁与反熵增 (Multi-Agent Concurrency & Anti-Entropy)**：
    - 并行工作时，必须先通过 `loopx-flow todo claim <todo-id> --goal-id <gid>` 锁定租约（内部完成 register-agent + task-lease acquire --owner --idempotency-key），严禁争抢同一任务。
    - 多特性分支开发时，合并前必须通过 `loopx integration-branch` 在本地隔离 worktree 提前探测并解决冲突。
@@ -53,15 +53,21 @@
 
 ## 管线 A: Feature 研发管线 (8 阶段场景化闭环)
 
+> **生效状态说明（2026-11-25）**：本文件管线规程**当前生效**（由 Agent / 人工按此执行，Gate1 / Gate2 必须显式人工触发）；以下能力处于**规划中、尚未落地**，文中涉及处均按目标态描述：
+> - **Conductor 自动化调度** `skills/workflow-conductor`（W7 `#45`，未解锁）——落地前由本文件管线规程承担；
+> - **实现期五维验证** `skills/verification-harness`（W5 `#43`，未解锁）——落地前由 TDD 与 `code-review` 既有流程承担。
+>
+> 其余引用的 `loopx-flow` 命令与 `skills/` 下 10 项技能均已存在并生效。技能 `description` 常驻于 Agent 上下文（**非 0 Token**），正文与脚本按需加载——"不调用即占 0 Token"的说法不成立。
+
 - **阶段 0：前置体检** ➔ 运行 `loopx-flow doctor` 确保 Git、CLI、认证、四大门禁与目录就绪；首次接入由 `loopx-flow init` 确认 `authorization_mode`（`independent`/`single_owner`）与风险接受，`doctor` 校验配置。
 - **阶段 1：方案研讨** ➔ 调用 `design-grill` 排除事实疑问。产品级取舍写入 `docs/adr/` 并修订 `docs/prd/loopx-workflow.md` 与必要时的详细设计。`specs/features/<feature>/01-decisions.md` 只记录本胶囊的实现取舍并链接该 ADR。
 - **阶段 2：需求切片** ➔ 对照产品 PRD 列出本胶囊要满足的 `REQ-*`。行为不在 PRD 中则先完成阶段 1 的 ADR，禁止在 `02-prd.md` 另立产品需求。`strategy-red-team` 只攻击本切片的承重假设。
 - **阶段 3：特性拆分** ➔ `user-stories` / `prioritize-features`，按独立可验证的业务结果与边界拆分（不设 PR/Feature Diff 行数上限，禁止纯粹为减小行数切碎代码；增量 PR 必须声明剩余 gap、下一 owner 与独立可测性），产出 `specs/features/<feature>/03-stories.md`。
-- **阶段 4：规格包与断点 1 审批** ➔ 在 `04-contract.md` 固化 TypeScript 签名 + AC 矩阵/Scope/Verification Plan/依赖顺序；`00-INDEX.md` 作为规格包视图；可按 `REQ-PR-LIFECYCLE-1` 创建 Draft PR 展示；人类执行 `loopx-flow approve contract <feature>`：校验规格完整性、TTY/第二账号、锁 SHA 并写 `user_gate` 授权记录后放行。
+- **阶段 4：规格包与断点 1 审批** ➔ 在 `04-contract.md` 固化 TypeScript 签名 + AC 矩阵/Scope/Verification Plan/依赖顺序；`00-INDEX.md` 作为规格包视图；可按 `REQ-PR-LIFECYCLE-1` 创建 Draft PR 展示；人类执行 `loopx-flow approve contract <feature>`：校验规格完整性、单账号评论/第二账号/TTY、锁 SHA 并写 `user_gate` 授权记录后放行。
 - **阶段 5：TDD 循环实现与反熵增** ➔ `loopx-flow todo claim` 认领排他租约 ➔ 红绿重构（单测先写先红）➔ 依 `anti-entropy-governance` 清理退役旧逻辑 ➔ 四大门禁全绿。
 - **阶段 6：代码审查与质量收据融合** ➔ 执行 `loopx-flow check`，运行语义审查（选配 OCR）并通过适配器写入 LoopX `change-quality` 严格 Receipt，回写 `specs/features/<feature>/05-evidence.md`。
 - **阶段 7：预集成与交付审查 (L2)** ➔ `loopx-flow integrate` 本地预集成 ➔ `loopx-flow pr ready <pr>` 将阶段 4 的 Draft PR 转为 Ready（不代表合并授权）➔ `loopx-flow review <pr_id>` 发布 formal review（Agent 发 COMMENT，不发 author-owned 批准标题）。
-- **阶段 8：断点 2 审批、原子合入与归档** ➔ **Mode A**：人类非作者在 GitHub 页面点击 Approve；**Mode B**：Owner 执行 `loopx-flow release-approve <pr>`（TTY 确认、principal=`gh api user` login、写结构化评论）→ 运行 `loopx-flow merge <pr_id>`：按模式校验审批/readiness（Mode B 用 `blocking_reasons` 三档判定）与二次 HEAD → Squash 合入 → 资产包原子移入 `specs/archive/<feature>/` → Goal 收尾。
+- **阶段 8：断点 2 审批、原子合入与归档** ➔ **Mode A**：人类非作者在 GitHub 页面点击 Approve；**Mode B**：Owner 执行 `loopx-flow release-approve <pr>`（默认校验 `accepted_by` 的 GitHub `gate=2` 评论；`--prepare` 打印模板，`--interactive` 走 TTY）→ 运行 `loopx-flow merge <pr_id>`：按模式校验审批/readiness（Mode B 用 `blocking_reasons` 三档判定）与二次 HEAD → Squash 合入 → 资产包原子移入 `specs/archive/<feature>/` → Goal 收尾。
 
 ---
 

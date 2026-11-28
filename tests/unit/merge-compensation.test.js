@@ -33,6 +33,7 @@ exit 0
 `, { mode: 0o755 });
   fs.writeFileSync(path.join(MOCK_BIN, 'loopx'), `#!/usr/bin/env bash
 echo "loopx $*" >> "\${CALLS}"
+${require('./helpers/capability-stub').HELP_PRELUDE}
 args="$*"
 if [[ "$args" == *"goal-lifecycle"* ]]; then
   if [[ "\${MOCK_STOP_FAIL:-}" == "1" ]]; then echo "stop failed boom" >&2; exit 1; fi
@@ -186,6 +187,7 @@ test('8. P0-B：真实 git-sync 归档先 pull main 再 git mv，远端拦截直
     fs.chmodSync(path.join(seed, 'bin/loopx-flow'), 0o755);
     fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.sh'), path.join(seed, 'lib/paths.sh'));
     fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.js'), path.join(seed, 'lib/paths.js'));
+    fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/capability-probe.js'), path.join(seed, 'lib/capability-probe.js'));
     fs.writeFileSync(path.join(seed, '.gitignore'), '.loopx/\n');
     fs.writeFileSync(path.join(seed, 'README.md'), '# seed\n');
     execSync('git add -A && git commit -qm init && git push -q -u origin main', { cwd: seed });
@@ -222,7 +224,7 @@ if [[ "$1" == "pr" && "$2" == "create" ]]; then
 fi
 exit 0
 `, { mode: 0o755 });
-    fs.writeFileSync(path.join(mockBin, 'loopx'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(mockBin, 'loopx'), '#!/usr/bin/env bash\n' + require('./helpers/capability-stub').HELP_PRELUDE + 'exit 0\n', { mode: 0o755 });
 
     const r = spawnSync(path.join(work, 'bin/loopx-flow'), ['merge', '88', feature], {
       cwd: work,

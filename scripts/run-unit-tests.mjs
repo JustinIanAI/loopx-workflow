@@ -63,6 +63,18 @@ export function parseRunnerArgs(argv, fallbackRoot = defaultUnitRoot()) {
   return { rootDir, extraArgs };
 }
 
+// `node --test` picks its default reporter by Node major version, and the
+// shape differs when stdout is a pipe rather than a TTY (Node 22 emits TAP:
+// `# fail 0`; newer majors emit spec: `ℹ fail 0`). Callers that assert on
+// runner output need one stable contract, so pin TAP unless the caller asked
+// for a specific reporter.
+export function resolveTestReporterArgs(extraArgs = []) {
+  const explicit = extraArgs.some(
+    (arg) => arg === '--test-reporter' || arg.startsWith('--test-reporter='),
+  );
+  return explicit ? [] : ['--test-reporter=tap'];
+}
+
 export function runUnitTests(rootDir, extraArgs = [], options = {}) {
   const files = discoverUnitTests(rootDir);
   const stderr = options.stderr || process.stderr;
@@ -82,6 +94,7 @@ export function runUnitTests(rootDir, extraArgs = [], options = {}) {
     '--test',
     '--test-concurrency=1',
     ...extraArgs,
+    ...resolveTestReporterArgs(extraArgs),
     ...files,
   ], {
     stdio: options.stdio || 'inherit',

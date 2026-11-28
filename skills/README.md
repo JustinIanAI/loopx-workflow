@@ -18,6 +18,10 @@
    - `verification-harness`：复用并适配 `pstack@0.15.46`（MIT）五维验证模型（`Surface / Run / Drive / Observe / Isolate`）与 4-H2 Feature Map，内置 `scripts/prove-cli-surface.js` 冷启动驱动真实 CLI 表面并留存 Proof 证据，严格区分 `Doc Drift / Harness Gap / Product Bug`。
    - `code-review`：默认跨边界语义契约审查，内置 `scripts/ingest-to-loopx-quality.js` 适配器，将审查结论直接编译为 LoopX `change_quality_agent_result_v2` 并回写 `specs/features/<feature>/05-evidence.md`。
    - `open-code-review`：定位为**选配能力**，内置 `run-ocr.sh` 脚本自主完成环境自检、自动安装、扫描并接入 LoopX 质量门禁。
+4. **规划中技能（未落地，勿当作已生效能力引用）**：
+   - `skills/workflow-conductor`（W7 `#45`）：编排中枢，四层路由（`Principles × Playbooks × Skills × L0 Commands`）与三方命令面一致性守卫；未落地前由 `AGENTS.md` 管线规程承担调度职责。
+   - `skills/verification-harness`（W5 `#43`）：实现期五维验证（Pstack `Surface / Run / Drive / Observe / Isolate` + 冷启动 Prove）；未落地前由 `test-driven-development` 与 `code-review` 既有流程承担。
+   - **加载机制澄清**：Skill 的 `description` 常驻于 Agent 上下文（**非 0 Token**），正文与脚本按需加载——"不调用即占 0 Token"的说法不成立。
 
 ---
 
