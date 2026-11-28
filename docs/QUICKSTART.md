@@ -91,16 +91,18 @@ bin/loopx-flow review <PR_NUMBER>
 
 ---
 
-## 四、场景 C：缺陷修复双分支流转 (Issue Fix)
+## 四、场景 C：Issue 修复管线 (impact 分级)
 
 接收到 GitHub Issue 后，执行：
 ```bash
-bin/loopx-flow issue <ISSUE_ID>
+bin/loopx-flow issue <ISSUE_ID>                       # dry-run：feasibility + workflow-plan
+bin/loopx-flow issue <ISSUE_ID> --init-goal           # 首次创建 issue-<id>-goal
+bin/loopx-flow issue <ISSUE_ID> --goal-id issue-<id>-goal --execute
 ```
 
-> `loopx-flow issue` 只做 LoopX `issue-fix feasibility` 路由并打印下一步，**不提交、不推送、不开 PR**。下两条是 Agent 规程，不是命令已实现的状态机。
+> 默认 dry-run：只调用 LoopX 做分诊与计划，不建分支、不写 domain state。`--execute` 才建/领 `fix/issue-<id>`；修复仍由 Agent 执行。
 
-- **路径 A：Fast-Path（改动 ≤ 20 行，零外部破坏）**：
-  适用于 Typo、错误日志优化、隔离配置调整。单测修复后执行 `./scripts/fast-fix-push.sh <ISSUE_ID> "fix(core): ..."`，遇到分支保护自动无缝升轨为 PR。
-- **路径 B：Standard PR-Path（业务/状态缺陷）**：
-  在 `tests/unit/issues/issue-<id>.test.ts` 中增加复现测试（必先 FAIL），外科手术式修复变绿，全流程闭环发 PR。
+- **R0 Isolated**：纯文档、Typo、错误日志、模板、无行为影响的隔离配置。纯文档 0 Goal、不跑 `check`，但仍走 Gate2；出现任何代码文件即回到 R1。
+- **R1 Behavioral**：有行为变化但未触及 Gate/授权/状态机/持久化/并发/公共契约。复现测试先 FAIL，修复后四门禁 → `loopx-flow check --goal-id issue-<id>-goal` → PR → Gate2。
+- **R2 Critical**：Gate/授权/状态机/持久化/并发/公共契约。留在 Issue 管线，不强制 Feature 胶囊；需要回归证据、回滚说明与 readiness；只有改产品契约才要求 Accepted ADR。
+- 代码修复测试放在 `tests/unit/issues/issue-<id>.test.js`；Issue 路径不写 `05-evidence.md`，证据 = Issue + PR + LoopX Receipt + CI。

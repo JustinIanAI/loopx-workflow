@@ -18,9 +18,19 @@ assignees: ""
 - **预期**：
 - **实际**：
 
-### 严重程度与影响面评估 (Triage Feasibility)
-- [ ] **是否可能符合 Fast-Path**（改动 ≤ 20 行，纯 Typo/错误日志/隔离配置/补充单测，0 对外接口变动）
-- [ ] **是否属于 Standard PR**（涉及业务逻辑、状态变更、算法调整、高危并发）
+### 影响分级与根因 (Impact & Root Cause)
+- **Impact**: R1  <!-- 只保留一个值：R0 | R1 | R2；判据见 AGENTS.md 管线 B -->
+
+| 级别 | 判据 |
+|---|---|
+| R0 Isolated | 纯文档 / Typo / 错误日志 / 模板 / 无行为影响的隔离配置 |
+| R1 Behavioral | 有行为变化，但未触及 Gate/授权/状态机/持久化/并发/公共契约 |
+| R2 Critical | Gate/授权/状态机/持久化/并发/公共契约 |
+
+- **根因层级（L1-L7）**：
+- **是否改变公共契约/默认行为**：否 / 是（是则先立 ADR）
+- **回归测试路径**：`tests/unit/issues/issue-<id>.test.js`
+- **回滚方式**：
 
 ### 环境信息 (Environment)
 - OS:

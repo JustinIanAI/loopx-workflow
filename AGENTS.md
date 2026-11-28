@@ -71,27 +71,25 @@
 
 ---
 
-## 管线 B: GitHub Issue 修复管线 (双分支决策)
+## 管线 B: GitHub Issue 修复管线 (impact 分级)
 
-针对接收到的 GitHub Issue，运行 `loopx-flow issue <id>`（底层调用 `loopx issue-fix feasibility`）自动判定分流：
+针对接收到的 GitHub Issue，运行 `loopx-flow issue <id> [--goal-id issue-<id>-goal] [--impact R0|R1|R2] [--execute]`。默认 dry-run：调用 `loopx issue-fix feasibility` 读取 `decision.route` 与 `decision.reason_codes[]`；`fix_pr` 再调用 `issue-fix workflow-plan` 输出计划，不建分支、不写 domain state。`--execute` 必须已绑定 Goal（或 `--init-goal`），才调用 `issue-fix caller-repo-branch --issue-branch fix/issue-<id>` 建/领分支；修复仍由 Agent 执行。
 
-### 路径 A：Fast-Path（极简微闭环）
-- **准入标准**：改动 ≤ 20 行；纯 Typo / 错误日志 / 文档 / 隔离配置 / 单测补充；0 对外接口或持久化模型变动。
-- **执行命令**：
-  1. 定位并补充单测验证。
-  2. 外科手术式最小修复（不碰邻近无关代码）。
-  3. 四大门禁全绿 + `loopx-flow check` 质量收据通过。
-  4. 创建修复分支与 PR，走与 Feature 相同的 Gate2（Fast-Path 不得绕过）；`scripts/fast-fix-push.sh` 不得直推 `main`，只允许分支+PR 或显式受控操作。
+### 影响分级（impact，不是路线命名）
+- **R0 Isolated**：纯文档 / Typo / 错误日志 / 模板 / 无行为影响的隔离配置。纯文档 PR 按 ADR-0006 不建 Goal、不跑 `check`，但仍必须 Gate2；出现任何代码文件即回到 R1。
+- **R1 Behavioral**：有行为变化但未触及 Gate/授权/状态机/持久化/并发/公共契约。必须有每 Issue Goal、先 FAIL 的复现测试、`loopx-flow check --goal-id` Receipt、Gate2。
+- **R2 Critical**：Gate/授权/状态机/持久化/并发/公共契约。留在 Issue 管线，不强制 Feature 胶囊；必须有回归证据、回滚说明、LoopX readiness 与 review-thread 检查；只有 `contract_impact=changed` 时才要求 Accepted ADR。R2 不额外要求第二个 GitHub 账号。
 
-### 路径 B：Standard PR-Path（标准 PR 流程）
-- **准入标准**：涉及业务逻辑、状态变更、算法调整、高危并发或任何不符合 Fast-Path 的缺陷。
-- **执行命令**：
-  1. 调用 `loopx issue-fix caller-repo-branch` 检出 `fix/issue-<id>`。
-  2. **七层根因因果诊断 (`systematic-debugging`)**：从 L1 症状持续下探至 L7 规格缺口，定位根本所有者 (Canonical Owner)。
-  3. **Failing Repro 先行**：在 `tests/unit/issues/issue-<id>.test.ts` 下新增针对根本所有者的复现用例，**验证必须先 FAIL**。
-  4. 实施外科手术修复与代码退役（`delete-first`），验证用例变绿。
-  5. 运行 `loopx-flow check` 固化质量收据。
-  6. 创建 GitHub PR 并在页面呈现修复对比证据；按 `authorization_mode` 走 Gate2（Mode A 非作者 Approve / Mode B `release-approve`）后由 `loopx-flow merge <pr_id>` 合并核销。
+### 执行命令（R1/R2 共用）
+1. 首次 `loopx-flow issue <id> --init-goal`，或显式 `--goal-id issue-<id>-goal`；不建 program Goal。
+2. **七层根因因果诊断 (`systematic-debugging`)**：从 L1 症状持续下探至 L7 规格缺口，定位根本所有者 (Canonical Owner)。
+3. **Failing Repro 先行**：在 `tests/unit/issues/issue-<id>.test.js` 下新增针对根本所有者的复现用例，**验证必须先 FAIL**。
+4. 实施外科手术修复与代码退役（`delete-first`），验证用例变绿；不碰邻近无关代码。
+5. 四门禁全绿 → `loopx-flow check --goal-id issue-<id>-goal` 生成 Receipt；Issue 路径不写 `05-evidence.md`。
+6. `loopx-flow pr create --issue <id> --goal-id issue-<id>-goal` 生成带 `loopx-meta` 与 `loopx-impact` 的 PR；按 `authorization_mode` 走 Gate2（Mode A 非作者 Approve / Mode B `release-approve`）后，由 `loopx-flow merge <pr_id> --goal-id issue-<id>-goal` 合并核销。
+7. 禁止网页合入后补账；已网页合入只做审计告警，不宣称 `loopx-flow merge` 已执行。
+
+`scripts/fast-fix-push.sh` 仅保留为受控的分支+PR 快捷方式，不得直推 `main`、不得绕过 Gate2/Receipt；Fast-Path 不再是独立管线。
 
 ---
 
