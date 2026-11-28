@@ -399,3 +399,26 @@ test('Stage B P0：跨进程续跑——新进程发现上一轮候选目录并�
     s.restore();
   }
 });
+
+test('状态目录在发现后被删除时不得崩溃（#97 实测 ENOENT 回归）', async () => {
+  const { reviewStateDir } = require('../../skills/code-review/scripts/authentic-review.js');
+  const s = sandbox();
+  try {
+    let removed = null;
+    const r = await runStageWithState(params(s, {
+      // runFn 在真实执行器返回前把状态目录删掉，模拟「发现→使用」窗口内的外部清理
+      runFn: () => {
+        const dir = reviewStateDir(s.dir, 73);
+        fs.rmSync(dir, { recursive: true, force: true });
+        removed = dir;
+        return { stdout: OK_JSON, stderr: '', rawStdout: OK_JSON };
+      },
+    }));
+    assert.ok(removed, '前置：状态目录确实被删除');
+    assert.strictEqual(r.ok, true, '目录被删后应重建并正常返回，而不是抛 ENOENT');
+    assert.strictEqual(fs.existsSync(removed), true, '重建后的目录必须存在');
+    assert.strictEqual(fs.readFileSync(path.join(removed, 'stage1.attempt1.out.txt'), 'utf8'), OK_JSON);
+  } finally {
+    s.restore();
+  }
+});
