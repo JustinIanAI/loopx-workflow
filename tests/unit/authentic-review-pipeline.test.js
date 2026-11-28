@@ -57,7 +57,9 @@ function nativeModelOut({ verdict = 'request_changes', headOid = HEAD, findings 
 }
 
 function makeSandbox(opts = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'auth-review-'));
+  // tmpParent 让用例可以把沙箱建在指定前缀下（例如路径里含 "claude" 的目录），
+  // 用来证明断言不依赖 os.tmpdir() 的路径内容。
+  const dir = fs.mkdtempSync(path.join(opts.tmpParent || os.tmpdir(), 'auth-review-'));
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin, { recursive: true });
   const logs = path.join(dir, 'logs');
@@ -201,6 +203,23 @@ exit 0
   const tmpDir = path.join(dir, 'tmp');
   fs.mkdirSync(tmpDir, { recursive: true });
   return { dir, bin, logs: path.join(logs, 'calls.log'), tmpDir };
+}
+
+// calls.log records `$0 $*` for every mock invoked, and prompts piped into a
+// mock are appended as raw body text. Match the invoked executable's basename
+// under the sandbox bin/ instead of the raw log, so a TMPDIR containing the
+// substring "claude" (e.g. ".../multica-claude-warm-.../tmp") cannot fake an
+// invocation that never happened.
+function invokedBinaries(sbx) {
+  const prefix = sbx.bin + path.sep;
+  const names = new Set();
+  if (!fs.existsSync(sbx.logs)) return names;
+  for (const line of fs.readFileSync(sbx.logs, 'utf8').split('\n')) {
+    if (!line.startsWith(prefix)) continue;
+    const [name] = line.slice(prefix.length).split(/\s+/, 1);
+    if (name) names.add(name);
+  }
+  return names;
 }
 
 function run(sbx, args, envExtra) {
@@ -616,12 +635,39 @@ describe('R3 agent policy and model declaration', () => {
     const f = path.join(os.tmpdir(), 'codex-unused-' + Date.now() + '.json');
     fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', findings: [] }));
     const sbx = makeSandbox({ omitCodex: true, codexStdoutFile: f, verdict: 'approve' });
-    const nodeDir = path.dirname(process.execPath);
-    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { PATH: `${sbx.bin}:${nodeDir}:/usr/bin:/bin` });
+    // 不能把 dirname(process.execPath) 直接放进 PATH：node 的同目录可能同时装着
+    // 真实 codex/claude（例如 /usr/local/bin），用例就会从「codex 不可用」变成
+    // 「调用真实 codex 直到超时」。只暴露一个 node shim，保持环境无关。
+    const nodeShim = path.join(sbx.dir, 'nodeshim');
+    fs.mkdirSync(nodeShim);
+    fs.symlinkSync(process.execPath, path.join(nodeShim, 'node'));
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { PATH: `${sbx.bin}:${nodeShim}:/usr/bin:/bin` });
     assert.notStrictEqual(r.code, 0);
     assert.ok(r.out.includes('NOT_VERIFIED') || r.out.includes('codex CLI unavailable'));
-    const calls = fs.readFileSync(sbx.logs, 'utf8');
-    assert.ok(!calls.includes('claude'));
+    const invoked = invokedBinaries(sbx);
+    assert.ok(!invoked.has('claude'), `codex 不可用时不得回退到 claude，实际调用：${[...invoked].join(', ') || '(none)'}`);
+  });
+
+  test('sandbox path containing "claude" does not fake a claude invocation', () => {
+    // 回归：TMPDIR 形如 .../multica-claude-warm-.../tmp 时，calls.log 里的
+    // 绝对路径会包含 "claude"，裸子串断言必然假红。
+    const tmpParent = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-warm-'));
+    try {
+      const f = path.join(tmpParent, 'codex-unused.json');
+      fs.writeFileSync(f, nativeModelOut({ verdict: 'approve', findings: [] }));
+      const sbx = makeSandbox({ tmpParent, omitCodex: true, codexStdoutFile: f, verdict: 'approve' });
+      const nodeShim = path.join(sbx.dir, 'nodeshim');
+      fs.mkdirSync(nodeShim);
+      fs.symlinkSync(process.execPath, path.join(nodeShim, 'node'));
+      const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE], { PATH: `${sbx.bin}:${nodeShim}:/usr/bin:/bin` });
+      assert.notStrictEqual(r.code, 0);
+      assert.ok(sbx.dir.includes('claude'), '前置条件：沙箱路径必须包含 "claude"');
+      const invoked = invokedBinaries(sbx);
+      assert.ok(!invoked.has('claude'), `沙箱路径含 claude 时也不得误判为调用 claude，实际调用：${[...invoked].join(', ') || '(none)'}`);
+      fs.rmSync(sbx.dir, { recursive: true, force: true });
+    } finally {
+      fs.rmSync(tmpParent, { recursive: true, force: true });
+    }
   });
 
   test('explicit --agent-bin claude is allowed', () => {
@@ -630,8 +676,8 @@ describe('R3 agent policy and model declaration', () => {
     const sbx = makeSandbox({ omitCodex: true, claudeStdoutFile: f, verdict: 'request_changes' });
     const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE, '--agent-bin', 'claude']);
     assert.strictEqual(r.code, 0, r.out);
-    const calls = fs.readFileSync(sbx.logs, 'utf8');
-    assert.ok(calls.includes('claude -p'));
+    const invoked = invokedBinaries(sbx);
+    assert.ok(invoked.has('claude'), `显式 --agent-bin claude 必须实际调用 claude，实际调用：${[...invoked].join(', ') || '(none)'}`);
   });
 
   test('Reviewer line records configured default model instead of codex', () => {
@@ -749,6 +795,9 @@ describe('P0-A1 gates env isolation', () => {
     const res = spawnSync(process.execPath, [
       '--test',
       '--test-concurrency=1',
+      // 固定 reporter：默认 reporter 的汇总行随 Node 主版本漂移（Node 22 TAP `# fail 0`，
+      // Node 25 spec `ℹ fail 0`），断言必须依赖显式契约。
+      '--test-reporter=tap',
       'tests/unit/issues/issue-8.test.js',
     ], {
       cwd: PROJECT_ROOT,
@@ -757,7 +806,7 @@ describe('P0-A1 gates env isolation', () => {
     });
     assert.strictEqual(res.status, 0, `${res.stdout}\n${res.stderr}`);
     assert.match(res.stdout, /D2 gc/);
-    assert.match(res.stdout, /# fail 0/);
+    assert.match(res.stdout, /^# fail 0$/m);
   });
 
   test('stage2 manifest includes priorEntries with the sandbox and stage2 files', () => {

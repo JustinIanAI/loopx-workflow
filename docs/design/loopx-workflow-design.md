@@ -54,21 +54,21 @@ flowchart LR
 | `doctor` | `cmd_doctor`、`cmd_doctor_control_plane` | 环境哨兵、`REQ-ENV-1`、`REQ-ENV-2`、`REQ-CAPABILITY-1`、`REQ-SKILL-READY-1` | preflight 失败（含本机已有 `loopx` 时 required skills/routes/新鲜度未通过）、`loopx doctor` 失败、本机没有 `loopx`、或集中式三层能力/`schema_version` 探针命中 BLOCK 缺口均非 0，并输出「能力→探测信号→PASS/WARN/BLOCK」矩阵与诊断卡（含原因/影响/修复命令）。控制面路由/registry 一致性、`~/.loopx` 半迁移残留、运行时工件被跟踪、GitHub API 50% 预算基线为 WARN 级检查（见 ADR-0007、ADR-0015） |
 | `init` | `cmd_init` | `REQ-MAIN-1`、`REQ-AUTH-MODE-1`、`REQ-SKILL-READY-1` | 安装 pre-commit；确认 `authorization_mode` 与风险接受；preflight 在已有 `loopx` 时阻断缺失或过期的 required skills；有 `loopx` 时 `bootstrap` 失败则退出 |
 | `feature <name>` | `cmd_feature` | `REQ-FAILCLOSED-2`、`REQ-CAPSULE-1` | 分支创建或切换失败则退出，不写胶囊 |
-| `approve contract <feature>` | `cmd_approve` | `REQ-CHECKPOINT-1`、`REQ-GATE1-AUTH-1`、`REQ-AUTH-MODE-1` | 缺配置/规格不完整/未授权/`configure-goal`/`user_gate` 写入失败均非 0；先锁最终内容 SHA256，成功后才原子写入批准标记 |
+| `approve contract <feature>` | `cmd_approve` | `REQ-CHECKPOINT-1`、`REQ-GATE1-AUTH-1`、`REQ-AUTH-MODE-1`、`REQ-PR-LIFECYCLE-1` | 缺配置/规格不完整/未授权（默认校验 `accepted_by` 的 GitHub `gate=1` 评论；`--prepare` 打印模板；`--interactive` 回退 TTY）/规格包未跟踪或未推送/无 PR/`presentation=pending`/`configure-goal`/`user_gate` 写入失败均非 0；先核验发布前置与规格完整性，再锁最终内容 SHA256，成功后才原子写入批准标记 |
 | `gate verify decisions\|contract` | `cmd_gate` | `REQ-GATE-DECISIONS-1`、`REQ-CONTRACT-LOCK-1`、`REQ-GATE1-AUTH-1` | 见第 5 节：SHA + user_gate 授权记录 + evidence 串；没有 `pr` 这个 stage |
 | `check [feature] [--goal-id] [--with-ocr]` | `cmd_check` | `REQ-GATE-1`、`REQ-QUALITY-1`、`REQ-QUALITY-3`、`REQ-EVIDENCE-1`、`REQ-CHECK-IDENTITY-1`、`REQ-FAILCLOSED-1` | 无 feature 且无 `--goal-id` 则非 0；有胶囊时先 `gate verify contract`；前置解析真实远程基线并诊断 Goal 资格；四门禁后必须收据 `ok=true` 才打印成功 |
 | `todo list\|claim\|done` | `cmd_todo` | `REQ-NATIVE-1`、`REQ-LEASE-1`、`REQ-CAPABILITY-1` | 没有 `loopx` 或三层能力/`schema_version` 探针不通过则退出。`claim` 先按 `next_cursor` 完整分页读完 `agent-directory` 解析已注册 owner（缺失、歧义、游标异常或 `LOOPX_AGENT_ID` 未注册时非 0 且不申领），随后直接委托受管 `loopx --format json todo claim --goal-id --todo-id --agent-id --claimed-by`，将 `claim_operation_id` 与五元组（`goal_id`/`todo_id`/`agent_id`/`registry_path`/`handoff_mode`）缓存至 `$LOOPX_TMP_DIR/claims/<gid>--<tid>.json`（透明适配 `hard_lease`/`soft_claim`）。`done` 委托 `loopx --format json todo complete` 原子完成并释放租约，执行 Q1 双分流停机恢复：缓存缺失或五元组不匹配时仅在租约有效且同 Owner 自动补领 receipt；已过期（`lease_state=expired`）/已释放/已转让/`deferred` 一律 Fail-Closed 非 0 停机并原样透出 LoopX `recovery` 指引，严禁静默重 `claim`（见 ADR-0015） |
 | `issue <id>` | `cmd_issue` | `REQ-NATIVE-1`、`REQ-ISSUE-PIPELINE-1`、`REQ-FAILCLOSED-1` | 读取 `decision.route`；`fix_pr` 走同一 Goal/Evidence/Gate2；不得直推 main |
 | `integrate [--execute\|--status]` | `cmd_integrate` | `REQ-NATIVE-1` | 默认 preview，不落盘。`--execute` 才 sync 落盘 |
 | `integrate configure --base-ref <ref> --integration-branch <ref> --source-branch <ref> [--replace] [--execute] [--plan-file <path>]` | `cmd_integrate_configure` | `REQ-FACADE-1`、`REQ-FACADE-2`、`REQ-NATIVE-1`、`REQ-FAILCLOSED-1` | 仅首参数 configure 分派；三个必填项各一次。缺值/空白值/重复项/未知项 exit 2 且零 LoopX 调用；带值项不能吞掉后续 `--option`。原生非零 exit 1 并保留诊断；成功 exit 0，仅打印可读成功提示 |
-| `pr create\|preview\|update\|ready` | `cmd_pr` | `REQ-PR-BODY-1`、`REQ-PR-LIFECYCLE-1` | 调用 `authentic-review.js --generate-pr-body`；draft→ready 不代表合并授权 |
+| `pr create\|preview\|update\|ready` | `cmd_pr` | `REQ-PR-BODY-1`、`REQ-PR-LIFECYCLE-1` | 调用 `authentic-review.js --generate-pr-body`；draft→ready 不代表合并授权；`create` 失败写 `presentation=pending` 持久标记并非 0（Gate1 据此阻断） |
 | `review <pr>` | `cmd_review` | `REQ-REVIEW-1`、`REQ-REVIEW-2`、`REQ-GATE2-MODE-1` | 发布 formal review（Agent 只发 COMMENT）；基于文件流契约与两阶段解耦；模板/审查不可用 `NOT_VERIFIED`，不发评论 |
 | `respond <pr>` | `cmd_respond` | `REQ-RESPOND-1` | 只接受精确 head artifact；四门禁或既有产物失败不发评论；无 `loopx` 时 status 记为跳过 |
 | `merge <pr> [feature]` | `cmd_merge` | `REQ-CHECKPOINT-2`、`REQ-CHECKPOINT-3`、`REQ-GATE2-MODE-1`、`REQ-CI-PROTECTION-1`、`REQ-GOAL-1`、`REQ-CAPSULE-1` | 见第 6 节；按 Mode A/B 校验审批与 readiness；已 MERGED 可重跑补步骤，任何未完成步骤非 0 |
 | `context <feature>` | `cmd_context` | 审阅入口 | 打印 `00-INDEX.md` |
 | `status` | `cmd_status` | 观察 | 只读；`loopx` 不可用时的退出码保持现状，不纳入失败即停 |
 | `status --next` | `cmd_status_next` | `REQ-STATUS-NEXT-1` | 只读投影 + 下一步建议，不写状态；不是 resume |
-| `release-approve <pr>` | `cmd_release_approve` | `REQ-GATE2-MODE-1` | Mode B 专用；非 TTY/`--yes` 非 0；principal 必须等于配置 `accepted_by` |
+| `release-approve <pr>` | `cmd_release_approve` | `REQ-GATE2-MODE-1` | Mode B 专用；默认校验 `accepted_by` 的 GitHub `gate=2` 评论（`--prepare` 打印模板，`--interactive` 走 TTY 并写评论）；`--yes` 非 0 |
 | `archive <feature>` | `cmd_archive` | 手动归档 | 有目录则移动；合入由 `merge` 移动；重复移动前判重 |
 ### 3.1 L0 命令契约与能力矩阵
 
@@ -77,19 +77,19 @@ L0 命令不是 LoopX 转发器，而是场景操作契约（遵循 [ADR-0010](.
 | 命令 | 原生能力映射（LoopX/GitHub） | Workflow 增强约束 | 前置与后置条件 | 失败与恢复策略 | 证据契约 |
 |---|---|---|---|---|---|
 | `feature` | `loopx bootstrap --goal-id <feature>-goal --state-file` + `sync-global` | 强制 `1 Feature : 1 Goal`；创建/切换 `feature/<name>` 分支、初始化胶囊骨架；运行态 `ACTIVE_STATE.md` 归 LoopX runtime 不入 Git | **前置**：工作区允许建/切分支；若含 LoopX 则 `goal.bootstrap` 能力可用。<br>**后置**：位于 `feature/<name>` 分支，胶囊文件存在，Goal 已注册且 `sync-global` 完成 | 分支创建/切换失败立即非 0 且不创建胶囊；重入先读回 Goal 是否已存在，不重复建 Goal；`sync-global` 重试后仍失败返回 `PARTIAL`（非 0） | 胶囊目录 `specs/features/<feature>/`（`00-INDEX.md`～`05-evidence.md`）与 LoopX registry Goal 条目（均不含运行态 `ACTIVE_STATE.md` 入 Git） |
-| `approve contract` | `loopx configure-goal --progress-review-contract-revision <sha>` + `loopx todo add/complete`（`user_gate`）+ `gh api`（Mode A 核验） | 规格包完整性核验（`01-decisions` APPROVED、`04-contract` 含 AC/Scope/Verification Plan/依赖顺序、Story 与 AC 对齐、引用 ≥1 条 REQ/ADR）；按 `authorization_mode`（`single_owner` TTY + 风险接受 / `independent` 第二账号 Draft PR `gate=1` 评论）核验审批主体 | **前置**：`loopx` 与 `todo.user_gate` 可用；`loopx-workflow.config.json` 合法；规格包完整且审批主体通过。<br>**后置**：最终带 `Contract-Status: FROZEN & APPROVED` 的 SHA256 已写入 Goal `contract_revision`、`user_gate` 审计记录落盘、契约批准标记原子写入且 `sync-global` 完成 | 任一步失败非 0 且不得在 `04-contract.md` 留下批准标记；重跑以新 SHA 与新 `user_gate` 记录取代旧授权 | LoopX `progress_review.contract_revision` + `user_gate` 记录（`decision-scope=other:goal:<sha>`、`decision-outcome=approve`、固定 `evidence` 串）+ `04-contract.md` 批准标记 |
+| `approve contract` | `loopx configure-goal --progress-review-contract-revision <sha>` + `loopx todo add/complete`（`user_gate`）+ `gh api`（Mode A 核验）+ `git ls-files`/`git ls-remote`/`gh pr view`（发布前置） | 发布前置核验（规格包三件套被 Git 跟踪、`specs/features/<feature>/**` 无未提交/未跟踪文件、`HEAD == origin/<branch>`、存在 `OPEN` 且 `headRefOid == HEAD` 的可读 PR、无 `presentation=pending` 标记）；规格包完整性核验（`01-decisions` APPROVED、`04-contract` 含 AC/Scope/Verification Plan/依赖顺序、Story 与 AC 对齐、引用 ≥1 条 REQ/ADR）；按 `authorization_mode`（`single_owner` 默认 `accepted_by` 的 GitHub `gate=1` 评论，`--interactive` 回退 TTY + 风险接受 / `independent` 第二账号 Draft PR `gate=1` 评论）核验审批主体 | **前置**：`loopx` 与 `todo.user_gate` 可用；`loopx-workflow.config.json` 合法；规格包完整且审批主体通过；规格包已提交并推送、存在可读 PR。<br>**后置**：最终带 `Contract-Status: FROZEN & APPROVED` 的 SHA256 已写入 Goal `contract_revision`、`user_gate` 审计记录落盘、契约批准标记原子写入且 `sync-global` 完成 | 任一步失败非 0 且不得在 `04-contract.md` 留下批准标记；规格包未跟踪/未推送/无 PR/`presentation=pending` 一律阻断（不得降级 WARN）；重跑以新 SHA 与新 `user_gate` 记录取代旧授权 | LoopX `progress_review.contract_revision` + `user_gate` 记录（`decision-scope=other:goal:<sha>`、`decision-outcome=approve`、固定 `evidence` 串）+ `04-contract.md` 批准标记 |
 | `todo` | `loopx agent-directory` + 受管 `loopx --format json todo claim` / `loopx --format json todo complete` / `loopx todo list`（ADR-0015） | 完整分页解析已注册 Agent 身份；直接委托受管执行（`manage_execution=True`，透明适配 `hard_lease` / `soft_claim`）；在 `$LOOPX_TMP_DIR/claims/<gid>--<tid>.json` 缓存 `claim_operation_id` 与五元组（`goal_id`/`todo_id`/`agent_id`/`registry_path`/`handoff_mode`）；禁止编排层手工调用 `task-lease acquire/release/renew` | **前置**：`loopx` 可用、三层能力/`schema_version` 探针通过、当前 Goal 存在且已解析唯一合法已注册 `agent_id`；`done` 需有效 `claim_operation_id`。<br>**后置**：`claim` 成功写入五元组缓存并返回 `claim_operation_id`；`done` 原子置 Todo 为 `done` 并释放租约（`released`）且清理缓存 | 身份缺失/歧义/游标异常非 0 且不申领；`done` 走 Q1 双分流：缓存缺失或五元组失配时仅租约有效且同 Owner 自动补领 receipt；租约已过期（`lease_state=expired`）/已释放/已转让/`deferred` 一律 Fail-Closed 非 0 停机并原样透出 LoopX `recovery`，严禁静默重 `claim`；`todo update` CAS 冲突先 `todo list` 对账 `provider_revision` | LoopX Todo/Lease 权威状态（`loopx_coordination_todo_*_v0` 返回体）+ 临时跨进程凭证缓存 `$LOOPX_TMP_DIR/claims/<gid>--<tid>.json`（非第二权威状态源） |
 | `integrate` | `loopx integration-branch status` / `sync` | 严格分离默认 preview（只读预演）与显式 `--execute`（落盘同步），不改写 LoopX 结论 | **前置**：`loopx` 与 `integration-branch` 能力探测通过（缺失/UNKNOWN 仅阻断本命令）；有效仓库与目标上下文。<br>**后置**：preview 零落盘副作用；`--execute` 完成目标分支同步且返回 LoopX 状态 | 缺能力/探针失败立即 `BLOCKED`（非 0）；同步冲突按 LoopX 输出停机，先读回真实状态不重复落盘 | LoopX `integration-branch` JSON/状态输出及同步后的 Git 分支状态 |
 | `integrate configure` | `loopx integration-branch configure --repo-path "$PROJECT_ROOT" ...` | 复用 `run_loopx`、现有 registry 与目标仓库根；原顺序数组透传三项 refs 及显式可选项，不推断、不缓存配置 | **前置**：有效 repo/registry、原生 CLI、参数校验通过。<br>**后置**：默认仅预演；`--execute` 才配置落盘；不伪造原生 JSON | 原生错误原样保留并非 0；不自动 replace/retry，不改变旧 sync/status 语义 | 原生 configure stdout/stderr；fake CLI argv 测试证明参数边界与零调用拒绝 |
 | `check` | 本地四大门禁（`npm run typecheck/lint/build/test`）+ `loopx change-quality prepare/record/verify`（via `ingest-to-loopx-quality.js`） | 无 feature 且无 `--goal-id` 直接阻断；有胶囊先跑 `gate verify contract`；前置解析真实远程基线（`origin/HEAD→origin/main→origin/master`）与 Goal 资格；Adapter 只翻译不造假；四门禁禁标 `not_applicable`；可选 `--with-ocr` | **前置**：契约锁定有效（有胶囊时）；远程基线可解析；Goal 已启用 `change-quality` 资格；`change-quality.strict-receipt` 能力与 `change_quality_*_v2` Schema 探针通过。<br>**后置**：四门禁全部退出码 0，`05-evidence.md` 按六状态更新，LoopX `change-quality verify` 收据 `ok=true` | 任一前置/门禁/收据校验失败非 0（`BLOCKED`/`FAILED`/`NOT_VERIFIED`），不写入 `passed` 也不打印成功；缺资格打印带 `--execute` 的 `configure-goal` 修复指令 | `specs/features/<feature>/05-evidence.md`（六状态与 `Real-vs-Mock` 验证矩阵）+ LoopX `change_quality_receipt_v2` / `change_quality_receipt_verification_v2` 权威收据 |
 | `issue` | `gh issue view` + `gh repo view` + `loopx issue-fix feasibility --format json` | 严格读取 `decision.route`（仅接受 `fix_pr` / `comment_only` / `triage_only`）；`fix_pr` 复用管线 A 的 Goal/Todo/Evidence/Gate2，Fast Path 不得绕过 Gate2 且禁止直推 `main` | **前置**：`loopx`、`gh` 与 `issue-fix.feasibility` 能力探针通过；目标 Issue 可读。<br>**后置**：输出合法路由；进入 `fix_pr` 后落入同标准 Goal/Branch/Evidence/Gate2 轨迹 | 缺 `loopx`/`gh`/`issue-fix.feasibility` 或路由为空/非法值立即 `BLOCKED`/`NOT_VERIFIED`（非 0），不进入直推分支 | LoopX `issue-fix feasibility` JSON（`decision.route`）与后续 `fix_pr` 对应的 Goal/PR/证据链 |
 | `gate verify` | 只读核验 `${LOOPX_REGISTRY:-.loopx/registry.json}` + LoopX `user_gate` 记录 | 校验 `decisions` APPROVED 标记或 `contract` 双重锁定（文件 SHA256 == Goal `contract_revision` + 最新未 supersede `user_gate` 记录 + `evidence` 固定串与 `authorization_mode` 一致） | **前置**：目标胶囊存在（活跃或归档）；`contract` 校验需可读有效 registry（附属 worktree 缺 registry Fail-Closed）。<br>**后置**：纯只读核验通过返回 0，零写入副作用 | 缺文件/缺 `FROZEN & APPROVED`/SHA 不匹配/缺授权记录/模式不一致/缺键均返回 `BLOCKED`（非 0）并打印差异诊断 | 只读核验输出（对比 `04-contract.md` SHA256、`registry.json` 与 `user_gate` 审计记录），不产出第二份授权文件 |
-| `pr` | `gh pr create` / `edit` / `ready`（正文经 stdin 传入）+ `authentic-review.js --generate-pr-body` | 固定四段正文（动机/改动思路/具体改动/对主干的风险）+ 含 `Real-vs-Mock` 列的验证矩阵 + 六问；支持阶段 4 `create --draft` 与阶段 7 `ready`；正文经 stdin 零落盘临时文件；缺信息写 `NOT_PROVIDED` | **前置**：`gh` 可用且已认证；当前为非主干特性分支；胶囊与真实 Git diff 可读。<br>**后置**：PR 创建/更新/就绪完成，远端 PR 正文与当前 diff / 胶囊一致；`draft→ready` 不代表合并授权 | 缺 `gh` 或正文生成/远端 API 失败非 0；重入 `create` 先读回当前分支是否已有 PR 禁止重复建 PR；`create --draft` 失败降级提示 `presentation=pending` | GitHub PR 元数据与四段正文 + 验证矩阵 + 六问（来源于胶囊与真实 `git diff`） |
+| `pr` | `gh pr create` / `edit` / `ready`（正文经 stdin 传入）+ `authentic-review.js --generate-pr-body` | 固定四段正文（动机/改动思路/具体改动/对主干的风险）+ 含 `Real-vs-Mock` 列的验证矩阵 + 六问；支持阶段 4 `create --draft` 与阶段 7 `ready`；正文经 stdin 零落盘临时文件；缺信息写 `NOT_PROVIDED` | **前置**：`gh` 可用且已认证；当前为非主干特性分支；胶囊与真实 Git diff 可读。<br>**后置**：PR 创建/更新/就绪完成，远端 PR 正文与当前 diff / 胶囊一致；`draft→ready` 不代表合并授权 | 缺 `gh` 或正文生成/远端 API 失败非 0；重入 `create` 先读回当前分支是否已有 PR 禁止重复建 PR；`create` 失败写 `.loopx/presentation/<feature>.json`（`presentation=pending`）并打印明确 stderr，非 0 且阻断 Gate1（不再降级 WARN） | GitHub PR 元数据与四段正文 + 验证矩阵 + 六问（来源于胶囊与真实 `git diff`） |
 | `review` | `loopx pr-review` 原生评审包 + `loopx pr-review --check-result` + 审查者 CLI（stdin 管道）+ `gh api` formal review | 遵循 ADR-0013 文件/流输入契约与两阶段解耦；仅发布 Agent `COMMENT`/`REQUEST_CHANGES` formal review（严禁自动生成 author-owned 批准标题）；评审缓存落入 `$REPO_ROOT/.loopx/cache/reviews/`（`v1`）且命中仍须重跑 `--check-result` | **前置**：`loopx`、`gh`、`pr-review.check-result` 能力与 `pull_request_review_*` Schema 探针通过；PR 非 Draft；原生 `review_template` 章节非空且审查者 CLI 可用。<br>**后置**：`check-result` 返回 `ok=true` 且 formal review 已发布至当前 `headRefOid` | 模板缺失/审查者不可用/输出不可解析/`check-result` 未通过均返回 `NOT_VERIFIED`（非 0）且不发布自造报告；复审存在未清 `reproducible` 时 verdict 上限 `REQUEST_CHANGES` | GitHub formal review（绑定精确 `headRefOid`、五段报告、verdict 与模型声明）+ LoopX `pull_request_review_result_v1` 校验通过 + 可丢弃缓存 `loopx_flow_review_cache_v1` |
 | `respond` | 本地四门禁 + `loopx status`（若本机有 `loopx`）+ `gh api` 评论（via `respond-report.js`，stdin 传输） | 复用五段结构回复审阅意见；**只接受与当前 PR `headRefOid` 精确匹配的既有审查产物**，严禁回退旧 head 缓存 | **前置**：`gh` 可用；当前 PR `headRefOid` 存在精确对应的既有审查产物；四门禁全绿（本机有 `loopx` 时 `loopx status` 亦须成功）。<br>**后置**：回复评论已发布至目标 PR | 精确 head 审查产物缺失、四门禁任一失败或 `loopx status` 失败均 Fail-Closed 非 0 且不发评论（无 `loopx` 时 `loopx status` 记为跳过） | GitHub PR 审阅回复评论（绑定精确 `headRefOid` 与实测四门禁结果） |
 | `merge` | `gh pr view` + `loopx pr-review --check-merge-readiness <pr>@<oid>` + `gh pr merge --squash --delete-branch` + `loopx goal-lifecycle stop` / `retire-global-goal` / `sync-global` + Git archive push | 按 `authorization_mode`（Mode A 非作者 `APPROVED` / Mode B Agent COMMENT + `release-approve` 评论 + `blocking_reasons` 三档判定）校验 Gate2；二次核对 `headRefOid` 防换头；已 `MERGED` 时跳过合并进入幂等前向补偿；可选接入 `goal-acceptance` | **前置**：`loopx`、`gh`、`pr-review.merge-readiness`、`goal.lifecycle` 能力与 Schema 探针通过；PR 非 Draft 且满足 Mode A/B Gate2 授权与 CI/分支保护；二次读取 `headRefOid` 一致。<br>**后置**：PR 已 Squash 合入，Goal 已 stop + retire + sync-global，胶囊归档至 `specs/archive/<feature>/` 并推送远端 | 授权/readiness/HEAD 校验失败非 0 且不调用 `gh pr merge`；合并后 stop/retire/sync/archive 任一步失败返回 `PARTIAL`（非 0）并打印「已合入、未闭环」与重跑命令，重跑先读回真实状态补齐剩余步骤、不重复合并 | GitHub `MERGED` 状态 + Gate2 授权记录 + LoopX 已退役 Goal 状态 + `specs/archive/<feature>/`（可选独立命名 `ACTIVE_STATE.snapshot.md`，`historical_snapshot: true`） |
 | `archive` | 本地 `git mv` + Git commit / push | 将已完成特性胶囊从 `specs/features/<feature>/` 移至 `specs/archive/<feature>/`；归档快照仅允许独立命名 `ACTIVE_STATE.snapshot.md`（`historical_snapshot: true`） | **前置**：目标特性目录存在（或已归档用于幂等判重）；工作区可安全提交推送。<br>**后置**：胶囊位于 `specs/archive/<feature>/` 且已提交推送至远端 | 移动前判重（已存在于 `specs/archive/<feature>/` 时跳过不嵌套）；commit 或 push 失败返回 `PARTIAL`/`FAILED`（非 0） | Git 归档提交与 `specs/archive/<feature>/` 不可变目录快照 |
-| `release-approve` | `gh api user` + `gh api` 发布结构化 PR 评论（stdin 传输） | Mode B（`single_owner`）专用 Gate2 人工发布授权；强制 TTY 确认（拒绝非 TTY / `--yes`）；校验 `principal == single_owner_risk_acceptance.accepted_by`；不宣称 `separation_of_duties` | **前置**：`gh` 可用；配置 `authorization_mode == single_owner` 且风险接受有效；交互式 TTY 确认通过；当前 PR 非 Draft 且存在合法 `headRefOid` 与 `contract_sha`。<br>**后置**：PR 上写入绑定当前 `head` 与 `contract_sha` 的结构化 `gate=2` 评论 | 非 TTY、传入 `--yes`、配置模式非 `single_owner` 或 `principal != accepted_by` 均返回 `BLOCKED`/`NEEDS_HUMAN`（非 0），不写授权评论 | GitHub PR 结构化评论（标记 `<!-- loopx-flow:release-authorization:<pr>@<head> -->` 与固定键值串 `gate=2;mode=single_owner;head=...;contract_sha=...;principal=...;approved_at=...;risk_acceptance=...`） |
+| `release-approve` | `gh api user` + `gh api` 发布结构化 PR 评论（stdin 传输） | Mode B（`single_owner`）专用 Gate2 人工发布授权；默认校验 `accepted_by` 的 GitHub `gate=2` 评论（`--prepare` 打印模板，`--interactive` 走 TTY 并写评论）；拒绝 `--yes`；不宣称 `separation_of_duties` | **前置**：`gh` 可用；配置 `authorization_mode == single_owner` 且风险接受有效；存在 `accepted_by` 的合法 `gate=2` 评论（或 `--interactive` TTY 确认通过）；当前 PR 非 Draft 且存在合法 `headRefOid` 与 `contract_sha`。<br>**后置**：PR 上存在绑定当前 `head` 与 `contract_sha` 的结构化 `gate=2` 评论（评论路径复用不重复写；`--interactive` 写入） | 无 `accepted_by` 合法评论且未加 `--interactive`、传入 `--yes`、配置模式非 `single_owner`（或 `--interactive` 下 `principal != accepted_by`）均返回 `BLOCKED`/`NEEDS_HUMAN`（非 0），不写授权评论 | GitHub PR 结构化评论（标记 `<!-- loopx-flow:release-authorization:<pr>@<head> -->` 与固定键值串 `gate=2;mode=single_owner;head=...;contract_sha=...;principal=...;risk_acceptance=...（`approved_at` 为 `--interactive` 写入的可选字段，评论路径不要求）`） |
 
 **上游契约锚点与三层能力探针矩阵（`REQ-CAPABILITY-1` / [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md)）**：
 
@@ -210,7 +210,7 @@ L0 命令不是 LoopX 转发器，而是场景操作契约（遵循 [ADR-0010](.
 | 8 断点 2 | 归档目录与已停机的 Goal | Mode A：GitHub 非作者 Approve；Mode B：`release-approve`；之后 `merge` |
 
 
-**Gate1（Specification Authorization）**：`approve contract` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；`single_owner` 需 TTY 确认 + 风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 story id 在 AC 矩阵中的一行、至少一条 REQ/ADR；锁 04-contract SHA 并写 `user_gate` 授权记录（固定 evidence 串）；任一失败非 0 且不写批准标记。
+**Gate1（Specification Authorization）**：`approve contract` 读取 `loopx-workflow.config.json` 的 `authorization_mode`；先核验发布前置（规格包三件套被 Git 跟踪、`specs/features/<feature>/**` 无未提交/未跟踪文件、`HEAD == origin/<branch>`、存在 `OPEN` 且 `headRefOid == HEAD` 的可读 PR、无 `presentation=pending` 标记）；`single_owner` 默认由 `accepted_by` 的 GitHub `gate=1` 评论授权（`--prepare` / `--interactive` 见 ADR-0019）并需风险接受，`independent` 需 Draft PR 上另一 GitHub 账号的 `gate=1` 评论；核对 01-decisions APPROVED、04-contract 的 AC/Scope/Verification Plan/依赖顺序、每个 story id 在 AC 矩阵中的一行、至少一条 REQ/ADR；锁 04-contract SHA 并写 `user_gate` 授权记录（固定 evidence 串）；任一失败非 0 且不写批准标记。
 
 **Gate2（Release Authorization）**：Mode A（`independent`）要求非作者 formal review `APPROVED` 且 `review.commit_id == headRefOid`；Mode B（`single_owner`）要求当前 head 的 Agent COMMENT + `release-approve` 评论（head/contract 与当前 PR 一致）；`merge` 按模式复核 readiness、二次 HEAD 后合入。Gate1 批准不得继承为 Gate2。
 
@@ -289,12 +289,6 @@ PR 正文的逐文件说明来自真实 diff hunk/符号或模型输出；无法
 
 `--with-ocr` 只影响 `check` 里的扫描脚本，不改变 `review` 的发布条件。
 
-### 8.2 证据契约与新鲜度 (ADR-0011)
-
-`05-evidence.md` 由 `ingest` 生成：Evidence Ref 用既有 REQ/Story/AC/Test 拼接，不新开编号；六状态 `passed/failed/blocked/not_run/not_applicable/deferred`；四门禁不得标 `not_applicable`。`ingest` 只消费 `check` 的退出码，缺结果拒绝写 `passed`。
-
-LoopX `validation.status` 只映射 `passed/failed/skipped`：`not_run/blocked/deferred → skipped + required:true`（check 非 0）；`not_applicable` 只留 05-evidence。Freshness 只对齐 `scope_fingerprint` / `headRefOid` / `contract_revision`；纯 docs（全部在 `docs/**` 与非契约 `*.md`）不使代码证据失效；`package.json`/`package-lock.json` blob 变化使全部 Test 行失效。
-
 ### 8.1 纯文档 PR 的审查豁免与静态三项自检 (ADR-0006)
 
 当 PR 为纯 Markdown 变动（如全局架构规范治理、docs-only 决策批）时，触发双轨流转中的纯文档路径：
@@ -304,6 +298,58 @@ LoopX `validation.status` 只映射 `passed/failed/skipped`：`not_run/blocked/d
   2. 需求与设计交叉引用无死链（所引用的 `REQ-*`、`ADR-*` 存在且一致）。
   3. Markdown 语法合规。
 - **合入依据**：以线下/线上研讨纪要或 `design-grill` 决策记录为准，人类 Maintainer 在 PR 页面直接 Approve 后 Squash 合入。日常特性研发采用契约与代码同分支单 PR 交付。
+
+### 8.2 证据契约与新鲜度 (ADR-0011)
+
+`05-evidence.md` 由 `ingest` 生成：Evidence Ref 用既有 REQ/Story/AC/Test 拼接，不新开编号；六状态 `passed/failed/blocked/not_run/not_applicable/deferred`；四门禁不得标 `not_applicable`。`ingest` 只消费 `check` 的退出码，缺结果拒绝写 `passed`。
+
+LoopX `validation.status` 只映射 `passed/failed/skipped`：`not_run/blocked/deferred → skipped + required:true`（check 非 0）；`not_applicable` 只留 05-evidence。Freshness 只对齐 `scope_fingerprint` / `headRefOid` / `contract_revision`；纯 docs（全部在 `docs/**` 与非契约 `*.md`）不使代码证据失效；`package.json`/`package-lock.json` blob 变化使全部 Test 行失效。
+
+#### 8.2.1 证据核验清单投影与 Stage 2 Fail-Closed（ADR-0013 2026-11-25 增补）
+
+`authentic-review.js` 的 Stage 2 在 `capVerdictInBody` 触发封顶时，将 LoopX `pr-review --check-result` 的 `approval_blockers` 完整明细**机械投影**为第 5 段 `### 证据核验清单（LoopX 契约投影）`（位于 `## 我的整体评价` 之前），列示"应审 N / 通过 X / 未通过 Y + 逐项原因"；数据 100% 来自 `check-result.json`/`result.json`，编排层不改写 LoopX 结论，注入清单后二次过 `check-result` 且必须 `ok === true` 才允许发布。
+
+Stage 2 的超时、非 0、截断标记、JSON 不可解析一律 `[NOT_VERIFIED]`、非 0 退出、保留 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 留证，且禁止调用 `gh` 发布；补证由 `check-result` 报错驱动按内聚域分批（≤3 域、≤2 轮有界收敛）。`gates()` 与 `buildEvidenceGraph` 锚定 `runDir/repo/` 的精确 `headRefOid` 只读代码树；本机 HEAD 不匹配时跳过本地实测并将对应 validation 行标 `unverified`。INV2/INV4/INV5 不变量分别挂靠 `REQ-RESPOND-1`/`REQ-EVIDENCE-1`/`REQ-REVIEW-2`（见 ADR-0013 增补决策 4），不新开编号体系。
+
+#### 8.2.2 审查管线可靠性契约（ADR-0017）
+
+以下契约以 ADR-0017（Proposed）为准；`REVIEW_MAX_TOTAL_ATTEMPTS`、`REVIEW_MAX_TOTAL_MS`、`REVIEW_STATE_STALE_MS`、`owner.lock` 与三件齐全 salvage 判据为提案项，ADR 接受并实现前不改变现有行为与失败条件。
+
+**阶段状态**：`loopx_flow_review_stage_state_v1` 是本地运行状态，不是证据。身份组（`pr`/`stage`/`head_oid`/`prompt_sha256`/`agent_bin`/`selection_hash`）任一变化即作废旧状态；`attempts_total` 跨进程累计；产物只落本进程运行目录；`pipeline.log` 写失败只告警，不阻断审查。
+
+**预算**：单次 `REVIEW_TIMEOUT_MS` 默认 600000、硬上限 `REVIEW_TIMEOUT_MS_MAX` 默认 7200000，非法值 fail-closed；单 head 总尝试 `REVIEW_MAX_TOTAL_ATTEMPTS` 默认 3、硬上限 6，总时间 `REVIEW_MAX_TOTAL_MS` 默认 `REVIEW_TIMEOUT_MS × 总尝试上限`，两者必须跨进程累计，达上限即停止重试；只有 `ETIMEDOUT` 可重试，CLI 缺失、stdin 超限、截断一次即终。
+
+**salvage**：只有 `review_body` + `verdict` + `declaration` 三件齐全且可解析才按成功恢复；缺一即按 `TRUNCATED` fail-closed。被接受的 salvage 必须在 `## 我的整体评价` 机械披露恢复字段清单，并写入 `05-evidence.md`，`Status` 不得因 salvage 升为 `passed`。
+
+**并发与续跑**：运行子目录 `review-pr<N>/<pid>-<random>/` 创建时原子写 `owner.lock`（`O_EXCL`）；发现候选目录必须跳过活跃锁；`pid` 不存在或 mtime 超过 `REVIEW_STATE_STALE_MS`（默认 `2 × REVIEW_TIMEOUT_MS_MAX`）视为陈旧；只删本进程子目录，父目录仅在已空时删除。
+
+**复用分工**：阶段状态只复用"同 head + 同 prompt + 同模型身份"的模型输出；`.loopx/cache/reviews` 只做整轮短路且命中必须重跑 `--check-result`；结论是否仍有效只由原生 `--fresh-audit-exact-head` 判定。三者都不得替代发布前的 `--check-result ok === true`。
+
+**Goal 身份**：`review` 必须解析 `<feature>-goal` 或显式 `--goal-id`，并以 `--goal-id` 传给 `loopx pr-review`；拉包与 `--check-result` 必须使用同一 Goal 配置与同一 packet；无法解析时 fail-closed，不得回落机器默认。
+
+**证据交叉**：`05-evidence.md` 必须同时记录本轮 `check-result` 摘要（`ok`、`approval_blockers` 计数、`reviewed_head`）与 `change-quality` receipt 标识（goal、diff SHA、receipt 路径/ID），两者绑定同一 `headRefOid` 与 `scope_fingerprint`。
+
+### 8.3 原生 pr-review 能力消费矩阵（ADR-0017）
+
+编排层只做绑定、校验与投影；审查队列与结论有效性以 `loopx pr-review` 为准。新增消费项必须先在本节登记并写明失败条件。
+
+| 原生能力 | 当前状态 | 消费约束 |
+| :--- | :--- | :--- |
+| `--target-exact-head` 评审包 | 已消费 | 只按精确 head 拉包；命令失败 `NOT_VERIFIED` |
+| `review_template` 五段 | 已消费 | 版式唯一来源；缺失 `NOT_VERIFIED`，不自造五段 |
+| `agent_response_contract.review_execution_contract` | 已消费 | 证据项由主机装配，模型不手写全量 JSON |
+| `review_plan.required_evidence_ids` / `evidence_commands` | 已消费 | 只执行清单内命令；输出落沙箱 |
+| `--check-result` | 已消费（硬门禁） | `ok === true` 才允许发布；封顶时投影 `approval_blockers` |
+| `--check-merge-readiness` | 已消费 | Mode A/B/默认三种判定；exact head + 二次 HEAD 校验 |
+| `--goal-id` | 待实现（D6） | 当前 `review` 未传；实现后 `review` 与 `merge` 都必须传，缺失 fail-closed |
+| `--fresh-audit-exact-head` | 待收敛（D5） | 结论有效性唯一权威；`--force-recheck` 必须对齐，不得只清本地缓存 |
+| `--check-approval-closeout` | 未消费 | 归 ADR-0012；Mode A/B 审批事实源待从 `gh pr view` 收敛 |
+| 队列 `--state` / `--review-order` / `--since` / `--limit` | 未消费 | 当前单 PR 定向；他人 PR 优先无执行保障 |
+| `--autonomous-observation` 系列 | 未消费 | 自主巡检未启用；启用前登记状态目录与幂等键 |
+| `loopx review-batch` | 未消费 | 批量审查走独立 Issue；禁止自建第三套批量逻辑 |
+| `loopx review-packet` | 未消费 | Goal 交付包，与本管线不同层；需要时显式接入 |
+
+**写权限边界**：原生 skill 是只读入口，不 comment / approve / merge。`loopx-flow review` 发布 formal review 的前提是：PR 非 Draft、精确 head、`check-result ok === true`、人类断点授权（Mode A 非作者 Approve / Mode B `release-approve`）。Agent 只发 COMMENT / REQUEST_CHANGES，不生成 author-owned 批准标题。`respond` 与复审 carryover 复用同一五段，不另立报告格式。
 
 ## 9. 资产
 
@@ -383,6 +429,9 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | 未跑过 `init` | `git commit` on `main` | —（未安装钩子） | 钩子不存在，本仓库命令不会拦截 |
 | 缺 `loopx-workflow.config.json` 或 Gate1 配置无效 | `approve contract` | `BLOCKED` | 非 0，不写批准标记 |
 | 规格包缺 AC/Scope/Verification Plan、Story 无 AC，或 story id 在 AC 矩阵无行 | `approve contract` | `BLOCKED` | 非 0，不写批准标记 |
+| 规格包三件套未被 Git 跟踪、`specs/features/<feature>/**` 有未提交/未跟踪文件，或 `HEAD != origin/<branch>` | `approve contract` | `BLOCKED` | 非 0，不写批准标记 |
+| 当前分支无可读 `OPEN` PR，或存在 `presentation=pending` 标记 | `approve contract` | `BLOCKED` | 非 0，不写批准标记（不再降级 WARN） |
+| `pr create --draft` 失败 | `pr create` | `FAILED` | 非 0 + 明确 stderr + `.loopx/presentation/<feature>.json` 持久标记，阻断 Gate1 |
 | 配置文件存在但 JSON 非法或 `authorization_mode` 非法 | `merge` | `BLOCKED` | 非 0，不退回 `reviewDecision`，不调用 `gh pr merge` |
 | `single_owner` 缺风险接受 | `approve contract` | `NEEDS_HUMAN` / `BLOCKED` | 非 0 |
 | `independent` 缺有效第二账号 `gate=1` 评论 | `approve contract` | `NEEDS_HUMAN` | 非 0 |
