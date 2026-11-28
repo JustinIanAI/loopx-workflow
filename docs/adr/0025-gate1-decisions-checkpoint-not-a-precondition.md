@@ -23,7 +23,7 @@ echo "- **Status**: APPROVED BY HUMAN ($operator@$timestamp)" >> "$decision_file
 
 ## 决策
 
-1. **前置改为「决策文件存在、可审阅、且未被否决」**：文件必须位于 `specs/features/<feature>/01-decisions.md`（契约文件已要求在 `specs/features/`，归档胶囊在更早处退出，故不再保留 `specs/archive` 分支）。状态判定是**白名单的反面**：`REJECTED` / `DEFERRED` / `SUPERSEDED` / `DECLINED` 一律 fail-closed，其余状态（`PROPOSED` / `DRAFT` / `APPROVED`）才继续走人工授权。
+1. **前置改为「决策文件存在、可审阅、且未被否决」**：文件必须位于 `specs/features/<feature>/01-decisions.md`（契约文件已要求在 `specs/features/`，归档胶囊在更早处退出，故不再保留 `specs/archive` 分支）。状态判定按黑名单阻断：`status:`（frontmatter）、`- **Status**:` 与 `- **方案状态**：` 三种写法里的 `REJECTED` / `DEFERRED` / `SUPERSEDED` / `DECLINED` 一律 fail-closed，其余状态（`PROPOSED` / `DRAFT` / `APPROVED`）才继续走人工授权。
    - 为什么必须带这一层：只判断「文件存在」会让本次批准**覆盖人类显式表达的否决**，并把 `APPROVED BY HUMAN` 的语义稀释成「文件在就有」。这是 #109 评审的 P1。
 2. **落款仍由 `approve` 在人工授权通过后写入**，写入时机、格式与内容一字不改。Gate1 的授权事实依旧是 `user_gate` 记录 + GitHub `gate=1` 评论 + 契约 SHA 锁定三件套，本 ADR 不改变其中任何一件。
 3. **删除 `gate1_decisions_approved` 死代码**：它只服务于被移除的前置，保留即为第二套判定口径。
@@ -38,10 +38,13 @@ echo "- **Status**: APPROVED BY HUMAN ($operator@$timestamp)" >> "$decision_file
 
 ## 影响与修订
 
-- `bin/loopx-flow#cmd_approve`：前置改为存在性检查（活跃/归档两条路径），删除 `gate1_decisions_approved`。
+- `bin/loopx-flow#cmd_approve`：前置改为存在性检查（只读 `specs/features/<feature>/01-decisions.md`；归档胶囊在契约文件检查处已提前退出），删除 `gate1_decisions_approved`。
+- `bin/loopx-flow` 新增单一口径解析 `decisions_status_lines` / `decisions_is_vetoed` / `decisions_is_approved`，`cmd_approve` 与 `cmd_gate`（`gate verify decisions`）共用，删除 `cmd_gate` 原有的第二套正则。
+- `gate verify decisions` 是只读文本校验，不核验 `user_gate`；因此提示语中的「不得手工改写」是修复指引而非可执行禁令，权威授权事实仍是 `gate=1` 评论 + `user_gate` 记录。要在 gate 阶段物理禁止手工落款，需核验 `user_gate`，超出本切片范围。
 - `AGENTS.md` 铁律 3：改为「核对 01-decisions 存在且内容可审阅（其 `APPROVED BY HUMAN` 落款由本命令在人工授权通过后写入，**不作前置**）」。
+- `docs/prd/loopx-workflow.md` `REQ-CHECKPOINT-1`：前置从「`01-decisions` APPROVED」改为「存在、可审阅且未被否决」，与实现一致。
 - `docs/design/loopx-workflow-design.md`：同步 Gate1 失败条件。
-- `tests/unit/gate1-decisions-checkpoint.test.js`（3 例）：PROPOSED 决策可通过并写入落款；`--prepare` 只打印模板且决策文件逐字节不变；决策文件缺失仍 fail-closed。
+- `tests/unit/gate1-decisions-checkpoint.test.js`（9 例）：PROPOSED 决策可通过并写入落款；`--prepare` 只打印模板且决策文件逐字节不变；项目符号 `REJECTED`、frontmatter `status: REJECTED`、`方案状态：DEFERRED` 三种否决形态均 fail-closed；`approve` 与 `gate verify decisions` 共用解析（frontmatter `APPROVED` / `APPROVED BY HUMAN` 通过，`DISAPPROVED` 不被误判）；决策文件缺失仍 fail-closed。
 
 ## 不做什么
 

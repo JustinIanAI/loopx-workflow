@@ -1267,6 +1267,22 @@ branch_protection_ok() {
     return 1
 }
 
+# 决策文件状态解析：唯一口径（ADR-0025）。`cmd_approve` 与 `cmd_gate` 共用，禁止再写第二套正则。
+# 本仓真实出现过三种载体：YAML frontmatter `status:`、`- **Status**:`、`- **方案状态**：`。
+decisions_status_lines() {
+    grep -i -E '^[[:space:]]*(status[[:space:]]*:|[-*][[:space:]]*\*\*(Status|方案状态)\*\*[[:space:]]*[:：])' "$1" 2>/dev/null || true
+}
+
+# 显式否决/挂起：任何状态行出现即阻断，宁可误拦也不覆盖人类否决。
+decisions_is_vetoed() {
+    decisions_status_lines "$1" | grep -q -i -E 'REJECTED|DEFERRED|SUPERSEDED|DECLINED'
+}
+
+# 已批准：带词界，避免 `DISAPPROVED` 之类的子串误判为 APPROVED。
+decisions_is_approved() {
+    decisions_status_lines "$1" | grep -q -E '(^|[^[:alnum:]_])APPROVED([^[:alnum:]_]|$)'
+}
+
 cmd_approve() {
     local target="${1:-}" feature="${2:-}" yes=false prepare=false interactive=false arg
     for arg in "$@"; do
@@ -1314,18 +1330,11 @@ cmd_approve() {
     fi
     local decision_source="$decision_file"
     # 显式否决/挂起必须阻断：放行会让本次批准覆盖人类已表达的 REJECTED。
-    local decision_status=""
-    decision_status="$(grep -i -m1 -E '^[[:space:]]*[-*]?[[:space:]]*\*\*Status\*\*[[:space:]]*[:：]' "$decision_source" 2>/dev/null \
-        | sed -E 's/.*\*\*Status\*\*[[:space:]]*[:：][[:space:]]*//' | tr -d '\r' | sed -E 's/[[:space:]]+$//')"
-    if [[ -n "$decision_status" ]]; then
-        local decision_state
-        decision_state="$(printf '%s' "$decision_status" | tr '[:lower:]' '[:upper:]')"
-        case "$decision_state" in
-            REJECTED*|DEFERRED*|SUPERSEDED*|DECLINED*)
-                echo "[-] [FAIL-CLOSED] 01-decisions 状态为「${decision_status}」，不得进入 Gate1 批准: ${decision_source}" >&2
-                echo "    修复指令: 显式否决/挂起必须先由人类改回 PROPOSED 并写明原因，再重跑 approve（ADR-0025）。" >&2
-                exit 1 ;;
-        esac
+    if decisions_is_vetoed "$decision_source"; then
+        echo "[-] [FAIL-CLOSED] 01-decisions 含否决/挂起状态，不得进入 Gate1 批准: ${decision_source}" >&2
+        decisions_status_lines "$decision_source" >&2
+        echo "    修复指令: 先由人类改回 PROPOSED 并写明原因，再重跑 approve（ADR-0025）。" >&2
+        exit 1
     fi
     if ! gate1_spec_complete "$feature"; then
         echo "[-] [FAIL-CLOSED] 规格不完整: 04-contract 需含 AC/Scope/Verification Plan/依赖顺序/REQ或ADR，且每个 story id 在 AC 矩阵中有一行" >&2; exit 1
@@ -2624,9 +2633,9 @@ cmd_gate() {
                 echo -e "${RED}[-] [GATE FAIL] 未找到决策文件: $decision_file${NC}" >&2
                 exit 1
             fi
-            if ! grep -Eq '^(status:[[:space:]]*APPROVED([[:space:]]|$)|[-*][[:space:]]*\*\*(Status|方案状态)\*\*(:|：).*APPROVED)' "$decision_file"; then
+            if ! decisions_is_approved "$decision_file"; then
                 echo -e "${RED}[-] [GATE FAIL] 阶段 1 架构决策未标记 APPROVED: $decision_file${NC}" >&2
-                echo -e "💡 修复指令: 先完成 Gate1 人工授权，再执行 loopx-flow approve contract <feature> 由命令落款；不得手工改写 'status: APPROVED'（ADR-0025）。" >&2
+                echo -e "💡 修复指令: 先完成 Gate1 人工授权，再执行 loopx-flow approve contract <feature> 由命令落款；手工改写 'status: APPROVED' 会绕过 gate=1 评论与 user_gate 授权记录（ADR-0025）。" >&2
                 exit 1
             fi
             echo -e "${GREEN}[✓] [GATE PASS] 阶段 1 架构决策签名通过: $decision_file${NC}"

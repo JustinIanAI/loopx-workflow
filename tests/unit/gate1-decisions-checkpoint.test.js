@@ -80,11 +80,17 @@ test('PROPOSED 决策下 --prepare 能打印签名模板，且零写入', () => 
 });
 
 // 收紧谓词（#109 评审 P1）：放行「文件存在」会把人类显式否决的 REJECTED 一起盖成 APPROVED。
-for (const state of ['REJECTED', 'DEFERRED']) {
-  test(`01-decisions 状态 ${state} → fail-closed，不覆盖人类否决`, () => {
-    const dir = h.makeSandbox(`gate1-decisions-${state.toLowerCase()}-`);
+// 三种既有写法都必须被识别：frontmatter `status:`、`- **Status**:`、`- **方案状态**：`。
+const NEGATIVE_DECISIONS = [
+  ['项目符号 REJECTED', '# Decisions\n\n- **Status**: REJECTED\n\n- D1: 否决\n'],
+  ['frontmatter REJECTED', '---\nstatus: REJECTED\n---\n\n# Decisions\n\n- D1: 否决\n'],
+  ['方案状态 DEFERRED', '# Decisions\n\n- **方案状态**：DEFERRED\n\n- D1: 挂起\n'],
+];
+
+for (const [label, decisions] of NEGATIVE_DECISIONS) {
+  test(`01-decisions ${label} → fail-closed，不覆盖人类否决`, () => {
+    const dir = h.makeSandbox(`gate1-decisions-${label.replace(/[^a-z]+/gi, '-').toLowerCase()}-`);
     try {
-      const decisions = PROPOSED.replace('PROPOSED', state);
       const capsule = h.writeCapsule(dir, FEATURE, { decisions });
       h.writeConfig(dir, 'independent');
       h.publishSpecPackage(dir, FEATURE);
@@ -102,6 +108,25 @@ for (const state of ['REJECTED', 'DEFERRED']) {
         fs.readFileSync(capsule.contractPath, 'utf8'), /FROZEN & APPROVED/,
         '否决状态下不得冻结契约',
       );
+    } finally { h.cleanup(dir); }
+  });
+}
+
+// #109 评审：`approve` 与 `gate verify decisions` 必须共用同一份状态解析，否则同一文件两套口径。
+const GATE_CASES = [
+  ['frontmatter APPROVED', '---\nstatus: APPROVED\n---\n\n# Decisions\n', true],
+  ['frontmatter APPROVED BY HUMAN', '---\nstatus: APPROVED BY HUMAN (tester@2026-11-28)\n---\n\n# Decisions\n', true],
+  ['项目符号 DISAPPROVED', '# Decisions\n\n- **Status**: DISAPPROVED\n', false],
+];
+
+for (const [label, decisions, expectPass] of GATE_CASES) {
+  test(`gate verify decisions 与 approve 共用解析: ${label}`, () => {
+    const dir = h.makeSandbox(`gate1-gate-${label.replace(/[^a-z]+/gi, '-').toLowerCase()}-`);
+    try {
+      h.writeCapsule(dir, FEATURE, { decisions });
+      const r = h.run(dir, ['gate', 'verify', 'decisions', FEATURE]);
+      assert.strictEqual(r.status, expectPass ? 0 : 1, r.stdout + r.stderr);
+      assert.match(r.stdout + r.stderr, expectPass ? /GATE PASS/ : /GATE FAIL/);
     } finally { h.cleanup(dir); }
   });
 }
