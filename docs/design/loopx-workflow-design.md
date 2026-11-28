@@ -53,6 +53,7 @@ flowchart LR
 |---|---|---|---|
 | `doctor` | `cmd_doctor`、`cmd_doctor_control_plane` | 环境哨兵、`REQ-ENV-1`、`REQ-ENV-2`、`REQ-CAPABILITY-1`、`REQ-SKILL-READY-1` | preflight 失败（含本机已有 `loopx` 时 required skills/routes/新鲜度未通过）、`loopx doctor` 失败、本机没有 `loopx`、或集中式三层能力/`schema_version` 探针命中 BLOCK 缺口均非 0，并输出「能力→探测信号→PASS/WARN/BLOCK」矩阵与诊断卡（含原因/影响/修复命令）。控制面路由/registry 一致性、`~/.loopx` 半迁移残留、运行时工件被跟踪、GitHub API 50% 预算基线为 WARN 级检查（见 ADR-0007、ADR-0015） |
 | `init` | `cmd_init` | `REQ-MAIN-1`、`REQ-AUTH-MODE-1`、`REQ-SKILL-READY-1` | 安装 pre-commit；确认 `authorization_mode` 与风险接受；preflight 在已有 `loopx` 时阻断缺失或过期的 required skills；有 `loopx` 时 `bootstrap` 失败则退出 |
+| `config set authorization-mode <mode>` | `cmd_config` + `lib/auth-config.js` | `REQ-AUTH-MODE-1`、`REQ-FAILCLOSED-1`（ADR-0020） | 非法模式/子命令写错/非 TTY/既有配置非法均非 0 且不改写配置；`single_owner` 需 TTY `YES` 风险接受并从 `gh api user` 取 `accepted_by`（读取失败非 0），`independent` 删除 `single_owner_risk_acceptance`；目标模式与当前一致时幂等成功零写入；写入由 `lib/auth-config.js` 原子完成（临时文件 + `rename`，失败清理），写后 `auth_require_config` 复验；成功输出声明既有 Gate 授权失效，须重新 `approve contract` / `release-approve` |
 | `feature <name>` | `cmd_feature` | `REQ-FAILCLOSED-2`、`REQ-CAPSULE-1` | 分支创建或切换失败则退出，不写胶囊 |
 | `approve contract <feature>` | `cmd_approve` | `REQ-CHECKPOINT-1`、`REQ-GATE1-AUTH-1`、`REQ-AUTH-MODE-1`、`REQ-PR-LIFECYCLE-1` | 缺配置/规格不完整/未授权（默认校验 `accepted_by` 的 GitHub `gate=1` 评论；`--prepare` 打印模板；`--interactive` 回退 TTY）/规格包未跟踪或未推送/无 PR/`presentation=pending`/`configure-goal`/`user_gate` 写入失败均非 0；先核验发布前置与规格完整性，再锁最终内容 SHA256，成功后才原子写入批准标记 |
 | `gate verify decisions\|contract` | `cmd_gate` | `REQ-GATE-DECISIONS-1`、`REQ-CONTRACT-LOCK-1`、`REQ-GATE1-AUTH-1` | 见第 5 节：SHA + user_gate 授权记录 + evidence 串；没有 `pr` 这个 stage |
@@ -432,6 +433,8 @@ Goal 标识：`cmd_feature` 使用 `<feature>-goal`。契约核验同时接受 `
 | `pr create --draft` 失败 | `pr create` | `FAILED` | 非 0 + 明确 stderr + `.loopx/presentation/<feature>.json` 持久标记，阻断 Gate1 |
 | 配置文件存在但 JSON 非法或 `authorization_mode` 非法 | `merge` | `BLOCKED` | 非 0，不退回 `reviewDecision`，不调用 `gh pr merge` |
 | `single_owner` 缺风险接受 | `approve contract` | `NEEDS_HUMAN` / `BLOCKED` | 非 0 |
+| `config set` 在非 TTY 下切换模式 | `config` | `NEEDS_HUMAN` | 非 0，配置不改写，打印交互终端重跑命令 |
+| `config set` 时既有配置非法 | `config` | `BLOCKED` | 非 0，不做覆盖写 |
 | `independent` 缺有效第二账号 `gate=1` 评论 | `approve contract` | `NEEDS_HUMAN` | 非 0 |
 | 授权记录缺失/被取代/evidence 缺键/模式不一致 | `gate verify contract` | `BLOCKED` | 非 0 |
 | Mode A formal review `commit_id != headRefOid` | `merge` | `BLOCKED` | 非 0 |

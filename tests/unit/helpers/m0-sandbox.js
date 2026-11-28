@@ -25,6 +25,7 @@ function makeSandbox(prefix = 'm0-sandbox-') {
   fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.sh'), path.join(dir, 'lib/paths.sh'));
   fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.js'), path.join(dir, 'lib/paths.js'));
   fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/capability-probe.js'), path.join(dir, 'lib/capability-probe.js'));
+  fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/auth-config.js'), path.join(dir, 'lib/auth-config.js'));
   fs.writeFileSync(path.join(dir, 'README.md'), '# sandbox\n');
   fs.writeFileSync(path.join(dir, '.gitignore'), '.loopx/\n');
   fs.writeFileSync(path.join(dir, '.loopx/registry.json'), JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
