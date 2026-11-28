@@ -1,6 +1,6 @@
 # 实现取舍
 
-status: DRAFT (Pending JustinIanAI Authorization)
+- **Status**: APPROVED
 
 追溯：PRD REQ-FACADE-1 / REQ-FACADE-2 / REQ-NATIVE-1 / REQ-FAILCLOSED-1；[ADR-0001](../../../docs/adr/0001-product-source-of-truth.md)。本项为既有 backlog 的纯增量门面，不新增产品 PRD/ADR。
 
