@@ -21,6 +21,7 @@ const { spawnSync } = require('node:child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const {
   localGateAnchor,
+  buildSkippedValidation,
 } = require(path.join(PROJECT_ROOT, 'skills/code-review/scripts/authentic-review.js'));
 const {
   buildEvidenceGraph,
@@ -154,5 +155,19 @@ describe('P0/B buildEvidenceGraph：repoRoot 锚定 invariant 测试路径解析
     const row = invariantRow(graph);
     assert.ok(row);
     assert.strictEqual(row.status, 'unverified', 'cwd 解析不到该文件时必须 unverified，证明锚定对象确实改变');
+  });
+});
+
+describe('C. 跳过本地门禁时的 validation 行（#74 评审 P0）', () => {
+  test('HEAD 不匹配 → 四门禁行必须是 unverified/NOT_RUN，不得伪造 failed 与 exit_code', () => {
+    const headOid = 'b'.repeat(40);
+    const rows = buildSkippedValidation(headOid, [{ name: 'Four Gates', bucket: 'in_progress' }]);
+    const gateRows = rows.filter((r) => ['typecheck', 'lint', 'build', 'test'].includes(r.case_id));
+    assert.strictEqual(gateRows.length, 4, '四个门禁行必须都在（缺行等于隐瞒「未运行」这一事实）');
+    for (const row of gateRows) {
+      assert.strictEqual(row.status, 'unverified', `${row.case_id} 未运行时必须 unverified`);
+      assert.strictEqual(row.result, 'NOT_RUN');
+      assert.strictEqual(row.exit_code, undefined, `${row.case_id} 未运行不得携带 exit_code`);
+    }
   });
 });

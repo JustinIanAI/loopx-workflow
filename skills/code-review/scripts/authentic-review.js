@@ -1044,6 +1044,14 @@ function localGateAnchor(repoRoot, headOid) {
   return { match: Boolean(localHead && target && localHead === target), localHead, headOid: target };
 }
 
+// 跳过本地门禁时的 validation 行。
+// 必须显式传 unverified:true：builder 只在拿到该开关时写 unverified/NOT_RUN，
+// 否则 parseGateOutcome(undefined) 落入 failed 分支并伪造 exit_code=1，
+// 把「没跑」谎报成「跑了但失败」——与 REQ-REVIEW-2 的承诺相反。
+function buildSkippedValidation(headOid, remoteChecks) {
+  return buildValidationMatrix({}, { headOid, remoteChecks, unverified: true });
+}
+
 // ---------------------------------------------------------------------------
 // 原生 LoopX pr-review 能力接入（版式与提示词的唯一来源）
 // ---------------------------------------------------------------------------
@@ -2222,7 +2230,7 @@ async function main() {
         validation = buildValidationMatrix(gates(), { headOid, remoteChecks });
       } else {
         console.warn(`[WARN] 本地 HEAD (${anchor.localHead || 'unknown'}) != 审查目标 headRefOid (${anchor.headOid || 'unknown'})；跳过本地四门禁实测，仅保留远端 CI 证据，本地门禁行标 unverified（宁缺毋假）。`);
-        validation = buildValidationMatrix({}, { headOid, remoteChecks });
+        validation = buildSkippedValidation(headOid, remoteChecks);
       }
     } catch (e) {
       console.warn(`[WARN] 四门禁实测/validation 构建失败：${e && e.message ? e.message : e}；validation 行标 unverified。`);
@@ -2622,6 +2630,7 @@ module.exports = {
   resolveReviewPolicyRevision,
   isolatedGateEnv,
   gates,
+  buildSkippedValidation,
   resolveReviewRuntimeSelection,
   declaredModelFamily,
   resolveReviewerDeclaration,
