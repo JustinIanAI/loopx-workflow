@@ -1,6 +1,6 @@
 # 实现取舍
 
-- **Status**: APPROVED
+- **Status**: APPROVED BY HUMAN (JustinIanAI@2026-11-28 12:30:08)
 
 追溯：PRD REQ-FACADE-1 / REQ-FACADE-2 / REQ-NATIVE-1 / REQ-FAILCLOSED-1；[ADR-0001](../../../docs/adr/0001-product-source-of-truth.md)。本项为既有 backlog 的纯增量门面，不新增产品 PRD/ADR。
 

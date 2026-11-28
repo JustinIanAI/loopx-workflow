@@ -1,6 +1,6 @@
 # integrate configure 契约与任务图
 
-Contract-Status: DRAFT (Pending JustinIanAI Authorization)
+- **Contract-Status**: FROZEN & APPROVED
 
 以下 TypeScript 仅描述 CLI 契约，不引入运行时接口或伪造原生 JSON：
 
