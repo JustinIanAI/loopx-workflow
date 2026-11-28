@@ -1034,3 +1034,103 @@ describe('host truncation fail-closed guard', () => {
     fs.rmSync(pre, { recursive: true, force: true });
   });
 });
+
+describe('阶段 2 证据对齐沿用同一 head 锚定（#109 复审 P1 回归）', () => {
+  const CASE_ID = 'changed_invariant_positive';
+  // 指向本仓一个真实存在且通过的单测：若阶段 2 重建时丢了 headAnchored，
+  // 宿主会在 PROJECT_ROOT 上真的跑它并判 passed（即在他版代码上取证）。
+  const TEST_PATH = 'tests/unit/review-anchor-head.test.js';
+
+  function scriptedCodex(sbx, files) {
+    const counter = path.join(sbx.dir, 'codex-seq');
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/usr/bin/env bash
+echo "$0 $*" >> ${JSON.stringify(sbx.logs)}/calls.log
+n=0
+[[ -f ${JSON.stringify(counter)} ]] && n=$(cat ${JSON.stringify(counter)})
+n=$((n+1)); echo "$n" > ${JSON.stringify(counter)}
+case "$n" in
+  1) cat ${JSON.stringify(files[0])} ;;
+  *) cat ${JSON.stringify(files[1] || files[0])} ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  }
+
+  test('本地不在被审 head + 阶段 2 给出 test_path → 该行仍为 unverified，不在本地实测', () => {
+    const sbx = makeSandbox();
+    // 沙箱不是 git 仓库 → localGateAnchor 判 match=false（本地不在被审 head）。
+
+    // 自定义 packet：review_plan 要求 validation_matrix，契约给出该证据的字段表；
+    // 默认 sandbox packet 只要求 e1，无法覆盖「阶段 2 重建证据图」这条路径。
+    const packetFile = path.join(sbx.dir, 'packet.json');
+    fs.writeFileSync(packetFile, JSON.stringify({
+      schema_version: 'pull_request_review_packet_v0',
+      repository: 'o/r',
+      request: { source: 'github_cli' },
+      reviewer_execution: { status: 'unavailable', reason: 'session_not_bound' },
+      agent_response_contract: {
+        review_execution_contract: {
+          policy_revision: 26,
+          evidence_requirements: [{
+            evidence_id: 'validation_matrix',
+            items_field: 'items',
+            item_fields: ['case_id', 'invariant_or_case', 'command_or_check', 'status', 'result', 'required', 'skip_or_failure_reason'],
+          }],
+        },
+      },
+      pull_requests: [{
+        number: 771,
+        head_oid: HEAD,
+        headRefOid: HEAD,
+        headRefName: 'feature/x',
+        title: 't',
+        review_action_kind: 'review',
+        review_template: {
+          schema: 'pr_review_five_block_template_v0',
+          sections: ['动机', '改动思路', '具体改动', '对主干的风险', '我的整体评价']
+            .map((label) => ({ label, minimum_prose_characters: 10, agent_instruction: `${label}约束` })),
+          output_hint: 'NATIVE_OUTPUT_HINT_XYZ',
+        },
+        review_plan: { required_evidence_ids: ['validation_matrix'], applicability: { behavior_bearing_change: true } },
+        evidence_commands: ['echo evidence-ok'],
+        motivation: 'LoopX extracted motivation text.',
+      }],
+    }, null, 2));
+
+    const stage1 = path.join(sbx.dir, 'stage1.json');
+    const stage2 = path.join(sbx.dir, 'stage2.json');
+    fs.writeFileSync(stage1, '```json\n' + JSON.stringify({
+      review_body: nativeReviewBody('APPROVE'),
+      verdict: 'APPROVE',
+      findings: [],
+      reviewer: { actor_kind: 'model_agent', declaration_source: 'self_reported', declared_model: 'codex', declared_provider: 'openai' },
+      headOid: HEAD,
+      evidence: {
+        validation_matrix: {
+          items: [{ case_id: CASE_ID, invariant_or_case: 'anchor invariant', test_path: [TEST_PATH] }],
+        },
+      },
+    }) + '\n```');
+    fs.writeFileSync(stage2, '```json\n' + JSON.stringify({
+      evidence: { validation_matrix: { items: [{ case_id: CASE_ID, test_path: [TEST_PATH] }] } },
+    }) + '\n```');
+    scriptedCodex(sbx, [stage1, stage2]);
+
+    // 成功路径会清理运行临时目录，评审产物（含 result_payload）落在仓库缓存里；
+    // 用独立 PR 号避免与其它用例的 pr@head 产物互相覆盖。
+    const artifactPath = path.join(PROJECT_ROOT, '.loopx', 'cache', 'reviews', `771@${HEAD.toLowerCase()}.json`);
+    try {
+      const r = run(sbx, ['--pr', '771', '--repo', 'o/r', '--feature', FEATURE, '--packet-file', packetFile], { REVIEW_TWO_STAGE_ALIGNMENT: '1' });
+      assert.strictEqual(r.code, 0, r.out);
+
+      const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+      const items = artifact.result_payload.evidence.validation_matrix.items;
+      const row = items.find((it) => it && it.case_id === CASE_ID);
+      assert.ok(row, `应保留 ${CASE_ID} 行: ${JSON.stringify(items)}`);
+      assert.strictEqual(row.status, 'unverified', `阶段 2 不得在他版代码上取证: ${JSON.stringify(row)}`);
+      assert.strictEqual(row.command_or_check, 'NOT_RUN');
+    } finally {
+      fs.rmSync(artifactPath, { force: true });
+    }
+  });
+});

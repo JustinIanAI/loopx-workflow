@@ -2435,6 +2435,9 @@ async function main() {
         diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
         modelEvidence: mergedModelEvidence,
         repoRoot,
+        // 与阶段 1 同一锚定事实：本地不在被审 head 时，阶段 2 抓到的 test_path
+        // 也不得被判 passed（否则等于在他版代码上取证，#74/#103 的 P1 会复活）。
+        headAnchored: headAnchor.match,
       });
     }
   }

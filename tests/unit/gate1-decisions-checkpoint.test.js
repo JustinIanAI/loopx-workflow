@@ -150,3 +150,50 @@ test('决策文件缺失 → 仍然 fail-closed，不写批准标记', () => {
     );
   } finally { h.cleanup(dir); }
 });
+
+// #109 复审 P2：gate verify decisions 必须与 approve 同口径（否决优先），
+// 且 APPROVED 判定大小写无关（历史胶囊可能写 status: approved）。
+test('gate verify decisions: 同时含 APPROVED 与 REJECTED → GATE FAIL', () => {
+  const dir = h.makeSandbox('gate1-gate-mixed-');
+  try {
+    const decisions = '# Decisions\n\n- **Status**: APPROVED BY HUMAN (tester@2026-11-28)\n- **方案状态**：REJECTED\n';
+    h.writeCapsule(dir, FEATURE, { decisions });
+    const r = h.run(dir, ['gate', 'verify', 'decisions', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /GATE FAIL[\s\S]*否决\/挂起/);
+  } finally { h.cleanup(dir); }
+});
+
+test('gate verify decisions: 小写 status: approved 仍判通过（大小写无关）', () => {
+  const dir = h.makeSandbox('gate1-gate-lower-');
+  try {
+    h.writeCapsule(dir, FEATURE, { decisions: '---\nstatus: approved\n---\n\n# Decisions\n' });
+    const r = h.run(dir, ['gate', 'verify', 'decisions', FEATURE]);
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout + r.stderr, /GATE PASS/);
+  } finally { h.cleanup(dir); }
+});
+
+// #109 复审 P2：「可审阅」必须是机器义务，而不是文档措辞。
+for (const [label, decisions] of [
+  ['0 字节', ''],
+  ['只有标题', '# Decisions\n\n## 1. 背景\n'],
+]) {
+  test(`01-decisions ${label} → approve fail-closed，不冻结契约`, () => {
+    const dir = h.makeSandbox(`gate1-empty-${label.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-`);
+    try {
+      const capsule = h.writeCapsule(dir, FEATURE, { decisions: decisions || PROPOSED });
+      // writeCapsule 对空串会回落到默认决策，这里显式写回目标形态。
+      fs.writeFileSync(decisionsPath(dir), decisions, 'utf8');
+      h.writeConfig(dir, 'independent');
+      h.publishSpecPackage(dir, FEATURE);
+      approveLoopxMock(dir);
+      h.ghGate1Mock(dir, { feature: FEATURE, sha: h.lockedShaFile(capsule.contractPath) });
+
+      const r = h.run(dir, ['approve', 'contract', FEATURE]);
+      assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+      assert.match(r.stderr + r.stdout, /没有可审阅正文/);
+      assert.doesNotMatch(fs.readFileSync(capsule.contractPath, 'utf8'), /FROZEN & APPROVED/);
+    } finally { h.cleanup(dir); }
+  });
+}

@@ -1278,9 +1278,17 @@ decisions_is_vetoed() {
     decisions_status_lines "$1" | grep -q -i -E 'REJECTED|DEFERRED|SUPERSEDED|DECLINED'
 }
 
-# 已批准：带词界，避免 `DISAPPROVED` 之类的子串误判为 APPROVED。
+# 已批准：大小写无关 + 带词界，避免 `DISAPPROVED` 之类的子串误判为 APPROVED。
 decisions_is_approved() {
-    decisions_status_lines "$1" | grep -q -E '(^|[^[:alnum:]_])APPROVED([^[:alnum:]_]|$)'
+    decisions_status_lines "$1" | grep -q -i -E '(^|[^[:alnum:]_])APPROVED([^[:alnum:]_]|$)'
+}
+
+# 「可审阅」= 除标题/分隔线外至少有一行正文；0 字节或只有标题的文件不得进入 Gate1 批准。
+decisions_has_content() {
+    awk '
+        $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*(---|===)[[:space:]]*$/ && NF { found=1; exit 0 }
+        END { if (!found) exit 1 }
+    ' "$1" 2>/dev/null
 }
 
 cmd_approve() {
@@ -1329,6 +1337,12 @@ cmd_approve() {
         echo "[-] [FAIL-CLOSED] 未找到 01-decisions.md: $decision_file" >&2; exit 1
     fi
     local decision_source="$decision_file"
+    # 「可审阅」是机器义务，不是文档措辞：0 字节/只有标题的决策文件不得被冻结成批准。
+    if ! decisions_has_content "$decision_source"; then
+        echo "[-] [FAIL-CLOSED] 01-decisions 没有可审阅正文（仅空白/标题）: ${decision_source}" >&2
+        echo "    修复指令: 先写下本胶囊的实现取舍与关联 ADR，再重跑 approve。" >&2
+        exit 1
+    fi
     # 显式否决/挂起必须阻断：放行会让本次批准覆盖人类已表达的 REJECTED。
     if decisions_is_vetoed "$decision_source"; then
         echo "[-] [FAIL-CLOSED] 01-decisions 含否决/挂起状态，不得进入 Gate1 批准: ${decision_source}" >&2
@@ -2633,12 +2647,18 @@ cmd_gate() {
                 echo -e "${RED}[-] [GATE FAIL] 未找到决策文件: $decision_file${NC}" >&2
                 exit 1
             fi
+            # 与 approve 同一口径：否决/挂起优先于 APPROVED，混合状态必须失败（ADR-0025）。
+            if decisions_is_vetoed "$decision_file"; then
+                echo -e "${RED}[-] [GATE FAIL] 阶段 1 架构决策含否决/挂起状态，不得视为已批准: $decision_file${NC}" >&2
+                decisions_status_lines "$decision_file" >&2
+                exit 1
+            fi
             if ! decisions_is_approved "$decision_file"; then
                 echo -e "${RED}[-] [GATE FAIL] 阶段 1 架构决策未标记 APPROVED: $decision_file${NC}" >&2
                 echo -e "💡 修复指令: 先完成 Gate1 人工授权，再执行 loopx-flow approve contract <feature> 由命令落款；手工改写 'status: APPROVED' 会绕过 gate=1 评论与 user_gate 授权记录（ADR-0025）。" >&2
                 exit 1
             fi
-            echo -e "${GREEN}[✓] [GATE PASS] 阶段 1 架构决策签名通过: $decision_file${NC}"
+            echo -e "${GREEN}[✓] [GATE PASS] 阶段 1 架构决策签名通过（文本校验；权威授权事实是 gate=1 评论 + user_gate）: $decision_file${NC}"
             ;;
         contract)
             local contract_file="$PROJECT_ROOT/specs/features/$feature/04-contract.md"
