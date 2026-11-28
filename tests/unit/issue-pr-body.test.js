@@ -1,0 +1,50 @@
+'use strict';
+/**
+ * Issue 修复模式的 PR 正文生成（authentic-review.js --issue-body-file）。
+ * 动机来自 Issue 正文，不读 Feature 胶囊；验证矩阵仍来自本地四门禁实测。
+ */
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync, execFileSync } = require('node:child_process');
+
+const PROJECT_ROOT = path.resolve(__dirname, '../..');
+const AUTH = path.join(PROJECT_ROOT, 'skills/code-review/scripts/authentic-review.js');
+
+test('--issue-body-file 生成含 Issue 动机与真实 diff 的 PR 正文，不读 Feature 胶囊', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'issue-pr-body-'));
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: dir });
+    fs.writeFileSync(path.join(dir, 'issue.md'), 'Gate flaky on reruns\n\nReproduction confirmed on main.\n');
+    fs.writeFileSync(path.join(dir, 'diff.patch'), [
+      'diff --git a/bin/loopx-flow b/bin/loopx-flow',
+      'new file mode 100755',
+      'index 0000000..1111111',
+      '--- /dev/null',
+      '+++ b/bin/loopx-flow',
+      '@@ -0,0 +1 @@',
+      '+echo hi',
+      ''
+    ].join('\n'));
+
+    const res = spawnSync(process.execPath, [
+      AUTH, '--generate-pr-body',
+      '--issue-body-file', path.join(dir, 'issue.md'),
+      '--impact', 'R1',
+      '--goal-id', 'issue-19-goal',
+      '--diff-file', path.join(dir, 'diff.patch')
+    ], { cwd: dir, encoding: 'utf8', timeout: 180000 });
+
+    assert.strictEqual(res.status, 0, res.stderr);
+    assert.match(res.stdout, /## 动机 \/ Motivation/);
+    assert.match(res.stdout, /Gate flaky on reruns/);
+    assert.match(res.stdout, /## 改动思路 \/ Approach/);
+    assert.match(res.stdout, /`bin\/loopx-flow`/);
+    assert.match(res.stdout, /### 验证矩阵/);
+    assert.doesNotMatch(res.stdout, /NOT_PROVIDED（diff 中无该文件明细/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

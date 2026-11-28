@@ -81,7 +81,20 @@ const ANCHOR_HELP = {
   ].join('\n'),
   'issue-fix --help': [
     'usage: loopx issue-fix [-h]',
-    '                       {repository-memory-sync,workflow-plan,feasibility,outcome,metrics} ...'
+    '                       {repository-memory-sync,workflow-plan,feasibility,caller-repo-branch,outcome,metrics} ...'
+  ].join('\n'),
+  'issue-fix workflow-plan --help': [
+    'usage: loopx issue-fix workflow-plan [-h] --repo-path REPO_PATH --base-branch BASE_BRANCH',
+    '                                     --issue-branch ISSUE_BRANCH [--goal-id GOAL_ID]',
+    '                                     [--project PROJECT] [--no-write-domain-state]',
+    '                                     [--format {markdown,json}]'
+  ].join('\n'),
+  'issue-fix caller-repo-branch --help': [
+    'usage: loopx issue-fix caller-repo-branch [-h] --repo-path REPO_PATH --repo REPO',
+    '                                           --issue-ref ISSUE_REF --base-branch BASE_BRANCH',
+    '                                           --issue-branch ISSUE_BRANCH',
+    '                                           --validation-command VALIDATION_COMMAND',
+    '                                           [--execute] [--format {markdown,json}]'
   ].join('\n'),
   'integration-branch --help': [
     'usage: loopx integration-branch [-h] {configure,status,sync} ...'

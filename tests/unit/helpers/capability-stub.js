@@ -27,7 +27,12 @@ const HELP_SIGNATURE = [
   '  pr-review --goal-id GOAL_ID --check-merge-readiness NUMBER@HEAD_OID --check-result CHECK_RESULT',
   '  goal-lifecycle --goal-id GOAL_ID --operation {stop,resume} --reason REASON --execute',
   '  sync-global --goal-id GOAL_ID [--replace-state] [--dry-run]',
-  '  issue-fix {repository-memory-sync,workflow-plan,feasibility,outcome,metrics}',
+  '  issue-fix {repository-memory-sync,workflow-plan,feasibility,caller-repo-branch,outcome,metrics}',
+  '  issue-fix workflow-plan --repo-path REPO_PATH --base-branch BASE_BRANCH --issue-branch ISSUE_BRANCH',
+  '               --goal-id GOAL_ID --project PROJECT --no-write-domain-state --format {markdown,json}',
+  '  issue-fix caller-repo-branch --repo-path REPO_PATH --repo REPO --issue-ref ISSUE_REF',
+  '               --base-branch BASE_BRANCH --issue-branch ISSUE_BRANCH',
+  '               --validation-command VALIDATION_COMMAND --execute --format {markdown,json}',
   '  integration-branch {configure,status,sync}',
   '  goal-acceptance {inspect,prepare,configure,verify} --goal-id GOAL_ID --format {markdown,json}'
 ].join('\n');
