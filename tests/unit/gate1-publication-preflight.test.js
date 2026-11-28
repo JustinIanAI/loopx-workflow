@@ -140,7 +140,12 @@ exit 0
 // mock 用真实 HEAD 模拟「PR 头 == 本地 HEAD」，与生产同形。
 function replayGhMock(dir, headExpr = '"$(git rev-parse HEAD)"') {
   h.mockGh(dir, `if [[ "$1" == "api" && "$2" == "user" ]]; then echo "executor"; exit 0; fi
-if [[ "$1" == "pr" && "$2" == "list" ]]; then printf 'https://github.com/o/r/pull/12\\t%s\\n' ${headExpr}; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "list" ]]; then
+  # 收紧 mock：生产读回必须取 headRefOid 并带 jq 过滤器；换成只认 url 的口径要让用例变红。
+  [[ "$*" == *headRefOid* && "$*" == *"--jq"* ]] || { echo "mock: pr list 缺少 headRefOid/--jq: $*" >&2; exit 64; }
+  printf 'https://github.com/o/r/pull/12\\t%s\\n' ${headExpr}
+  exit 0
+fi
 if [[ "$1" == "pr" && "$2" == "create" ]]; then echo "a pull request for branch already exists" >&2; exit 1; fi
 exit 0
 `);

@@ -2037,7 +2037,7 @@ HELPTXT
                 # 错配防护：分支 feature/foo 上的 PR 不能被当作 feature=bar 的展示（会清错标记）。
                 local branch_feature=""
                 if [[ "$current_branch" =~ ^(feature|fix)/(.+) ]]; then branch_feature="${BASH_REMATCH[2]}"; fi
-                if [[ -n "$branch_feature" && "$branch_feature" != "$feature" ]]; then
+                if [[ -n "$feature" && -n "$branch_feature" && "$branch_feature" != "$feature" ]]; then
                     echo -e "${RED}[-] [FAIL-CLOSED] 当前分支 ${current_branch} 对应 feature=${branch_feature}，与请求的 feature=${feature} 不一致${NC}" >&2
                     echo -e "    拒绝把该 PR 视为 $feature 的规格包展示。请检出 $feature 的分支，或显式指定正确的特性名。" >&2
                     exit 1
@@ -2049,14 +2049,20 @@ HELPTXT
                     echo -e "    先推送本地提交（git push）再重跑；若该 PR 不属于本特性，请在对应分支上操作。" >&2
                     exit 1
                 fi
-                rm -f "$(presentation_state_file "$feature")"
-                echo -e "${YELLOW}[i] 分支 $current_branch 已有可读 PR（head=${local_head:0:12}），视为 presentation 已完成；已清除 pending 标记。${NC}" >&2
+                # feature 可能为空（如未来的 --issue 通道）：此时没有本 feature 的标记可清。
+                if [[ -n "$feature" ]]; then
+                    rm -f "$(presentation_state_file "$feature")"
+                    echo -e "${YELLOW}[i] 分支 $current_branch 已有可读 PR（head=${local_head:0:12}），视为 presentation 已完成；已清除 pending 标记。${NC}" >&2
+                else
+                    echo -e "${YELLOW}[i] 分支 $current_branch 已有可读 PR（head=${local_head:0:12}），视为已发布（无 feature 标记需清理）。${NC}" >&2
+                fi
                 echo -e "${GREEN}[✓] PR 已存在: ${existing_pr_url}${NC}"
                 # 重入不重建 PR：明确列出被忽略的参数，避免调用方以退出码 0 推断参数已生效。
                 local -a ignored_args=()
                 [[ "$base" != "main" ]] && ignored_args+=("--base $base")
                 [[ "$draft" == "true" ]] && ignored_args+=("--draft")
                 [[ "$title" != "feat(${feature}): implement ${feature} aligned with PR #7545 protocol" ]] && ignored_args+=("--title")
+                [[ ${#passthru_args[@]} -gt 0 ]] && ignored_args+=("${passthru_args[*]}")
                 if [[ ${#ignored_args[@]} -gt 0 ]]; then
                     echo -e "${YELLOW}[!] 既有 PR 未应用参数: ${ignored_args[*]}；如需变更请直接编辑该 PR。${NC}" >&2
                 fi
