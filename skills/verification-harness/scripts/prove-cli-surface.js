@@ -312,6 +312,19 @@ function setupCliWorkspace(sandboxRoot) {
   const ghCallsLog = path.join(sandboxRoot, 'gh-calls.jsonl');
   fs.writeFileSync(ghCommentsFile, '[]\n');
 
+  // Gate1 发布前置（REQ-PR-LIFECYCLE-1）会读 `gh pr view <branch> --json ...`，
+  // 要求 PR 为 OPEN 且 headRefOid == 本地 HEAD。Fake 从磁盘读取一份可写的 PR 状态，
+  // 由 prove 在推送分支后刷新 headRefOid —— 仍不触网，且让"PR head 必须对齐"这条
+  // 不变量在沙箱里真实可验。
+  const ghPrViewFile = path.join(sandboxRoot, 'gh-pr-view.json');
+  fs.writeFileSync(ghPrViewFile, JSON.stringify({
+    number: 43,
+    state: 'OPEN',
+    isDraft: true,
+    url: 'https://github.com/JustinIanAI/loopx-workflow/pull/43',
+    headRefOid: '',
+  }, null, 2) + '\n');
+
   const fakeGhJs = path.join(mockBinDir, 'fake-gh.js');
   fs.writeFileSync(fakeGhJs, [
     "'use strict';",
@@ -321,6 +334,7 @@ function setupCliWorkspace(sandboxRoot) {
     "if (args[0] === 'auth' && args[1] === 'status') { process.stdout.write('Logged in to github.com\\n'); process.exit(0); }",
     "if (args[0] === 'api' && args[1] === 'user') { process.stdout.write('executor\\n'); process.exit(0); }",
     "if (args[0] === 'repo' && args[1] === 'view') { process.stdout.write('JustinIanAI/loopx-workflow\\n'); process.exit(0); }",
+    "if (args[0] === 'pr' && args[1] === 'view') { process.stdout.write(fs.readFileSync(" + JSON.stringify(ghPrViewFile) + ", 'utf8')); process.exit(0); }",
     "if (args[0] === 'pr' && args[1] === 'list') { process.stdout.write('43\\n'); process.exit(0); }",
     "if (args[0] === 'api' && args[1] === 'repos/JustinIanAI/loopx-workflow/issues/43/comments') {",
     `  process.stdout.write(fs.readFileSync(${JSON.stringify(ghCommentsFile)}, 'utf8'));`,
@@ -451,13 +465,21 @@ function setupCliWorkspace(sandboxRoot) {
   const loopxWrapper = path.join(mockBinDir, 'loopx');
   fs.writeFileSync(loopxWrapper, `#!/usr/bin/env bash\nexec "${process.execPath}" "${fakeLoopxJs}" "$@"\n`, { mode: 0o755 });
 
+  // 本地 bare 仓库充当 origin：Gate1 发布前置用 `git ls-remote --heads origin` 校验
+  // 「分支已推送且 HEAD == origin/<branch>」。用真实 GitHub URL 时沙箱无法推送，
+  // 前置永远 fail-closed —— 沙箱必须是可推送的离线远端，而不是指向公网。
+  const originDir = path.join(sandboxRoot, 'origin.git');
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', originDir]);
+
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repoDir });
   execFileSync('git', ['config', 'user.email', 'prove@example.com'], { cwd: repoDir });
   execFileSync('git', ['config', 'user.name', 'prove-harness'], { cwd: repoDir });
   execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: repoDir });
-  execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/JustinIanAI/loopx-workflow.git'], { cwd: repoDir });
+  execFileSync('git', ['remote', 'add', 'origin', originDir], { cwd: repoDir });
   execFileSync('git', ['add', '-A'], { cwd: repoDir });
   execFileSync('git', ['commit', '-qm', 'chore: initial prove sandbox commit'], { cwd: repoDir });
+  execFileSync('git', ['push', '-q', '-u', 'origin', 'main'], { cwd: repoDir });
+  execFileSync('git', ['remote', 'set-head', 'origin', '-a'], { cwd: repoDir });
 
   return {
     repoDir,
@@ -465,6 +487,7 @@ function setupCliWorkspace(sandboxRoot) {
     homeDir,
     tmpDir,
     ghCommentsFile,
+    ghPrViewFile,
     ghCallsLog,
     loopxCallsLog,
     registryPath: path.join(repoDir, '.loopx', 'registry.json'),
@@ -762,6 +785,16 @@ function main() {
       execFileSync('git', ['add', '-A'], { cwd: ws.repoDir });
       execFileSync('git', ['commit', '-qm', 'feat(demo-slice): freeze candidate stage 1-4 capsule'], { cwd: ws.repoDir });
       const specCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ws.repoDir, encoding: 'utf8' }).trim();
+
+      // Gate1 发布前置 ③④：分支必须已推送到 origin，且存在 head 对齐的 OPEN PR。
+      execFileSync('git', ['push', '-q', '-u', 'origin', 'feature/demo-slice'], { cwd: ws.repoDir });
+      fs.writeFileSync(ws.ghPrViewFile, JSON.stringify({
+        number: 43,
+        state: 'OPEN',
+        isDraft: true,
+        url: 'https://github.com/JustinIanAI/loopx-workflow/pull/43',
+        headRefOid: specCommit,
+      }, null, 2) + '\n');
 
       // Pre-seed the second-principal gate=1 comment with the golden (offline
       // computed) SHA; after `approve contract` we assert the on-disk bytes and
