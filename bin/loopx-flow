@@ -910,16 +910,26 @@ process.stdout.write(number + " " + String(d.headRefOid || ""));
     echo "[✓] Gate1 发布前置通过: PR #$pr_number ($branch@${head_sha:0:12}) 可读，规格包已跟踪并推送。" >&2
 }
 
-find_gate1_independent_comment() {
-    local feature="$1" pre_sha="$2" executor="$3" spec_commit="$4" branch="feature/$1" repo pr comments
-    repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
-    [[ -n "$repo" ]] || return 1
-    pr="$(gh pr list --head "$branch" --state open --json number,isDraft --jq '.[0] | select(.isDraft == true) | .number' 2>/dev/null || true)"
-    [[ -n "$pr" && "$pr" != "null" ]] || return 1
-    comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null || true)"
+# 统一解析 Gate 授权评论（Gate1 independent / Gate1 single_owner / Gate2 Mode B）。
+#
+#   gate_comment_author <comments-json> <marker> <eq|neq> <login> <self-key|-> <key=value>...
+#
+# 输出匹配评论的作者 login；无匹配返回 1；分页载荷不可读返回 2。
+#   <eq|neq>    身份条件：评论作者 == login / != login
+#   <self-key>  要求该字段值等于评论作者（approver / principal），"-" 表示不校验
+#   <key=value> 其余必须逐字相等的字段
+#
+# 三处调用点只传 marker、身份条件与必需字段，分页拆段、字段解析与自洽校验只有这一份。
+gate_comment_author() {
+    local comments="$1"
+    shift
     node -e '
 const fs = require("fs");
-const executor = process.argv[1], feature = process.argv[2], preSha = process.argv[3], specCommit = process.argv[4];
+const [marker, idMode, idLogin, selfKey, ...required] = process.argv.slice(1);
+const need = Object.fromEntries(required.map((pair) => {
+  const i = pair.indexOf("=");
+  return [pair.slice(0, i), pair.slice(i + 1)];
+}));
 const raw = fs.readFileSync(0, "utf8").trim();
 const rows = [];
 try {
@@ -927,7 +937,7 @@ try {
   while (i < raw.length) {
     while (i < raw.length && /\s/.test(raw[i])) i++;
     if (i >= raw.length) break;
-    if (raw[i] !== "[") process.exit(1);
+    if (raw[i] !== "[") process.exit(2);
     let depth = 0, inStr = false, esc = false, start = i;
     for (; i < raw.length; i++) {
       const c = raw[i];
@@ -936,20 +946,40 @@ try {
       if (c === "[") depth++;
       else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
     }
-    if (depth !== 0) process.exit(1);
+    if (depth !== 0) process.exit(2);
     rows.push(...JSON.parse(raw.slice(start, i)));
   }
-} catch (_) { process.exit(1); }
-const marker = "<!-- loopx-flow:gate1-authorization:" + feature + "@" + preSha + " -->";
+} catch (_) { process.exit(2); }
 for (const row of rows) {
   const body = String(row.body || ""), login = String((row.user || {}).login || "");
-  if (!body.includes(marker) || !login || login === executor) continue;
+  if (!login || !body.includes(marker)) continue;
+  if (idMode === "eq" ? login !== idLogin : login === idLogin) continue;
   const fields = {};
-  for (const part of body.split(/[;\n]/)) { const i = part.indexOf("="); if (i <= 0) continue; const k = part.slice(0, i).trim(); if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim(); }
-  if (fields.gate === "1" && fields.mode === "independent" && fields.contract_sha === preSha && fields.spec_commit === specCommit && fields.approver === login) { process.stdout.write(login); process.exit(0); }
+  for (const part of body.split(/[;\n]/)) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    const k = part.slice(0, i).trim();
+    if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim();
+  }
+  if (selfKey !== "-" && fields[selfKey] !== login) continue;
+  if (!Object.entries(need).every(([k, v]) => fields[k] === v)) continue;
+  process.stdout.write(login);
+  process.exit(0);
 }
 process.exit(1);
-' "$executor" "$feature" "$pre_sha" "$spec_commit" <<< "$comments"
+' "$@" <<< "$comments"
+}
+
+find_gate1_independent_comment() {
+    local feature="$1" pre_sha="$2" executor="$3" spec_commit="$4" branch="feature/$1" repo pr comments
+    repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    [[ -n "$repo" ]] || return 1
+    pr="$(gh pr list --head "$branch" --state open --json number,isDraft --jq '.[0] | select(.isDraft == true) | .number' 2>/dev/null || true)"
+    [[ -n "$pr" && "$pr" != "null" ]] || return 1
+    comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null || true)"
+    gate_comment_author "$comments" "<!-- loopx-flow:gate1-authorization:$feature@$pre_sha -->" \
+        neq "$executor" approver \
+        gate=1 mode=independent contract_sha="$pre_sha" spec_commit="$spec_commit"
 }
 
 # ADR-0019：当前分支对应的 open PR（Gate1/Gate2 GitHub 签名路径使用）。
@@ -981,42 +1011,9 @@ find_gate1_single_owner_comment() {
     pr="$(current_branch_pr)" || return 1
     [[ -n "$pr" && "$pr" != "null" ]] || return 1
     comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null || true)"
-    node -e '
-const fs = require("fs");
-const acceptedBy = process.argv[1], feature = process.argv[2], preSha = process.argv[3], specCommit = process.argv[4];
-const raw = fs.readFileSync(0, "utf8").trim();
-const rows = [];
-try {
-  let i = 0;
-  while (i < raw.length) {
-    while (i < raw.length && /\s/.test(raw[i])) i++;
-    if (i >= raw.length) break;
-    if (raw[i] !== "[") process.exit(1);
-    let depth = 0, inStr = false, esc = false, start = i;
-    for (; i < raw.length; i++) {
-      const c = raw[i];
-      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
-      if (c === "\"") { inStr = true; continue; }
-      if (c === "[") depth++;
-      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
-    }
-    if (depth !== 0) process.exit(1);
-    rows.push(...JSON.parse(raw.slice(start, i)));
-  }
-} catch (_) { process.exit(1); }
-const marker = "<!-- loopx-flow:gate1-authorization:" + feature + "@" + preSha + " -->";
-for (const row of rows) {
-  const body = String(row.body || ""), login = String((row.user || {}).login || "");
-  if (!body.includes(marker) || !login || login !== acceptedBy) continue;
-  const fields = {};
-  for (const part of body.split(/[;\n]/)) { const i = part.indexOf("="); if (i <= 0) continue; const k = part.slice(0, i).trim(); if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim(); }
-  if (fields.gate === "1" && fields.mode === "single_owner" && fields.contract_sha === preSha && fields.spec_commit === specCommit && fields.approver === acceptedBy) {
-    process.stdout.write(login);
-    process.exit(0);
-  }
-}
-process.exit(1);
-' "$accepted_by" "$feature" "$pre_sha" "$spec_commit" <<< "$comments"
+    gate_comment_author "$comments" "<!-- loopx-flow:gate1-authorization:$feature@$pre_sha -->" \
+        eq "$accepted_by" approver \
+        gate=1 mode=single_owner contract_sha="$pre_sha" spec_commit="$spec_commit"
 }
 
 gate1_user_gate_evidence() {
@@ -1178,40 +1175,10 @@ release_authorization_ok() {
     repo="$(github_repo)"
     [[ -n "$repo" ]] || return 1
     comments="$(gh api "repos/$repo/issues/$pr_id/comments" --paginate 2>/dev/null || true)"
-    node -e '
-const fs = require("fs");
-const pr = process.argv[1], head = process.argv[2], acceptedBy = process.argv[3], contractSha = process.argv[4], risk = process.argv[5];
-const raw = fs.readFileSync(0, "utf8").trim();
-const rows = [];
-try {
-  let i = 0;
-  while (i < raw.length) {
-    while (i < raw.length && /\s/.test(raw[i])) i++;
-    if (i >= raw.length) break;
-    if (raw[i] !== "[") process.exit(1);
-    let depth = 0, inStr = false, esc = false, start = i;
-    for (; i < raw.length; i++) {
-      const c = raw[i];
-      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
-      if (c === "\"") { inStr = true; continue; }
-      if (c === "[") depth++;
-      else if (c === "]") { depth--; if (depth === 0) { i++; break; } }
-    }
-    if (depth !== 0) process.exit(1);
-    rows.push(...JSON.parse(raw.slice(start, i)));
-  }
-} catch (_) { process.exit(1); }
-const marker = "<!-- loopx-flow:release-authorization:" + pr + "@" + head + " -->";
-for (const row of rows) {
-  const body = String(row.body || ""), login = String((row.user || {}).login || "");
-  if (!body.includes(marker) || login !== acceptedBy) continue;
-  const fields = {};
-  for (const part of body.split(/[;\n]/)) { const i = part.indexOf("="); if (i <= 0) continue; const k = part.slice(0, i).trim(); if (/^[A-Za-z0-9_]+$/.test(k)) fields[k] = part.slice(i + 1).trim(); }
-  const ok = fields.gate === "2" && fields.mode === "single_owner" && fields.head === head && fields.principal === acceptedBy && fields.contract_sha === contractSha && fields.risk_acceptance === risk;
-  if (ok) process.exit(0);
-}
-process.exit(1);
-' "$pr_id" "$head_oid" "$accepted_by" "$contract_sha" "$risk" <<< "$comments"
+    # 输出被丢弃：本函数只回 0/1，匹配到的 login 不进入调用方 stdout。
+    gate_comment_author "$comments" "<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->" \
+        eq "$accepted_by" principal \
+        gate=2 mode=single_owner head="$head_oid" contract_sha="$contract_sha" risk_acceptance="$risk" >/dev/null
 }
 
 # Mode A：非作者 formal review APPROVED 且 review commit == 当前 head，PR 非 Draft（ADR-0012 决策 2②）
