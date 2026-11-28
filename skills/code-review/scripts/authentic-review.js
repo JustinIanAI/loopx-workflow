@@ -694,6 +694,7 @@ function parseArgs(argv) {
     else if (a === '--issue-body-file') o.issueBodyFile = argv[++i];
     else if (a === '--impact') o.impact = argv[++i];
     else if (a === '--goal-id') o.goalId = argv[++i];
+    else if (a === '--gate-results') o.gateResultsFile = argv[++i];
     else if (a === '--agent-bin' || a.startsWith('--agent-bin=')) {
       if (!a.startsWith('--agent-bin=')) o.agentBin = argv[++i];
       else o.agentBin = a.slice(a.indexOf('=') + 1);
@@ -1000,7 +1001,8 @@ function buildBody(feature, diff, repoRoot, opts = {}) {
     if (mMatch) matrix = mMatch[0];
   }
   if (!matrix) {
-    const items = buildValidationMatrix(gates());
+    const recorded = opts.gateResultsFile ? recordedGates(opts.gateResultsFile, root) : null;
+    const items = buildValidationMatrix(recorded || gates());
     matrix = '### 验证矩阵\n\n| Check | Result | Details |\n|---|---|---|\n' +
       items.map(i => `| \`${i.command_or_check}\` | ${i.status.toUpperCase()} | ${i.result} |`).join('\n');
   }
@@ -1035,6 +1037,24 @@ function isolatedGateEnv(baseEnv = process.env, opts = {}) {
     }
   }
   return clean;
+}
+
+// 复用 `loopx-flow check` 刚跑出的四大门禁实测，但只在记录里的 head 与当前 HEAD
+// 完全一致时才采信；否则回落到现场实测，宁可慢也不拿旧结果冒充新提交。
+function recordedGates(file, repoRoot) {
+  try {
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const r = sh('git', ['-C', repoRoot, 'rev-parse', 'HEAD']);
+    const head = r.status === 0 ? String(r.stdout || '').trim() : '';
+    if (!d.head || !head || d.head !== head) return null;
+    const out = {};
+    for (const g of d.gates || []) {
+      out[g.name] = g.status === 'passed' ? 'PASSED' : `FAILED (${g.status})`;
+    }
+    return Object.keys(out).length ? out : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 function gates(opts = {}) {
@@ -2081,7 +2101,7 @@ async function main() {
         diff = (fbMain.status === 0 && fbMain.stdout) ? fbMain.stdout : (sh('git', ['-C', repoRoot, 'diff', 'master...HEAD']).stdout || '');
       }
     }
-    const body = buildBody(feature, diff, repoRoot, { issueBodyFile: o.issueBodyFile });
+    const body = buildBody(feature, diff, repoRoot, { issueBodyFile: o.issueBodyFile, gateResultsFile: o.gateResultsFile });
     if (o.outputFile) {
       fs.writeFileSync(o.outputFile, body, 'utf8');
       console.log(`[✓] Generated PR #7545 compliant body to ${o.outputFile}`);

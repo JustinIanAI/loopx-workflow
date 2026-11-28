@@ -156,6 +156,23 @@ test('2c. 非法 --reproduction / --scope / --comment-value 本地 fail-closed�
   }
 });
 
+test('2d. impact:R0 不允许 --init-goal / --execute（ADR-0023：R0 0 Goal、不建分支）', () => {
+  const dir = setup();
+  try {
+    for (const args of [
+      ['issue', '123', '--impact', 'R0', '--init-goal'],
+      ['issue', '123', '--impact', 'R0', '--execute']
+    ]) {
+      const res = run(dir, args);
+      assert.strictEqual(res.status, 1, `${args.join(' ')} 必须非 0`);
+      assert.match(res.stderr, /impact:R0 不建 Goal/);
+    }
+    assert.doesNotMatch(calls(dir), /bootstrap/);
+  } finally {
+    sandbox.cleanup(dir);
+  }
+});
+
 test('3. invalid impact fails closed (CLI value and Issue body value)', () => {
   const cliDir = setup();
   try {

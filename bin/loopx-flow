@@ -1631,6 +1631,16 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
 ' "$gate_results_file" "$gate_name" "$gate_code" "$gate_status"
         if [[ "$gate_code" -ne 0 ]]; then gate_failed=1; fi
     done
+    # 把本次实测固化为 PR 可直接引用的证据（带 head，避免用旧结果冒充新提交）。
+    local gate_state_dir="$PROJECT_ROOT/.loopx/state" # loopx-allow: run-state dir under the project, ignored by git
+    mkdir -p "$gate_state_dir"
+    node -e '
+const fs = require("fs");
+const [src, dst, head] = process.argv.slice(1);
+const d = JSON.parse(fs.readFileSync(src, "utf8"));
+d.head = head;
+fs.writeFileSync(dst, JSON.stringify(d, null, 2));
+' "$gate_results_file" "$gate_state_dir/gate-results.json" "$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo '')"
     if [[ "$gate_failed" -ne 0 ]]; then
         echo -e "${RED}[-] [FAIL-CLOSED] 四大硬门禁未全绿；仍会写 05-evidence 的 failed/not_run 实测，但禁止进入交付。${NC}" >&2
         echo -e "    四门禁实测结果文件: $gate_results_file" >&2
@@ -2109,8 +2119,10 @@ HELPTXT
                     echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Issue #$issue_id 正文，拒绝生成无动机的 PR。${NC}" >&2
                     exit 1
                 fi
-                pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" \
-                    --generate-pr-body --issue-body-file "$issue_body_file" --impact "$impact" --goal-id "$goal_id")"
+                local -a body_args=(--generate-pr-body --issue-body-file "$issue_body_file" --impact "$impact" --goal-id "$goal_id")
+                local gate_evidence="$PROJECT_ROOT/.loopx/state/gate-results.json" # loopx-allow: check 固化的实测证据
+                if [[ -f "$gate_evidence" ]]; then body_args+=(--gate-results "$gate_evidence"); fi
+                pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" "${body_args[@]}")"
                 wf_unregister_temp_file "$issue_body_file"
                 rm -f "$issue_body_file"
                 local adrs_json="[]"
@@ -2453,7 +2465,8 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
             IFS=',' read -r -a adrs <<< "$list"
             for adr in "${adrs[@]}"; do
                 content="$(gh api "repos/$repo/contents/$adr?ref=$head_oid" -H "Accept: application/vnd.github.raw" 2>/dev/null || true)"
-                if [[ ! "$content" =~ [Ss]tatus[^A-Za-z]*Accepted ]]; then
+                # 本仓库 ADR 模板用「**状态**：Accepted」，英文 Status 只是别名；两种都要认。
+                if ! printf '%s' "$content" | grep -Eq '(状态|[Ss]tatus)[^A-Za-z]{0,8}Accepted'; then
                     echo -e "${RED}[-] [FAIL-CLOSED] impact:R2 要求 $adr 在 PR head 上为 Accepted。${NC}" >&2
                     return 1
                 fi
@@ -2533,6 +2546,24 @@ cmd_merge() {
     fi
     if [[ "$state" != "MERGED" && -z "$merged_at" ]]; then
         merge_enforce_issue_impact "$pr_id" "$head_oid" "$head_ref" || exit 1
+    fi
+    # R0 纯文档 / 首次接入没有 Goal：绝不能对未登记的 Goal 做 stop/retire/sync，
+    # 否则合入后必然以「已合入、未闭环」非 0 退出（Review P0）。
+    # 显式 --goal-id 是操作者断言，仍按原样传递；只有从分支/PR body 推导出的
+    # Goal 才要求已登记，避免为 R0 凭空补偿一个不存在的 Goal。
+    if [[ -z "$goal_id_flag" && -n "$merge_goal_id" && "$head_ref" =~ ^fix/issue-[0-9]+ ]] \
+        && ! issue_goal_registered "$merge_goal_id"; then
+        local derived_level
+        derived_level="$(gh pr view "$pr_id" --json body --jq '.body' 2>/dev/null \
+            | sed -n 's/.*"level"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        if [[ "$derived_level" == "R0" ]]; then
+            echo -e "    ${YELLOW}[i] impact:R0 不建 Goal，跳过 Goal 补偿步骤。${NC}"
+            merge_goal_id=""
+        else
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal ${merge_goal_id} 未登记：R1/R2 必须有 Goal 与 check 收据，不得静默跳过补偿。${NC}" >&2
+            echo -e "    💡 修复: loopx-flow issue <id> --init-goal，或显式传 --goal-id <gid>（操作者断言）。" >&2
+            exit 1
+        fi
     fi
     local auth_mode_val=""
     if [[ -f "$(auth_config_path)" ]]; then
@@ -3244,6 +3275,11 @@ if (line) {
     fi
     if [[ -z "$impact" ]]; then
         impact="${issue_impact_raw:-R1}"
+    fi
+    # ADR-0023：R0 是纯文档/隔离配置，0 Goal、不建分支；impact 在这里是约束而非建议。
+    if [[ "$impact" == "R0" && ( "$init_goal" == "true" || "$execute" == "true" ) ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] impact:R0 不建 Goal、不建分支（ADR-0023）；请在 PR body 标记 loopx-impact 后直接走 Gate2。${NC}" >&2
+        exit 1
     fi
 
     echo -e "    Issue 标题: ${BOLD}${issue_title:-<unknown>}${NC} | Repo: ${BOLD}${repo_label:-unknown}${NC}"
