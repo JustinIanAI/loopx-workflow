@@ -115,6 +115,7 @@ test('3. approve configure-goal failure rolls back approval marker', () => {
   try {
     const { contractPath } = h.writeCapsule(dir, feature);
     h.writeConfig(dir, 'independent');
+    h.publishSpecPackage(dir, feature);
     h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
     h.mockLoopx(dir, 'if [[ "$*" == *"configure-goal"* ]]; then echo "configure boom" >&2; exit 1; fi\nexit 0');
     const before = fs.readFileSync(contractPath, 'utf8');
@@ -156,6 +157,7 @@ test('6. sync-global failure after successful lock keeps the locked approval', (
   try {
     const { contractPath } = h.writeCapsule(dir, feature);
     h.writeConfig(dir, 'independent');
+    h.publishSpecPackage(dir, feature);
     h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
     h.mockLoopx(dir, `args="$*"
 if [[ "$args" == *"configure-goal"* ]]; then exit 0; fi
@@ -177,6 +179,7 @@ test('7. approve passes --registry to configure-goal', () => {
   try {
     const { contractPath } = h.writeCapsule(dir, feature);
     h.writeConfig(dir, 'independent');
+    h.publishSpecPackage(dir, feature);
     h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
     h.mockLoopx(dir, `args="$*"
 if [[ "$args" == *"todo add"* ]]; then echo '{"schema_version":"loopx_coordination_todo_create_result_v0","todo_id":"todo_reg"}'; exit 0; fi
@@ -199,6 +202,7 @@ test('8. approve feature name cannot inject shell through cleanup trap', () => {
   try {
     const { contractPath } = h.writeCapsule(dir, feature);
     h.writeConfig(dir, 'independent');
+    h.publishSpecPackage(dir, feature);
     h.ghGate1Mock(dir, { feature, sha: h.lockedShaFile(contractPath) });
     h.mockLoopx(dir, `if [[ "$*" == *"todo add"* ]]; then echo '{"schema_version":"loopx_coordination_todo_create_result_v0","todo_id":"todo_trap"}'; exit 0; fi
 if [[ "$*" == *"todo complete"* ]]; then echo '{"schema_version":"loopx_coordination_todo_terminal_lifecycle_result_v0"}'; exit 0; fi
