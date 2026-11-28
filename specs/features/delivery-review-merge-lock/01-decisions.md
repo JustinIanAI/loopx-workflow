@@ -1,6 +1,7 @@
 # Architecture Decisions: delivery-review-merge-lock
 - **Status**: DRAFT (Pending Human Approval)
 - **Feature**: delivery-review-merge-lock
+- **关联 ADR**: [ADR-0012](../../../docs/adr/0012-delivery-authorization-and-recovery.md)（Gate2 交付授权与 merge 物理锁）、[ADR-0002](../../../docs/adr/0002-merge-compensation.md)（合入后补偿与全局退役）
 - **Architectural Scope**: 动态 5-Block PR 审查生成与 LoopX 合并物理防偷跑锁实心化
 
 ## 1. 核心技术路线对比与权衡

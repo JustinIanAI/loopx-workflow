@@ -1,6 +1,7 @@
 # Architecture Decisions: authentic-review-pipeline
 - **Status**: PROPOSED (Pending Contract Approval)
 - **Feature**: authentic-review-pipeline
+- **关联 ADR**: [ADR-0013](../../../docs/adr/0013-align-review-architecture-with-loopx-philosophy.md)（审查管线回归 LoopX 原生文件契约：packet / fresh-audit-exact-head / check-result）、[ADR-0017](../../../docs/adr/0017-review-pipeline-reliability.md)（异步执行、失败分类与重试预算）
 
 ## 1. 核心技术路线对比与权衡
 - **分支 1（采纳）: 真实模型审查 agent（Codex CLI）+ LoopX pr-review 骨架**
