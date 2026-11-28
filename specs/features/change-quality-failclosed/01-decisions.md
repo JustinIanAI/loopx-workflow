@@ -1,6 +1,7 @@
 # Architecture Decisions: change-quality-failclosed
 - **Status**: DRAFT (Pending Human Approval)
 - **Feature**: change-quality-failclosed
+- **关联 ADR**: [ADR-0011](../../../docs/adr/0011-evidence-traceability-and-quality.md)（change-quality 是唯一质量裁决；收据缺失/失效/未验证 → 非 0）、[ADR-0005](../../../docs/adr/0005-quality-scan-pr-body.md)（质量扫描范围与 PR 正文真实性）
 - **Architectural Scope**: LoopX 质量收据真实化、动态 Diff 审查与严格 Fail-Closed 阻断机制
 
 ## 1. 核心技术路线对比与权衡
