@@ -221,6 +221,9 @@ usage() {
   issue <issue_id> [--goal-id <gid>] [--impact R0|R1|R2] [--init-goal] [--execute]
                           Issue 修复管线：feasibility 因果路由 + workflow-plan；--execute 才建/领 fix/issue-<id>
                           （默认 dry-run 不写 domain state；--execute 必须绑定每 Issue Goal）
+        [--reproduction confirmed|planned|missing|blocked] [--scope bounded|uncertain|oversized]
+        [--reproduction-label <l>] [--validation-label <l>] [--comment-value none|clarification|diagnosis]
+        [--repository-context-json <path|->]   观察量决定 fix_pr 路由；label 缺失时用公开安全默认值
   integrate [--execute|--status]  LoopX 集成分支本地预集成 (默认 preview 不落盘)
   context <feature>       生成当前特性的长程上下文胶囊，供开发者与 AI Agent 快速穿透审阅
   archive <feature>       原子归档已合入特性的资产包 (specs/features/ -> specs/archive/)
@@ -3111,11 +3114,24 @@ cmd_issue() {
     # 解析 Agent 观察量与 Issue 修复管线参数
     local repro="missing" scope="uncertain" goal_id="" project_root="$PROJECT_ROOT"
     local impact="" base_branch="main" issue_branch="" execute="false" init_goal="false"
+    local repro_label="" validation_label="" comment_value="none" context_json=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --reproduction)
                 [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --reproduction 需要取值${NC}" >&2; exit 1; }
                 repro="$2"; shift 2 ;;
+            --reproduction-label)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --reproduction-label 需要取值${NC}" >&2; exit 1; }
+                repro_label="$2"; shift 2 ;;
+            --validation-label)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --validation-label 需要取值${NC}" >&2; exit 1; }
+                validation_label="$2"; shift 2 ;;
+            --comment-value)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --comment-value 需要取值${NC}" >&2; exit 1; }
+                comment_value="$2"; shift 2 ;;
+            --repository-context-json)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --repository-context-json 需要文件路径或 '-'${NC}" >&2; exit 1; }
+                context_json="$2"; shift 2 ;;
             --scope)
                 [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --scope 需要取值${NC}" >&2; exit 1; }
                 scope="$2"; shift 2 ;;
@@ -3207,16 +3223,50 @@ if (line) {
     fi
 
     echo -e "    Issue 标题: ${BOLD}${issue_title:-<unknown>}${NC} | Repo: ${BOLD}${repo_label:-unknown}${NC}"
+    # feasibility 的枚举与互斥约束来自 LoopX 2.3.0 --help：越界值在本地先 fail-closed，
+    # 且 confirmed/planned 必须带 compact public-safe 的 reproduction-label。
+    if [[ ! "$repro" =~ ^(confirmed|planned|missing|blocked)$ ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 非法 --reproduction ${repro}（只接受 confirmed|planned|missing|blocked）${NC}" >&2
+        exit 1
+    fi
+    if [[ ! "$scope" =~ ^(bounded|uncertain|oversized)$ ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 非法 --scope ${scope}（只接受 bounded|uncertain|oversized）${NC}" >&2
+        exit 1
+    fi
+    if [[ ! "$comment_value" =~ ^(none|clarification|diagnosis)$ ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 非法 --comment-value ${comment_value}（只接受 none|clarification|diagnosis）${NC}" >&2
+        exit 1
+    fi
+    if [[ -n "$context_json" && "$context_json" != "-" && ! -f "$context_json" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] --repository-context-json 指向的文件不存在: ${context_json}${NC}" >&2
+        exit 1
+    fi
+    if [[ -z "$repro_label" && ( "$repro" == "confirmed" || "$repro" == "planned" ) ]]; then
+        repro_label="issue-${issue_id}-repro"
+        echo -e "    ${YELLOW}[i] 未提供 --reproduction-label，使用公开安全的默认标签: ${repro_label}${NC}"
+    fi
+    # fix_pr 的第二个必要条件：LoopX 要求具名验证面（validation_label）。
+    if [[ -z "$validation_label" ]]; then
+        validation_label="npm-run-test"
+        echo -e "    ${YELLOW}[i] 未提供 --validation-label，使用默认验证面标签: ${validation_label}${NC}"
+    fi
+
     echo -e "    影响分级: ${BOLD}impact:$impact${NC} | 观察量: reproduction=$repro | scope=$scope"
     echo -e "${BLUE}==> 调用 LoopX issue-fix feasibility 执行因果路由裁决...${NC}"
 
-    local feasibility_json
-    if ! feasibility_json="$(run_loopx issue-fix feasibility \
+    local -a feasibility_args=(issue-fix feasibility \
         --repo "$repo_label" \
         --issue-ref "$issue_id" \
         --reproduction-status "$repro" \
         --scope-class "$scope" \
-        --format json)"; then
+        --format json)
+    if [[ -n "$repro_label" ]]; then feasibility_args+=(--reproduction-label "$repro_label"); fi
+    if [[ -n "$validation_label" ]]; then feasibility_args+=(--validation-label "$validation_label"); fi
+    if [[ "$comment_value" != "none" ]]; then feasibility_args+=(--comment-value "$comment_value"); fi
+    if [[ -n "$context_json" ]]; then feasibility_args+=(--repository-context-json "$context_json"); fi
+
+    local feasibility_json
+    if ! feasibility_json="$(run_loopx "${feasibility_args[@]}")"; then
         echo -e "${RED}[-] [FAIL-CLOSED] LoopX 缺陷可行性裁决失败: Issue #$issue_id 无法获取因果路由，操作已阻断。${NC}" >&2
         exit 1
     fi
@@ -3270,12 +3320,20 @@ process.stdout.write(codes.map((code) => String(code)).join(", "));
 
             if [[ "$wp_status" == "PASS" || "$execute" == "true" ]]; then
                 local -a plan_args=(issue-fix workflow-plan \
+                    --repo "$repo_label" \
+                    --issue-ref "$issue_id" \
                     --repo-path "$PROJECT_ROOT" \
                     --base-branch "$base_branch" \
                     --issue-branch "$issue_branch" \
                     --format json)
                 if [[ -n "$goal_id" ]]; then
                     plan_args+=(--goal-id "$goal_id" --project "$project_root")
+                fi
+                if [[ -n "$validation_label" ]]; then
+                    plan_args+=(--validation-label "$validation_label")
+                fi
+                if [[ -n "$context_json" ]]; then
+                    plan_args+=(--repository-context-json "$context_json")
                 fi
                 if [[ "$execute" != "true" ]]; then
                     plan_args+=(--no-write-domain-state)

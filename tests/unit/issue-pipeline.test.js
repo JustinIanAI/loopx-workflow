@@ -114,6 +114,48 @@ test('2. dry-run with --goal-id forwards the goal and project into workflow-plan
   }
 });
 
+test('2b. feasibility 收到公开安全的复现/验证标签，并透传 comment-value 与仓库上下文', () => {
+  const dir = setup();
+  const ctx = path.join(dir, 'ctx.json');
+  fs.writeFileSync(ctx, '{"schema_version":"issue_fix_repository_context_input_v0","sources":[]}');
+  try {
+    const res = run(dir, [
+      'issue', '123', '--reproduction', 'confirmed', '--scope', 'bounded',
+      '--comment-value', 'diagnosis', '--repository-context-json', ctx
+    ]);
+    assert.strictEqual(res.status, 0, res.stderr);
+    const log = calls(dir);
+    assert.match(log, /issue-fix feasibility .*--reproduction-label issue-123-repro/,
+      'fix_pr 要求 compact public-safe 的 reproduction-label');
+    assert.match(log, /--validation-label npm-run-test/, 'fix_pr 要求具名验证面');
+    assert.match(log, /--comment-value diagnosis/);
+    assert.match(log, /--repository-context-json .*ctx\.json/);
+    assert.match(log, /workflow-plan .*--validation-label npm-run-test/);
+    assert.match(log, /workflow-plan .*--repo owner\/repo --issue-ref 123/,
+      'workflow-plan 必须带真实 repo/issue，避免落到 fixture');
+  } finally {
+    sandbox.cleanup(dir);
+  }
+});
+
+test('2c. 非法 --reproduction / --scope / --comment-value 本地 fail-closed，不调用 loopx', () => {
+  const dir = setup();
+  try {
+    for (const args of [
+      ['issue', '123', '--reproduction', 'maybe'],
+      ['issue', '123', '--scope', 'huge'],
+      ['issue', '123', '--comment-value', 'rant']
+    ]) {
+      const res = run(dir, args);
+      assert.strictEqual(res.status, 1, `${args.join(' ')} 必须非 0`);
+      assert.match(res.stderr, /FAIL-CLOSED/);
+    }
+    assert.doesNotMatch(calls(dir), /issue-fix feasibility/);
+  } finally {
+    sandbox.cleanup(dir);
+  }
+});
+
 test('3. invalid impact fails closed (CLI value and Issue body value)', () => {
   const cliDir = setup();
   try {
