@@ -557,6 +557,37 @@ function withClaimingChild(dir, fn) {
   }).then((v) => fn(v.child, v.out)).finally(() => { try { child.kill('SIGKILL'); } catch (_) { /* ignore */ } });
 }
 
+
+function withRacingClaimChildren(dirs, fn) {
+  const { spawn } = require('node:child_process');
+  const code = 'const ar = require(process.argv[1]);'
+    + 'const dir = process.argv[2];'
+    + 'process.stdout.write("READY\\n");'
+    + 'process.stdin.once("data", () => {'
+    + '  const ok = ar.claimPriorStateDir(dir);'
+    + '  process.stdout.write((ok ? "CLAIMED" : "REFUSED") + "\\n");'
+    + '  setTimeout(() => {}, 20000);'
+    + '});';
+  const children = dirs.map((dir) => spawn(process.execPath, ['-e', code, SRC, dir], { stdio: ['pipe', 'pipe', 'ignore'] }));
+  const waitFor = (child, tokens) => new Promise((resolve, reject) => {
+    let buf = '';
+    child.stdout.on('data', (chunk) => {
+      buf += chunk;
+      const hit = tokens.find((t) => buf.includes(t));
+      if (hit) resolve(hit);
+    });
+    child.on('error', reject);
+  });
+  return Promise.all(children.map((c) => waitFor(c, ['READY'])))
+    .then(() => {
+      // 同一时刻发令：两个子进程在 claimPriorStateDir 内真实交错
+      for (const c of children) c.stdin.write('go\n');
+      return Promise.all(children.map((c) => waitFor(c, ['CLAIMED', 'REFUSED'])));
+    })
+    .then((results) => fn(results))
+    .finally(() => { for (const c of children) { try { c.kill('SIGKILL'); } catch (_) { /* ignore */ } } });
+}
+
 test('原子认领：所有者已死的残留目录可被新进程抢占（陈旧认领不阻止续跑）', () => {
   const s = sandbox();
   try {
@@ -603,6 +634,51 @@ test('原子认领：另一存活进程持有认领时，本次运行不接管�
       assert.strictEqual(names.length, 2, '被他人认领的目录不得复用：本次运行必须另建自己的 pid 子目录');
       assert.ok(names.some((n) => n.startsWith(`${process.pid}-`)));
       assert.ok(names.includes('99999-feedface'), '他人持有中的目录必须原样保留');
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：空 owner 的认领目录在宽限期内不得被抢占（发布窗口不可被利用）', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-cafebabe');
+    writePriorState(dir);
+    fs.mkdirSync(path.join(dir, '.resume-claim'), { recursive: true }); // 尚无 owner，恰在发布窗口
+    assert.strictEqual(ar.claimPriorStateDir(dir), false, '刚出现且没有 owner 的认领不得被当作陈旧抢占');
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：陈旧空 owner 认领（旧版本崩溃残留）可被抢占', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-cafed00d');
+    writePriorState(dir);
+    const claimDir = path.join(dir, '.resume-claim');
+    fs.mkdirSync(claimDir, { recursive: true });
+    const old = new Date(Date.now() - 60000);
+    fs.utimesSync(claimDir, old, old);
+    assert.strictEqual(ar.claimPriorStateDir(dir), true, '超过宽限的空 owner 残留必须可抢占，否则续跑永久卡死');
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：两个子进程同时竞争同一残留目录，恰好一个成功', async () => {
+  const s = sandbox();
+  try {
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-race0001');
+    writePriorState(dir);
+    await withRacingClaimChildren([dir, dir], (results) => {
+      assert.strictEqual(results.filter((r) => r === 'CLAIMED').length, 1, '认领必须排他：恰好一个进程赢，另一个必须放手');
     });
   } finally {
     s.restore();

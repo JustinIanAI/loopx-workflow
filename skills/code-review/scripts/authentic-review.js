@@ -265,9 +265,13 @@ function resumeMemo(repoRoot, pr) {
 // 原子认领（ADR-0021 follow_up #1）：所有者已死的残留目录在事故后「立刻重试两次」时
 // 会被两个新进程同时 discover。若不排他认领，两者会共同写同名的 attempt 输出、
 // 先结束的再把目录整删 —— 原 ENOENT 竞态在这一支路重现。
-// 认领用 mkdir 抢占（原子且失败即 EEXIST），抢占陈旧认领用 rename 搬走（同样原子），
-// 因此任意时刻只有一个进程赢，输的一方必须放手。
+// 认领的**发布**必须原子：先在唯一临时目录写好 owner，再 rename 成 `.resume-claim`。
+// 若先 mkdir 再写 owner，存在「P1 mkdir 完但没写 owner → P2 读到空 owner 当成陈旧、
+// 把目录搬走再自建 → 两者都认为自己持有」的窗口（复审 finding）。
 const RESUME_CLAIM_DIR = '.resume-claim';
+// 认领目录存在但读不到 owner 时，只有足够陈旧才按「崩溃残留」抢占：
+// 正常发布是原子的，owner 永远在 rename 之前写好，空 owner 只会来自旧版本崩溃残留。
+const CLAIM_GRACE_MS = 1000;
 
 function claimHolderPid(claimDir) {
   try {
@@ -283,27 +287,41 @@ function claimHolderPid(claimDir) {
 function claimPriorStateDir(dir) {
   if (!dir) return false;
   const claimDir = path.join(dir, RESUME_CLAIM_DIR);
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  const stamp = `${process.pid}\n${new Date().toISOString()}\n`;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    let stat = null;
+    try { stat = fs.statSync(claimDir); } catch (_) { stat = null; }
+    if (stat) {
+      const holder = claimHolderPid(claimDir);
+      if (holder === process.pid) {
+        stateDirOwnedSet().add(dir);
+        return true;
+      }
+      if (holder !== null && pidIsAlive(holder)) return false;
+      if (holder === null && Date.now() - stat.mtimeMs < CLAIM_GRACE_MS) {
+        // 认领目录刚出现却还没有 owner：正常发布不会出现这种状态，
+        // 保守当作「正在发布/状态不明」，本轮放手（宁可新开目录，不可双持有）。
+        return false;
+      }
+      // 陈旧认领：搬走再抢建。rename 原子，两个进程只有一个能把目录搬走，输家下一轮照常竞争。
+      const stale = `${claimDir}.stale.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
+      try { fs.renameSync(claimDir, stale); } catch (_) { /* 已被别人搬走，回到竞争 */ }
+      try { fs.rmSync(stale, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      continue;
+    }
+    // 原子发布：owner 与目录同生共死，任何读取者看到的认领目录都自带持有者信息。
+    const tmp = `${claimDir}.tmp.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
     try {
-      fs.mkdirSync(claimDir);
-      fs.writeFileSync(path.join(claimDir, 'owner'), `${process.pid}\n${new Date().toISOString()}\n`, 'utf8');
+      fs.mkdirSync(tmp);
+      fs.writeFileSync(path.join(tmp, 'owner'), stamp, 'utf8');
+      // 目标已存在（含空目录被 POSIX rename 覆盖的情形）会失败 → 判定为输给并发发布者。
+      fs.renameSync(tmp, claimDir);
       stateDirOwnedSet().add(dir);
       return true;
-    } catch (err) {
-      if (!err || err.code !== 'EEXIST') return false;
+    } catch (_) {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      // 回到循环重新判定：可能已被他人发布并持有。
     }
-    const holder = claimHolderPid(claimDir);
-    if (holder === process.pid) {
-      stateDirOwnedSet().add(dir);
-      return true;
-    }
-    if (holder !== null && pidIsAlive(holder)) return false;
-    // 陈旧认领：搬走再抢建。rename 原子，两个进程只有一个能把目录搬走，输家下一轮照常竞争。
-    const stale = `${claimDir}.stale.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
-    try {
-      fs.renameSync(claimDir, stale);
-    } catch (_) { /* 已被别人搬走，回到竞争 */ }
-    try { fs.rmSync(stale, { recursive: true, force: true }); } catch (_) { /* ignore */ }
   }
   return false;
 }
