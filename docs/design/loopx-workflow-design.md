@@ -305,9 +305,23 @@ LoopX `validation.status` 只映射 `passed/failed/skipped`：`not_run/blocked/d
 
 #### 8.2.1 证据核验清单投影与 Stage 2 Fail-Closed（ADR-0013 2026-11-25 增补）
 
-`authentic-review.js` 的 Stage 2 在 `capVerdictInBody` 触发封顶时，将 LoopX `pr-review --check-result` 的 `approval_blockers` 完整明细**机械投影**为第 5 段 `### 证据核验清单（LoopX 契约投影）`（位于 `## 我的整体评价` 之前），列示"应审 N / 通过 X / 未通过 Y + 逐项原因"；数据 100% 来自 `check-result.json`/`result.json`，编排层不改写 LoopX 结论，注入清单后二次过 `check-result` 且必须 `ok === true` 才允许发布。
+本节区分**已实现**与**目标态**。2026-11-28 之前本节把两者写混，把尚未落地的能力描述成现状（Issue #76 审查 P1）；修订后凡未实现的条目一律标注「未实现」，不得作为现状引用。
 
-Stage 2 的超时、非 0、截断标记、JSON 不可解析一律 `[NOT_VERIFIED]`、非 0 退出、保留 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 留证，且禁止调用 `gh` 发布；补证由 `check-result` 报错驱动按内聚域分批（≤3 域、≤2 轮有界收敛）。`gates()` 与 `buildEvidenceGraph` 锚定 `runDir/repo/` 的精确 `headRefOid` 只读代码树；本机 HEAD 不匹配时跳过本地实测并将对应 validation 行标 `unverified`。INV2/INV4/INV5 不变量分别挂靠 `REQ-RESPOND-1`/`REQ-EVIDENCE-1`/`REQ-REVIEW-2`（见 ADR-0013 增补决策 4），不新开编号体系。
+**现状（本仓已实现）**
+
+- **Stage 2 部分 Fail-Closed**：仅 `truncated`（模型输出含宿主截断标记）与 `stdinRejected`（stdin 超限拒绝）会 `[NOT_VERIFIED]` + 非 0 退出，且不调用 `gh` 发布；运行目录 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 保留留证。
+- **封顶只改裁决**：`capVerdictInBody` 做两件事——`authorOwned` 时把 APPROVE 标题降为 REQUEST_CHANGES；把 `English verdict: APPROVE` 行替换为封顶说明 + `REQUEST_CHANGES`。**不**投影 `approval_blockers`。
+- **精确 head 锚定只有 P0**：`localGateAnchor` 比较本地 `HEAD` 与 `headRefOid`，不一致时跳过本地四门禁并把对应 validation 行标 `unverified`；**没有** `runDir/repo` 精确 head 检出。
+- **发布前硬门禁**：`loopx pr-review --check-result` 必须 `ok === true` 才允许发布（唯一裁决，不自行判定版式通过）。
+
+**目标态（ADR-0013 增补决策 2 / 4 的要求，尚未实现）**
+
+- Stage 2 的超时、非 0、JSON 不可解析也一律 `[NOT_VERIFIED]` + 非 0 退出（当前这三类只落为「该证据未补到」，由 `--check-result` 与封顶兜底）。
+- 封顶触发时将 `approval_blockers` 完整明细机械投影为第 5 段 `### 证据核验清单（LoopX 契约投影）`（位于 `## 我的整体评价` 之前），列示「应审 N / 通过 X / 未通过 Y + 逐项原因」；数据 100% 来自 `check-result.json`/`result.json`，编排层不改写 LoopX 结论，注入后二次过 `check-result`。
+- `gates()` 与 `buildEvidenceGraph` 锚定 `runDir/repo/` 的精确 `headRefOid` 只读代码树（取代 P0 的「不匹配就跳过」）。
+- 补证由 `check-result` 报错驱动按内聚域分批（≤3 域、≤2 轮有界收敛）。
+
+INV2/INV4/INV5 不变量分别挂靠 `REQ-RESPOND-1`/`REQ-EVIDENCE-1`/`REQ-REVIEW-2`（见 ADR-0013 增补决策 4），不新开编号体系。
 
 #### 8.2.2 审查管线可靠性契约（ADR-0017）
 
