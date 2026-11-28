@@ -811,7 +811,9 @@ gate2_rebind_allowed() {
     [[ "$(gate2_rebind_mode)" == "patch_id" ]] || return 1
     [[ -n "$signed" && -n "$current" && -n "$base_ref" ]] || return 1
     [[ "$signed" != "$current" ]] || return 1
-    LOOPX_REPO_ROOT="$PROJECT_ROOT" node "$WORKFLOW_ROOT/lib/gate2-rebind.js" same-change "origin/$base_ref" "$signed" "$current" >/dev/null 2>&1
+    # 只丢 stdout（判定结果由退出码承载）；stderr 必须透传，否则 fetch 失败的告警
+    # 会和「指纹不等」在错误面上混在一起，用户无法判断是离线还是改动真的变了。
+    LOOPX_REPO_ROOT="$PROJECT_ROOT" node "$WORKFLOW_ROOT/lib/gate2-rebind.js" same-change "origin/$base_ref" "$signed" "$current" >/dev/null
 }
 
 gh_login() {
