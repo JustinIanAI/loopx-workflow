@@ -136,6 +136,30 @@ exit 0
   } finally { h.cleanup(dir); }
 });
 
+test('pr create 读回既有 PR → 清除 pending 标记并成功（重跑不再永久阻断 Gate1）', () => {
+  const dir = h.makeSandbox('gate1-draftreplay-');
+  try {
+    h.writeCapsule(dir, FEATURE);
+    h.writeConfig(dir, 'independent');
+    execFileSync('git', ['checkout', '-q', '-b', `feature/${FEATURE}`], { cwd: dir, stdio: 'ignore' });
+    h.mockGh(dir, `if [[ "$1" == "api" && "$2" == "user" ]]; then echo "executor"; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "list" ]]; then echo "https://github.com/o/r/pull/12"; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "create" ]]; then echo "a pull request for branch already exists" >&2; exit 1; fi
+exit 0
+`);
+
+    // 模拟上一次 create 在服务端已成功、本地却判定失败留下的标记。
+    const marker = path.join(dir, '.loopx/presentation', FEATURE + '.json');
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, JSON.stringify({ schema_version: 'loopx_flow_presentation_v0', feature: FEATURE, presentation: 'pending' }, null, 2));
+
+    const r = h.run(dir, ['pr', 'create', FEATURE, '--draft']);
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /presentation=published/);
+    assert.strictEqual(fs.existsSync(marker), false, '读回成功后必须清除 pending 标记');
+  } finally { h.cleanup(dir); }
+});
+
 test('远端领先（本地未拉取）→ Gate1 非 0，禁止签落后于远端的 HEAD', () => {
   const { dir, capsule, published } = publishedCapsule('gate1-ahead-');
   const clone = fs.mkdtempSync(path.join(os.tmpdir(), 'gate1-ahead-clone-'));

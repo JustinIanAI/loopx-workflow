@@ -2018,6 +2018,21 @@ HELPTXT
                 title="feat(${feature}): implement ${feature} aligned with PR #7545 protocol"
             fi
 
+            # 幂等读回：上一次 create 可能已在服务端成功、本地却判定失败（超时/连接中断），
+            # 此时已写入 presentation=pending；而重跑 gh pr create 会因分支已有 PR 必然失败，
+            # 标记永远清不掉 → Gate1 被永久阻断。所以先读回既有 PR，有则视为已发布。
+            local existing_pr_url=""
+            if [[ -n "$current_branch" ]]; then
+                existing_pr_url="$(gh pr list --head "$current_branch" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)"
+            fi
+            if [[ -n "$existing_pr_url" ]]; then
+                rm -f "$(presentation_state_file "$feature")"
+                echo -e "${YELLOW}[i] 分支 $current_branch 已有可读 PR，视为 presentation 已完成；已清除 pending 标记。${NC}" >&2
+                echo -e "${GREEN}[✓] PR 已存在: ${existing_pr_url}${NC}"
+                echo "presentation=published"
+                return 0
+            fi
+
             local pr_body
             pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
 
