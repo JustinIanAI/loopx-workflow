@@ -266,6 +266,13 @@ function readStageState(repoRoot, pr, stage) {
   }
 }
 
+// 目录可能在「发现→使用」窗口里被外部清理（上一轮成功清理、并发进程、gc），
+// 任何落盘前都补一次 mkdir，把 ENOENT 崩溃降级成一次可解释的重跑。
+function ensureParentDir(filePath) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
 function writeStageState(repoRoot, pr, stage, patch) {
   const prev = readStageState(repoRoot, pr, stage) || {};
   const next = {
@@ -278,6 +285,7 @@ function writeStageState(repoRoot, pr, stage, patch) {
   };
   const p = stageStatePath(repoRoot, pr, stage);
   const tmp = `${p}.tmp-${process.pid}`;
+  ensureParentDir(tmp);
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8');
   fs.renameSync(tmp, p);
   return next;
@@ -400,6 +408,10 @@ async function runStageWithState(options) {
   // 使 readStageState 能读到它；无可续轮次才创建新的 pid 子目录。
   const resumedFromPrior = reviewStateDirForResume(repoRoot, pr);
   const stateDir = resumedFromPrior || reviewStateDir(repoRoot, pr);
+  // 发现→使用之间存在窗口：上一轮进程的成功清理、并发进程或 gc 可能已经把该目录删掉，
+  // 之后写 attempt 输出就会 ENOENT 崩掉整条评审（实测：review #97 崩在 stage1.attempt1.out.txt）。
+  // 目录没了就重建（状态随之丢失，等价于全新一轮），把崩溃换成一次明确的重跑。
+  if (!fs.existsSync(stateDir)) fs.mkdirSync(stateDir, { recursive: true });
   const prior = readStageState(repoRoot, pr, stage);
   const sameIdentity = Boolean(prior)
     && prior.head_oid === headOid
@@ -503,7 +515,8 @@ async function runStageWithState(options) {
 
     if (!run.error) {
       const out = String(run.stdout || '');
-      fs.writeFileSync(outputPath, out, 'utf8');
+      ensureParentDir(outputPath);
+      fs.writeFileSync(outputPath, out, "utf8");
       writeStageState(repoRoot, pr, stage, {
         status: 'ok',
         elapsed_ms: elapsed,
@@ -536,7 +549,8 @@ async function runStageWithState(options) {
       `stage=${stage} attempt=${attempt} event=failed error_class=${errorClass} elapsed_ms=${elapsed} detail="${detail}" raw_error="${String(run.error || '').slice(0, 200)}" signal=${run.signal || '-'} timeout_ms=${budgetMs} partial_output=${partial.path || '-'} partial_bytes=${partial.bytes}`);
 
     if (partial.salvaged) {
-      fs.writeFileSync(outputPath, partial.text, 'utf8');
+      ensureParentDir(outputPath);
+      fs.writeFileSync(outputPath, partial.text, "utf8");
       writeStageState(repoRoot, pr, stage, {
         status: 'ok',
         salvage: true,
