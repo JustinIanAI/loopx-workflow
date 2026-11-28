@@ -243,6 +243,16 @@ reason. Zero findings in a category does **not** mean "not covered", and a table
 evidence of completeness. Say "no supported findings in the examined scope" — never that the code is
 bug-free.
 
+## PR Review Boundary (LoopX native)
+
+This section overrides the `Report` structure above when the review target is a GitHub PR that will become a formal review.
+
+- The only report format for a PR is the five-section `review_template` returned by `loopx pr-review` (动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价). The `Report` structure in this file is for non-PR static review, investigation and local notes; never publish it as a PR review body.
+- The publication path is `loopx-flow review <pr>` (which drives `authentic-review.js`), not a hand-written `gh api` review. The native packet must be fetched with the same `--goal-id` used by `--check-result`.
+- A formal review may be published only when the PR is not Draft, the reviewed head is exact, and `loopx pr-review --check-result` returns `ok === true`. Otherwise emit `NOT_VERIFIED` and exit non-zero.
+- The native `loopx-pr-review` skill is a read-only entry point: it does not comment, approve or merge. Any write happens in `loopx-flow review` / `respond` under the human gate (Mode A non-author approval / Mode B `release-approve`); agents publish COMMENT or REQUEST_CHANGES only, never an author-owned approval.
+- Re-review carryover and `respond` reuse the same five sections; do not invent a second report contract.
+
 ## Notes
 
 - Say explicitly what is well built. A review that only accuses is easy to dismiss.
