@@ -149,7 +149,41 @@ test('direct entry passes node --test exit status and stdio, including extra arg
     assert.notStrictEqual(direct.status, 0);
     assert.strictEqual(via.status, direct.status);
     assert.match(via.stdout, /expected failure sentinel/);
-    assert.match(via.stdout, /# fail [1-9]/);
+    assert.match(via.stdout, /^# fail [1-9]/m, 'runner 默认必须固定 TAP reporter，汇总行不随 Node 主版本漂移');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runner pins TAP by default and honors an explicit --test-reporter', async () => {
+  const { resolveTestReporterArgs } = await loadRunner();
+  assert.deepStrictEqual(resolveTestReporterArgs([]), ['--test-reporter=tap']);
+  assert.deepStrictEqual(resolveTestReporterArgs(['--test-name-pattern', 'x']), ['--test-reporter=tap']);
+  assert.deepStrictEqual(resolveTestReporterArgs(['--test-reporter=spec']), []);
+  assert.deepStrictEqual(resolveTestReporterArgs(['--test-reporter', 'spec']), []);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'unit-reporter-'));
+  try {
+    writeFile(root, 'fail.test.js', [
+      "'use strict';",
+      "const { test } = require('node:test');",
+      "test('reporter sentinel', () => { throw new Error('reporter sentinel failure'); });",
+    ].join('\n'));
+
+    const pinned = spawnSync(process.execPath, [RUNNER, root], {
+      encoding: 'utf8',
+      env: freshTestEnv(),
+    });
+    assert.strictEqual(pinned.status, 1);
+    assert.match(pinned.stdout, /^# fail 1$/m, '默认输出必须是 TAP 汇总行');
+
+    const explicit = spawnSync(process.execPath, [RUNNER, root, '--test-reporter=spec'], {
+      encoding: 'utf8',
+      env: freshTestEnv(),
+    });
+    assert.strictEqual(explicit.status, 1);
+    assert.doesNotMatch(explicit.stdout, /^# fail \d+$/m, '显式 reporter 必须覆盖默认值');
+    assert.match(explicit.stdout, /fail 1/, '显式 spec reporter 仍须报告失败计数');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
