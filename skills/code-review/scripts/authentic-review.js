@@ -1080,6 +1080,14 @@ function localGateAnchor(repoRoot, headOid) {
   return { match: Boolean(localHead && target && localHead === target), localHead, headOid: target };
 }
 
+// 跳过本地门禁时的 validation 行。
+// 必须显式传 unverified:true：builder 只在拿到该开关时写 unverified/NOT_RUN，
+// 否则 parseGateOutcome(undefined) 落入 failed 分支并伪造 exit_code=1，
+// 把「没跑」谎报成「跑了但失败」——与 REQ-REVIEW-2 的承诺相反。
+function buildSkippedValidation(headOid, remoteChecks) {
+  return buildValidationMatrix({}, { headOid, remoteChecks, unverified: true });
+}
+
 // ---------------------------------------------------------------------------
 // 原生 LoopX pr-review 能力接入（版式与提示词的唯一来源）
 // ---------------------------------------------------------------------------
@@ -2250,15 +2258,18 @@ async function main() {
     'evidence-output.md': String(evidenceText || ''),
     'remote-checks.txt': remoteChecksText,
   });
+  // 精确 head 锚定只解析一次，供「四门禁是否实测」与「evidence graph 是否允许执行仓库测试」共用。
+  // 两处必须同一个事实：本地检出不是被审查的提交时，任何在本地跑出来的 passed 都不是它的证据。
+  const headAnchor = localGateAnchor(repoRoot, headOid);
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
     try {
-      const anchor = localGateAnchor(repoRoot, headOid);
+      const anchor = headAnchor;
       if (anchor.match) {
         validation = buildValidationMatrix(gates(), { headOid, remoteChecks });
       } else {
         console.warn(`[WARN] 本地 HEAD (${anchor.localHead || 'unknown'}) != 审查目标 headRefOid (${anchor.headOid || 'unknown'})；跳过本地四门禁实测，仅保留远端 CI 证据，本地门禁行标 unverified（宁缺毋假）。`);
-        validation = buildValidationMatrix({}, { headOid, remoteChecks });
+        validation = buildSkippedValidation(headOid, remoteChecks);
       }
     } catch (e) {
       console.warn(`[WARN] 四门禁实测/validation 构建失败：${e && e.message ? e.message : e}；validation 行标 unverified。`);
@@ -2366,6 +2377,7 @@ async function main() {
     diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
     modelEvidence: mergedModelEvidence,
     repoRoot,
+    headAnchored: headAnchor.match,
   });
 
   // ADR-0013 阶段 2（两阶段解耦）：当模型阶段 1 主观 verdict=APPROVE 但仍有未对齐的判断类证据行时，
@@ -2449,6 +2461,7 @@ async function main() {
           diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
           modelEvidence: mergedModelEvidence,
           repoRoot,
+          headAnchored: headAnchor.match,
         });
       }
     }
@@ -2628,13 +2641,21 @@ async function main() {
   process.exit(0);
 }
 
+// ADR-0017 Stage 1 起 main 为 async：入口统一收口 rejection，
+// 避免未捕获拒绝以崩溃栈退出而丢失 [NOT_VERIFIED] 诊断标记。
+// 退出码与 stderr 是下游（bin/loopx-flow / CI）判定「审查是否跑完」的唯一依据，
+// 因此把收口逻辑抽成可注入 exit/log 的函数，供回归用例直接驱动而不是靠读源码。
+function runEntry(mainFn, { exit = (code) => process.exit(code), log = console.error } = {}) {
+  return Promise.resolve()
+    .then(mainFn)
+    .catch((err) => {
+      log(`[NOT_VERIFIED] authentic review pipeline aborted: ${err && err.message ? err.message : String(err)}`);
+      exit(1);
+    });
+}
+
 if (require.main === module) {
-  // ADR-0017 Stage 1 起 main 为 async：入口统一收口 rejection，
-  // 避免未捕获拒绝以崩溃栈退出而丢失 [NOT_VERIFIED] 诊断标记。
-  main().catch((err) => {
-    console.error(`[NOT_VERIFIED] authentic review pipeline aborted: ${err && err.message ? err.message : String(err)}`);
-    process.exit(1);
-  });
+  runEntry(main);
 }
 
 module.exports = {
@@ -2658,7 +2679,10 @@ module.exports = {
   resolveReviewPolicyRevision,
   isolatedGateEnv,
   gates,
+  buildSkippedValidation,
   resolveReviewRuntimeSelection,
+  // 入口收口（#88 回归：rejection 必须以 [NOT_VERIFIED] + exit 1 收场）
+  runEntry,
   declaredModelFamily,
   resolveReviewerDeclaration,
   // 阶段状态 / 可观测性（单测直接驱动，生产路径由 main() 调用）

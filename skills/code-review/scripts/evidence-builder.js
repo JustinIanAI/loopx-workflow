@@ -199,6 +199,19 @@ function resolveRepoTestPaths(candidate, repoRoot) {
 }
 
 function buildInvariantRow(caseId, label, candidate, opts = {}) {
+  // 精确 head 守卫：本地检出与审查目标不是同一提交时，在它上面跑出来的
+  // passed 属于另一份代码的证据。此时不执行、不判失败，直接标 unverified。
+  if (opts.headAnchored === false) {
+    return {
+      case_id: caseId,
+      invariant_or_case: label,
+      command_or_check: 'NOT_RUN',
+      status: 'unverified',
+      result: 'unverified: local HEAD != review target headRefOid',
+      required: true,
+      skip_or_failure_reason: 'unverified: repository is not checked out at the reviewed head',
+    };
+  }
   const resolvedList = resolveRepoTestPaths(candidate, opts.repoRoot);
   if (!resolvedList || !resolvedList.length) {
     return {
@@ -369,6 +382,7 @@ function buildHostValidationRow(ctx, modelValidation) {
       headOid: ctx.headOid,
       repoRoot: ctx.repoRoot,
       runNodeTest: ctx.runNodeTest,
+      headAnchored: ctx.headAnchored,
     });
     const idx = baseItems.findIndex(item => item && item.case_id === caseId);
     if (idx >= 0) baseItems[idx] = evaluated;
@@ -735,7 +749,7 @@ function buildJudgmentRow(id, req, plan, modelRow) {
   return out;
 }
 
-function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, validation, modelEvidence, repoRoot, runNodeTest }) {
+function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, validation, modelEvidence, repoRoot, runNodeTest, headAnchored }) {
   const reqs = new Map((contract && contract.evidence_requirements || []).map(r => [r.evidence_id, r]));
   const requiredIds = Array.isArray(plan && plan.required_evidence_ids) ? plan.required_evidence_ids : [];
   const ctx = {
@@ -750,6 +764,7 @@ function buildEvidenceGraph({ contract, plan, diff, headOid, pr, motivation, val
     validation: Array.isArray(validation) ? validation : [],
     repoRoot,
     runNodeTest,
+    headAnchored,
   };
   const out = {};
   for (const id of requiredIds) {
