@@ -53,6 +53,12 @@
 
 ## 管线 A: Feature 研发管线 (8 阶段场景化闭环)
 
+> **生效状态说明（2026-11-25）**：本文件管线规程**当前生效**（由 Agent / 人工按此执行，Gate1 / Gate2 必须显式人工触发）；以下能力处于**规划中、尚未落地**，文中涉及处均按目标态描述：
+> - **Conductor 自动化调度** `skills/workflow-conductor`（W7 `#45`，未解锁）——落地前由本文件管线规程承担；
+> - **实现期五维验证** `skills/verification-harness`（W5 `#43`，未解锁）——落地前由 TDD 与 `code-review` 既有流程承担。
+>
+> 其余引用的 `loopx-flow` 命令与 `skills/` 下 10 项技能均已存在并生效。技能 `description` 常驻于 Agent 上下文（**非 0 Token**），正文与脚本按需加载——"不调用即占 0 Token"的说法不成立。
+
 - **阶段 0：前置体检** ➔ 运行 `loopx-flow doctor` 确保 Git、CLI、认证、四大门禁与目录就绪；首次接入由 `loopx-flow init` 确认 `authorization_mode`（`independent`/`single_owner`）与风险接受，`doctor` 校验配置。
 - **阶段 1：方案研讨** ➔ 调用 `design-grill` 排除事实疑问。产品级取舍写入 `docs/adr/` 并修订 `docs/prd/loopx-workflow.md` 与必要时的详细设计。`specs/features/<feature>/01-decisions.md` 只记录本胶囊的实现取舍并链接该 ADR。
 - **阶段 2：需求切片** ➔ 对照产品 PRD 列出本胶囊要满足的 `REQ-*`。行为不在 PRD 中则先完成阶段 1 的 ADR，禁止在 `02-prd.md` 另立产品需求。`strategy-red-team` 只攻击本切片的承重假设。

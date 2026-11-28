@@ -26,9 +26,12 @@ if [[ "$args" == *"sync-global"* ]]; then exit 0; fi
 
 function gate1GhMock(dir, commentsFile, login = 'owner') {
   if (!fs.existsSync(commentsFile)) fs.writeFileSync(commentsFile, '[]');
+  // REQ-PR-LIFECYCLE-1 发布前置需要可读且 head 对齐的 PR。
+  const prJson = h.prViewJson(dir, { head: execSync('git rev-parse HEAD', { cwd: dir, encoding: 'utf8' }).trim() });
   h.mockGh(dir, `if [[ "$1" == "api" && "$2" == "user" ]]; then echo "${login}"; exit 0; fi
 if [[ "$1" == "repo" && "$2" == "view" ]]; then echo "owner/repo"; exit 0; fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then echo "7"; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then printf '%s\\n' '${prJson}'; exit 0; fi
 if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then cat "${commentsFile}"; exit 0; fi
 exit 0
 `);
@@ -44,6 +47,8 @@ function gate1Sandbox() {
   const dir = h.makeSandbox('adr19-g1-');
   h.writeConfig(dir, 'single_owner', RISK);
   const capsule = h.writeCapsule(dir, FEATURE);
+  // REQ-PR-LIFECYCLE-1：规格包必须已提交并推送，否则 Gate1 在签名之前就 Fail-Closed。
+  h.publishSpecPackage(dir, FEATURE);
   approveLoopxMock(dir);
   return { dir, capsule, lockedSha: h.lockedShaFile(capsule.contractPath) };
 }
