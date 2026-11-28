@@ -12,6 +12,21 @@ const { spawnSync, execFileSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const AUTH = path.join(PROJECT_ROOT, 'skills/code-review/scripts/authentic-review.js');
+const sandbox = require('./helpers/m0-sandbox');
+
+test('pr create --issue: contract_impact=changed 缺 --adr 时 fail-closed', () => {
+  const dir = sandbox.makeSandbox('issue-pr-flags-');
+  try {
+    sandbox.mockGh(dir, 'echo "[mock gh] $*"; exit 0');
+    execFileSync('git', ['checkout', '-q', '-b', 'fix/issue-49'], { cwd: dir });
+    const res = sandbox.run(dir, ['pr', 'create', '--issue', '49', '--impact', 'R2', '--contract-impact', 'changed']);
+    assert.strictEqual(res.status, 1, `${res.stdout}${res.stderr}`);
+    assert.match(res.stderr, /--adr/);
+    assert.match(res.stderr, /FAIL-CLOSED/);
+  } finally {
+    sandbox.cleanup(dir);
+  }
+});
 
 test('--issue-body-file 生成含 Issue 动机与真实 diff 的 PR 正文，不读 Feature 胶囊', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'issue-pr-body-'));

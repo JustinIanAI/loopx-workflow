@@ -1997,6 +1997,8 @@ HELPTXT
             local base="main"
             local draft="false"
             local issue_id="" goal_id="" impact=""
+            local contract_impact="none"
+            local -a adrs=()
             local passthru_args=()
             while [[ $# -gt 0 ]]; do
                 case "$1" in
@@ -2023,6 +2025,16 @@ HELPTXT
                     --impact)
                         [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --impact 需要取值 R0|R1|R2${NC}" >&2; exit 1; }
                         impact="$2"
+                        shift 2
+                        ;;
+                    --contract-impact)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --contract-impact 需要取值 none|changed${NC}" >&2; exit 1; }
+                        contract_impact="$2"
+                        shift 2
+                        ;;
+                    --adr)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --adr 需要取值 docs/adr/*.md${NC}" >&2; exit 1; }
+                        adrs+=("$2")
                         shift 2
                         ;;
                     --draft)
@@ -2052,6 +2064,14 @@ HELPTXT
                 [[ -n "$impact" ]] || impact="R1"
                 if [[ ! "$impact" =~ ^R[012]$ ]]; then
                     echo -e "${RED}[-] [FAIL-CLOSED] 非法影响分级 --impact ${impact}（只接受 R0|R1|R2）${NC}" >&2
+                    exit 1
+                fi
+                if [[ ! "$contract_impact" =~ ^(none|changed)$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法 --contract-impact ${contract_impact}（只接受 none|changed）${NC}" >&2
+                    exit 1
+                fi
+                if [[ "$contract_impact" == "changed" && ${#adrs[@]} -eq 0 ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] --contract-impact changed 必须用 --adr 指明至少一份 ADR（merge 会核验其在 PR head 上为 Accepted）。${NC}" >&2
                     exit 1
                 fi
                 if [[ "$current_branch" =~ ^fix/issue-([0-9]+) && "${BASH_REMATCH[1]}" != "$issue_id" ]]; then
@@ -2093,10 +2113,14 @@ HELPTXT
                     --generate-pr-body --issue-body-file "$issue_body_file" --impact "$impact" --goal-id "$goal_id")"
                 wf_unregister_temp_file "$issue_body_file"
                 rm -f "$issue_body_file"
+                local adrs_json="[]"
+                if [[ ${#adrs[@]} -gt 0 ]]; then
+                    adrs_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "${adrs[@]}")"
+                fi
                 pr_body="${pr_body}
 
 <!-- loopx-meta: {\"goal_id\":\"${goal_id}\"} -->
-<!-- loopx-impact: {\"level\":\"${impact}\",\"issue\":${issue_id},\"contract_impact\":\"none\",\"adrs\":[],\"regression\":[\"tests/unit/issues/issue-${issue_id}.test.js\"],\"rollback\":\"revert the squash commit of this PR\"} -->"
+<!-- loopx-impact: {\"level\":\"${impact}\",\"issue\":${issue_id},\"contract_impact\":\"${contract_impact}\",\"adrs\":${adrs_json},\"regression\":[\"tests/unit/issues/issue-${issue_id}.test.js\"],\"rollback\":\"revert the squash commit of this PR\"} -->"
             else
                 pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
             fi
