@@ -1892,7 +1892,18 @@ HELPTXT
     echo -e "    [5/5] 执行 LoopX Status..."
     local loopx_status="PASSED"
     if command -v loopx >/dev/null 2>&1; then
-        if ! run_loopx status >/dev/null 2>&1; then
+        # 只核验本次交付的 Goal：全局 status 会因其它项目的 stale goal 非 0，
+        # 那与本次回复无关，不应阻断（也不能因此跳过核验）。
+        local respond_goal="" respond_branch
+        respond_branch="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+        if [[ "$respond_branch" =~ ^fix/issue-([0-9]+) ]]; then
+            respond_goal="issue-${BASH_REMATCH[1]}-goal"
+        fi
+        local -a respond_status_args=(status)
+        if [[ -n "$respond_goal" ]]; then
+            respond_status_args+=(--goal-id "$respond_goal")
+        fi
+        if ! run_loopx "${respond_status_args[@]}" >/dev/null 2>&1; then
             echo -e "${RED}[-] [FAIL-CLOSED] LoopX status 检查失败，阻断回复发布！${NC}" >&2
             exit 1
         fi
