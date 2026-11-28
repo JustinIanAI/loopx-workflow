@@ -2180,27 +2180,85 @@ fs.writeFileSync(file, JSON.stringify({
             fi
             ;;
         update)
-            pr_id="${1:-}"
-            shift || true
-            feature="${1:-}"
+            local upd_issue="" upd_goal="" upd_impact="" upd_contract="none"
+            local -a upd_adrs=()
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --issue)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --issue 需要 Issue 编号${NC}" >&2; exit 1; }
+                        upd_issue="$2"; shift 2 ;;
+                    --goal-id)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --goal-id 需要取值${NC}" >&2; exit 1; }
+                        upd_goal="$2"; shift 2 ;;
+                    --impact)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --impact 需要取值 R0|R1|R2${NC}" >&2; exit 1; }
+                        upd_impact="$2"; shift 2 ;;
+                    --contract-impact)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --contract-impact 需要取值 none|changed${NC}" >&2; exit 1; }
+                        upd_contract="$2"; shift 2 ;;
+                    --adr)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --adr 需要取值 docs/adr/*.md${NC}" >&2; exit 1; }
+                        upd_adrs+=("$2"); shift 2 ;;
+                    -*)
+                        echo -e "${RED}[-] 错误: 未知参数 $1${NC}" >&2; exit 1 ;;
+                    *)
+                        if [[ -z "$pr_id" ]]; then pr_id="$1"; elif [[ -z "$feature" ]]; then feature="$1"; fi
+                        shift ;;
+                esac
+            done
             if [[ -z "$pr_id" ]]; then
                 echo -e "${RED}[-] 错误: 请指定待更新的 PR 编号，例如: loopx-flow pr update 13${NC}" >&2
                 exit 1
             fi
-            if [[ -z "$feature" ]]; then
+            if [[ -z "$upd_issue" && "$current_branch" =~ ^fix/issue-([0-9]+) ]]; then
+                upd_issue="${BASH_REMATCH[1]}"
+            fi
+            if [[ -z "$feature" && -z "$upd_issue" ]]; then
                 if [[ "$current_branch" =~ ^feature/(.+) ]]; then
                     feature="${BASH_REMATCH[1]}"
                 elif [[ "$current_branch" =~ ^fix/(.+) ]]; then
                     feature="${BASH_REMATCH[1]}"
                 fi
             fi
-            if [[ -z "$feature" ]]; then
-                echo -e "${RED}[-] 错误: 请指定特性名称或检出 feature/<name> 分支。${NC}" >&2
+            if [[ -z "$feature" && -z "$upd_issue" ]]; then
+                echo -e "${RED}[-] 错误: 请指定特性名称、--issue <id>，或检出 feature/<name> 分支。${NC}" >&2
                 exit 1
             fi
 
             local pr_body
-            pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
+            if [[ -n "$upd_issue" ]]; then
+                [[ -n "$upd_goal" ]] || upd_goal="issue-${upd_issue}-goal"
+                [[ -n "$upd_impact" ]] || upd_impact="R1"
+                if [[ ! "$upd_impact" =~ ^R[012]$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法影响分级 --impact ${upd_impact}（只接受 R0|R1|R2）${NC}" >&2
+                    exit 1
+                fi
+                wf_run_dir pr-update
+                local upd_body_file="$WF_RUN_DIR/issue-${upd_issue}-body.md"
+                wf_register_temp_file "$upd_body_file"
+                if ! gh issue view "$upd_issue" --json body --jq '.body // ""' > "$upd_body_file" 2>/dev/null || [[ ! -s "$upd_body_file" ]]; then
+                    wf_unregister_temp_file "$upd_body_file"
+                    rm -f "$upd_body_file"
+                    echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Issue #$upd_issue 正文。${NC}" >&2
+                    exit 1
+                fi
+                local -a upd_args=(--generate-pr-body --issue-body-file "$upd_body_file" --impact "$upd_impact" --goal-id "$upd_goal")
+                local upd_gate_evidence="$PROJECT_ROOT/.loopx/state/gate-results.json" # loopx-allow: check 固化的实测证据
+                if [[ -f "$upd_gate_evidence" ]]; then upd_args+=(--gate-results "$upd_gate_evidence"); fi
+                pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" "${upd_args[@]}")"
+                wf_unregister_temp_file "$upd_body_file"
+                rm -f "$upd_body_file"
+                local upd_adrs_json="[]"
+                if [[ ${#upd_adrs[@]} -gt 0 ]]; then
+                    upd_adrs_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "${upd_adrs[@]}")"
+                fi
+                pr_body="${pr_body}
+
+<!-- loopx-meta: {\"goal_id\":\"${upd_goal}\"} -->
+<!-- loopx-impact: {\"level\":\"${upd_impact}\",\"issue\":${upd_issue},\"contract_impact\":\"${upd_contract}\",\"adrs\":${upd_adrs_json},\"regression\":[\"tests/unit/issues/issue-${upd_issue}.test.js\"],\"rollback\":\"revert the squash commit of this PR\"} -->"
+            else
+                pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
+            fi
 
             echo -e "${BLUE}==> [PR 更新] 正在更新 PR #${pr_id} 描述 (对齐 PR #7545 双语 4-Part 体系)...${NC}"
             if printf '%s' "$pr_body" | gh pr edit "$pr_id" --body-file -; then
