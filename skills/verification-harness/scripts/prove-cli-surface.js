@@ -658,6 +658,23 @@ function main() {
 
   try {
     const ws = setupCliWorkspace(sandboxDir);
+    // 步骤 3/4 会驱动 `loopx-flow feature` / `approve contract`，而这两条命令在
+    // lib/capability-probe.js 判 BLOCK（loopx 缺失或不可用）时会在第一个不可逆动作
+    // 之前 fail-closed —— 这是有意的安全行为。Prove 必须把它记录成 harness gap
+    // (`verified_unreachable`)，否则"没有 loopx 就永远拿不到 Proof"，Freshness 与
+    // 三态 triage 都会失去观测对象。真实 loopx 可用性只在这里判定一次。
+    const resolvedLoopx = resolveLoopxExecutable();
+    const realLoopxBin = resolvedLoopx && resolvedLoopx.ok ? resolvedLoopx.bin : '';
+    const verProbe = realLoopxBin
+      ? spawnSync(realLoopxBin, ['--version'], { encoding: 'utf8' })
+      : { status: 1, stdout: '', stderr: '' };
+    const versionOut = `${verProbe.stdout || ''}${verProbe.stderr || ''}`.trim();
+    const loopxReadiness = classifyLoopx23({
+      resolvedOk: Boolean(resolvedLoopx && resolvedLoopx.ok),
+      resolvedError: resolvedLoopx && resolvedLoopx.error ? resolvedLoopx.error : '',
+      probeStatus: verProbe.status,
+      versionOut,
+    });
 
     // 1. cli-help-surface
     {
@@ -725,164 +742,168 @@ function main() {
     }
 
     // 3. cli-feature-and-gate1-negative
-    {
-      // Verify pre-commit hook installed by init blocks direct commits on main
-      fs.writeFileSync(path.join(ws.repoDir, "README.md"), "# blocked direct main commit\n");
-      execFileSync("git", ["add", "README.md"], { cwd: ws.repoDir });
-      const blockedMainCommit = spawnSync("git", ["commit", "-qm", "should be blocked on main"], {
-        cwd: ws.repoDir,
-        encoding: "utf8",
-      });
-      assertCondition(blockedMainCommit.status !== 0, "pre-commit hook must block direct commits to main");
-      execFileSync("git", ["reset", "--hard", "-q", "HEAD"], { cwd: ws.repoDir });
-
-      // Scaffold feature/demo-slice via real loopx-flow feature
-      const featRes = runCli(ws, ["feature", "demo-slice"]);
-      assertCondition(featRes.status === 0, `loopx-flow feature failed (${featRes.status}): ${featRes.stdout}\n${featRes.stderr}`);
-
-      const curBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: ws.repoDir, encoding: "utf8" }).trim();
-      assertCondition(curBranch === "feature/demo-slice", `Expected branch feature/demo-slice, got ${curBranch}`);
-
-      const capsuleDir = path.join(ws.repoDir, "specs/features/demo-slice");
-      const expectedFiles = ["00-INDEX.md", "01-decisions.md", "02-prd.md", "03-stories.md", "04-contract.md", "05-evidence.md"];
-      for (const f of expectedFiles) {
-        assertCondition(fs.existsSync(path.join(capsuleDir, f)), `Capsule file missing: ${f}`);
-      }
-
-      const negVerify = runCli(ws, ["gate", "verify", "contract", "demo-slice"]);
-      assertCondition(negVerify.status !== 0, "gate verify contract on DRAFT contract must fail closed");
-
-      const negApprove = runCli(ws, ["approve", "contract", "demo-slice"]);
-      assertCondition(negApprove.status !== 0, "approve contract on unapproved DRAFT capsule must fail closed");
-
-      const contractDraft = fs.readFileSync(path.join(capsuleDir, "04-contract.md"), "utf8");
-      assertCondition(!contractDraft.includes("FROZEN & APPROVED"), "Failed approve contract must never write FROZEN & APPROVED");
-
+    if (!loopxReadiness.ready) {
       steps.push({
-        id: "cli-feature-and-gate1-negative",
-        surface: "bin/loopx-flow feature + pre-commit main guard + gate verify/approve (negative)",
-        status: "passed",
-        real_vs_mock: "real+contract_fake",
-        observations: [
-          `pre-commit hook blocked direct main commit (exit=${blockedMainCommit.status})`,
-          "switched to branch feature/demo-slice and generated all 6 capsule files",
-          `premature gate verify contract exited ${negVerify.status} and approve contract exited ${negApprove.status} with zero FROZEN & APPROVED leak`,
-        ],
+        id: 'cli-feature-and-gate1-negative',
+        surface: 'bin/loopx-flow feature + pre-commit main guard + gate verify/approve (negative)',
+        status: 'verified_unreachable',
+        real_vs_mock: 'real+contract_fake',
+        observations: [loopxReadiness.reason],
       });
+    } else {
+        // Verify pre-commit hook installed by init blocks direct commits on main
+        fs.writeFileSync(path.join(ws.repoDir, "README.md"), "# blocked direct main commit\n");
+        execFileSync("git", ["add", "README.md"], { cwd: ws.repoDir });
+        const blockedMainCommit = spawnSync("git", ["commit", "-qm", "should be blocked on main"], {
+          cwd: ws.repoDir,
+          encoding: "utf8",
+        });
+        assertCondition(blockedMainCommit.status !== 0, "pre-commit hook must block direct commits to main");
+        execFileSync("git", ["reset", "--hard", "-q", "HEAD"], { cwd: ws.repoDir });
+
+        // Scaffold feature/demo-slice via real loopx-flow feature
+        const featRes = runCli(ws, ["feature", "demo-slice"]);
+        assertCondition(featRes.status === 0, `loopx-flow feature failed (${featRes.status}): ${featRes.stdout}\n${featRes.stderr}`);
+
+        const curBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: ws.repoDir, encoding: "utf8" }).trim();
+        assertCondition(curBranch === "feature/demo-slice", `Expected branch feature/demo-slice, got ${curBranch}`);
+
+        const capsuleDir = path.join(ws.repoDir, "specs/features/demo-slice");
+        const expectedFiles = ["00-INDEX.md", "01-decisions.md", "02-prd.md", "03-stories.md", "04-contract.md", "05-evidence.md"];
+        for (const f of expectedFiles) {
+          assertCondition(fs.existsSync(path.join(capsuleDir, f)), `Capsule file missing: ${f}`);
+        }
+
+        const negVerify = runCli(ws, ["gate", "verify", "contract", "demo-slice"]);
+        assertCondition(negVerify.status !== 0, "gate verify contract on DRAFT contract must fail closed");
+
+        const negApprove = runCli(ws, ["approve", "contract", "demo-slice"]);
+        assertCondition(negApprove.status !== 0, "approve contract on unapproved DRAFT capsule must fail closed");
+
+        const contractDraft = fs.readFileSync(path.join(capsuleDir, "04-contract.md"), "utf8");
+        assertCondition(!contractDraft.includes("FROZEN & APPROVED"), "Failed approve contract must never write FROZEN & APPROVED");
+
+        steps.push({
+          id: "cli-feature-and-gate1-negative",
+          surface: "bin/loopx-flow feature + pre-commit main guard + gate verify/approve (negative)",
+          status: "passed",
+          real_vs_mock: "real+contract_fake",
+          observations: [
+            `pre-commit hook blocked direct main commit (exit=${blockedMainCommit.status})`,
+            "switched to branch feature/demo-slice and generated all 6 capsule files",
+            `premature gate verify contract exited ${negVerify.status} and approve contract exited ${negApprove.status} with zero FROZEN & APPROVED leak`,
+          ],
+        });
     }
 
     // 4. cli-gate1-approve-and-tamper-detect
-    {
-      const capsuleDir = path.join(ws.repoDir, 'specs/features/demo-slice');
-      fs.writeFileSync(path.join(capsuleDir, '01-decisions.md'), [
-        '# Architecture Decisions: demo-slice',
-        '- **Status**: APPROVED',
-        '- **ADR**: ADR-0011',
-        '',
-      ].join('\n'));
-      fs.writeFileSync(path.join(capsuleDir, '03-stories.md'), [
-        '# Stories: demo-slice',
-        '- Story-1: Prove CLI surface end-to-end',
-        '  - AC: CLI commands enforce fail-closed invariants',
-        '',
-      ].join('\n'));
-      const contractPath = path.join(capsuleDir, '04-contract.md');
-      fs.writeFileSync(contractPath, DEMO_DRAFT_CONTRACT_TEXT);
-
-      execFileSync('git', ['add', '-A'], { cwd: ws.repoDir });
-      execFileSync('git', ['commit', '-qm', 'feat(demo-slice): freeze candidate stage 1-4 capsule'], { cwd: ws.repoDir });
-      const specCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ws.repoDir, encoding: 'utf8' }).trim();
-
-      // Gate1 发布前置 ③④：分支必须已推送到 origin，且存在 head 对齐的 OPEN PR。
-      execFileSync('git', ['push', '-q', '-u', 'origin', 'feature/demo-slice'], { cwd: ws.repoDir });
-      fs.writeFileSync(ws.ghPrViewFile, JSON.stringify({
-        number: 43,
-        state: 'OPEN',
-        isDraft: true,
-        url: 'https://github.com/JustinIanAI/loopx-workflow/pull/43',
-        headRefOid: specCommit,
-      }, null, 2) + '\n');
-
-      // Pre-seed the second-principal gate=1 comment with the golden (offline
-      // computed) SHA; after `approve contract` we assert the on-disk bytes and
-      // the registry-locked revision both equal that golden constant.
-      const expectedLockedSha = GOLDEN_LOCKED_CONTRACT_SHA256;
-      const gate1CommentBody = [
-        `<!-- loopx-flow:gate1-authorization:demo-slice@${expectedLockedSha} -->`,
-        `gate=1;mode=independent;contract_sha=${expectedLockedSha};spec_commit=${specCommit};approver=reviewer-bot`,
-      ].join('\n');
-      fs.writeFileSync(ws.ghCommentsFile, JSON.stringify([
-        { body: gate1CommentBody, user: { login: 'reviewer-bot' } },
-      ], null, 2));
-
-      const approveRes = runCli(ws, ['approve', 'contract', 'demo-slice']);
-      assertCondition(
-        approveRes.status === 0,
-        `approve contract failed (${approveRes.status}):\nSTDOUT:\n${approveRes.stdout}\nSTDERR:\n${approveRes.stderr}`
-      );
-
-      const lockedBytes = fs.readFileSync(contractPath, 'utf8');
-      assertCondition(
-        lockedBytes === GOLDEN_LOCKED_CONTRACT_TEXT,
-        'Locked 04-contract.md bytes differ from the golden fixture (independent Oracle mismatch)'
-      );
-      const postLockSha = sha256Buffer(fs.readFileSync(contractPath));
-      assertCondition(postLockSha === expectedLockedSha, `Locked SHA mismatch: ${postLockSha} !== ${expectedLockedSha}`);
-
-      const registryLockedRevision = extractFirstJson(fs.readFileSync(ws.registryPath, 'utf8').replace(/\s+/g, ' '));
-      assertCondition(Boolean(registryLockedRevision), 'Registry must be readable after approve contract');
-      const registryGoal = (registryLockedRevision.goals || []).find((g) => g.id === 'demo-slice-goal');
-      const registryRevision = registryGoal
-        && registryGoal.control_plane
-        && registryGoal.control_plane.progress_review
-        && registryGoal.control_plane.progress_review.contract_revision;
-      assertCondition(
-        registryRevision === expectedLockedSha,
-        `Registry locked contract_revision (${registryRevision}) must equal on-disk golden SHA (${expectedLockedSha})`
-      );
-
-      const verifyPass = runCli(ws, ['gate', 'verify', 'contract', 'demo-slice']);
-      assertCondition(verifyPass.status === 0, `gate verify contract failed (${verifyPass.status}): ${verifyPass.stderr}`);
-
-      // Tamper 1 line in 04-contract.md and confirm fail-closed tamper block
-      fs.appendFileSync(contractPath, '\n<!-- unauthorized post-freeze mutation -->\n');
-      const verifyTamper = runCli(ws, ['gate', 'verify', 'contract', 'demo-slice']);
-      assertCondition(verifyTamper.status !== 0, 'Tampered 04-contract.md must fail closed on gate verify contract');
-      assertCondition(
-        (verifyTamper.stderr + verifyTamper.stdout).includes('CONTRACT_TAMPERED'),
-        'Tampered contract rejection must report CONTRACT_TAMPERED'
-      );
-
-      const ghCallLines = fs.readFileSync(ws.ghCallsLog, 'utf8').trim().split('\n').filter(Boolean);
-      assertCondition(ghCallLines.length >= 3, 'Contract Fake gh must record cross-process argv calls');
-
+    if (!loopxReadiness.ready) {
       steps.push({
         id: 'cli-gate1-approve-and-tamper-detect',
         surface: 'bin/loopx-flow approve contract + gate verify contract (lock & tamper detect)',
-        status: 'passed',
+        status: 'verified_unreachable',
         real_vs_mock: 'real+contract_fake',
-        observations: [
-          `locked bytes === golden fixture; registry contract_revision === on-disk SHA-256 ${expectedLockedSha.slice(0, 16)}... (exit=0)`,
-          'gate verify contract passed (exit=0) when intact and blocked with CONTRACT_TAMPERED (exit!=0) after 1-line edit',
-          `audited ${ghCallLines.length} cross-process gh CLI invocations`,
-        ],
+        observations: [loopxReadiness.reason],
       });
+    } else {
+        const capsuleDir = path.join(ws.repoDir, 'specs/features/demo-slice');
+        fs.writeFileSync(path.join(capsuleDir, '01-decisions.md'), [
+          '# Architecture Decisions: demo-slice',
+          '- **Status**: APPROVED',
+          '- **ADR**: ADR-0011',
+          '',
+        ].join('\n'));
+        fs.writeFileSync(path.join(capsuleDir, '03-stories.md'), [
+          '# Stories: demo-slice',
+          '- Story-1: Prove CLI surface end-to-end',
+          '  - AC: CLI commands enforce fail-closed invariants',
+          '',
+        ].join('\n'));
+        const contractPath = path.join(capsuleDir, '04-contract.md');
+        fs.writeFileSync(contractPath, DEMO_DRAFT_CONTRACT_TEXT);
+
+        execFileSync('git', ['add', '-A'], { cwd: ws.repoDir });
+        execFileSync('git', ['commit', '-qm', 'feat(demo-slice): freeze candidate stage 1-4 capsule'], { cwd: ws.repoDir });
+        const specCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ws.repoDir, encoding: 'utf8' }).trim();
+
+        // Gate1 发布前置 ③④：分支必须已推送到 origin，且存在 head 对齐的 OPEN PR。
+        execFileSync('git', ['push', '-q', '-u', 'origin', 'feature/demo-slice'], { cwd: ws.repoDir });
+        fs.writeFileSync(ws.ghPrViewFile, JSON.stringify({
+          number: 43,
+          state: 'OPEN',
+          isDraft: true,
+          url: 'https://github.com/JustinIanAI/loopx-workflow/pull/43',
+          headRefOid: specCommit,
+        }, null, 2) + '\n');
+
+        // Pre-seed the second-principal gate=1 comment with the golden (offline
+        // computed) SHA; after `approve contract` we assert the on-disk bytes and
+        // the registry-locked revision both equal that golden constant.
+        const expectedLockedSha = GOLDEN_LOCKED_CONTRACT_SHA256;
+        const gate1CommentBody = [
+          `<!-- loopx-flow:gate1-authorization:demo-slice@${expectedLockedSha} -->`,
+          `gate=1;mode=independent;contract_sha=${expectedLockedSha};spec_commit=${specCommit};approver=reviewer-bot`,
+        ].join('\n');
+        fs.writeFileSync(ws.ghCommentsFile, JSON.stringify([
+          { body: gate1CommentBody, user: { login: 'reviewer-bot' } },
+        ], null, 2));
+
+        const approveRes = runCli(ws, ['approve', 'contract', 'demo-slice']);
+        assertCondition(
+          approveRes.status === 0,
+          `approve contract failed (${approveRes.status}):\nSTDOUT:\n${approveRes.stdout}\nSTDERR:\n${approveRes.stderr}`
+        );
+
+        const lockedBytes = fs.readFileSync(contractPath, 'utf8');
+        assertCondition(
+          lockedBytes === GOLDEN_LOCKED_CONTRACT_TEXT,
+          'Locked 04-contract.md bytes differ from the golden fixture (independent Oracle mismatch)'
+        );
+        const postLockSha = sha256Buffer(fs.readFileSync(contractPath));
+        assertCondition(postLockSha === expectedLockedSha, `Locked SHA mismatch: ${postLockSha} !== ${expectedLockedSha}`);
+
+        const registryLockedRevision = extractFirstJson(fs.readFileSync(ws.registryPath, 'utf8').replace(/\s+/g, ' '));
+        assertCondition(Boolean(registryLockedRevision), 'Registry must be readable after approve contract');
+        const registryGoal = (registryLockedRevision.goals || []).find((g) => g.id === 'demo-slice-goal');
+        const registryRevision = registryGoal
+          && registryGoal.control_plane
+          && registryGoal.control_plane.progress_review
+          && registryGoal.control_plane.progress_review.contract_revision;
+        assertCondition(
+          registryRevision === expectedLockedSha,
+          `Registry locked contract_revision (${registryRevision}) must equal on-disk golden SHA (${expectedLockedSha})`
+        );
+
+        const verifyPass = runCli(ws, ['gate', 'verify', 'contract', 'demo-slice']);
+        assertCondition(verifyPass.status === 0, `gate verify contract failed (${verifyPass.status}): ${verifyPass.stderr}`);
+
+        // Tamper 1 line in 04-contract.md and confirm fail-closed tamper block
+        fs.appendFileSync(contractPath, '\n<!-- unauthorized post-freeze mutation -->\n');
+        const verifyTamper = runCli(ws, ['gate', 'verify', 'contract', 'demo-slice']);
+        assertCondition(verifyTamper.status !== 0, 'Tampered 04-contract.md must fail closed on gate verify contract');
+        assertCondition(
+          (verifyTamper.stderr + verifyTamper.stdout).includes('CONTRACT_TAMPERED'),
+          'Tampered contract rejection must report CONTRACT_TAMPERED'
+        );
+
+        const ghCallLines = fs.readFileSync(ws.ghCallsLog, 'utf8').trim().split('\n').filter(Boolean);
+        assertCondition(ghCallLines.length >= 3, 'Contract Fake gh must record cross-process argv calls');
+
+        steps.push({
+          id: 'cli-gate1-approve-and-tamper-detect',
+          surface: 'bin/loopx-flow approve contract + gate verify contract (lock & tamper detect)',
+          status: 'passed',
+          real_vs_mock: 'real+contract_fake',
+          observations: [
+            `locked bytes === golden fixture; registry contract_revision === on-disk SHA-256 ${expectedLockedSha.slice(0, 16)}... (exit=0)`,
+            'gate verify contract passed (exit=0) when intact and blocked with CONTRACT_TAMPERED (exit!=0) after 1-line edit',
+            `audited ${ghCallLines.length} cross-process gh CLI invocations`,
+          ],
+        });
     }
 
     // 5. cli-todo-managed-canary (Real LoopX 2.3.x CLI when available)
     {
-      const resolvedLoopx = resolveLoopxExecutable();
-      const realLoopxBin = resolvedLoopx && resolvedLoopx.ok ? resolvedLoopx.bin : "";
-      const verProbe = realLoopxBin
-        ? spawnSync(realLoopxBin, ['--version'], { encoding: 'utf8' })
-        : { status: 1, stdout: '', stderr: '' };
-      const versionOut = `${verProbe.stdout || ''}${verProbe.stderr || ''}`.trim();
-      const loopxReadiness = classifyLoopx23({
-        resolvedOk: Boolean(resolvedLoopx && resolvedLoopx.ok),
-        resolvedError: resolvedLoopx && resolvedLoopx.error ? resolvedLoopx.error : '',
-        probeStatus: verProbe.status,
-        versionOut,
-      });
 
       if (!loopxReadiness.ready) {
         steps.push({
