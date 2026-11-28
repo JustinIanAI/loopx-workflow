@@ -1112,6 +1112,32 @@ function fetchPrChecks(repo, prId) {
   }
 }
 
+// 模型偶尔会在 JSON 字符串里直接换行（长正文中途从 \n 转义切换成真实换行），
+// 严格解析会整块失败、被当成「缺少 review_body」白跑一轮。这里只在字符串内部
+// 转义裸控制字符，不改变任何可见文本；修复后仍须过 acceptModelOutput 与原生 check-result。
+function escapeRawControlCharsInStrings(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) { out += ch; escaped = false; continue; }
+      if (ch === '\\') { out += ch; escaped = true; continue; }
+      if (ch === '"') { out += ch; inString = false; continue; }
+      if (ch === '\n') { out += '\\n'; continue; }
+      if (ch === '\r') { out += '\\r'; continue; }
+      if (ch === '\t') { out += '\\t'; continue; }
+      if (ch < ' ') { out += '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'); continue; }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    out += ch;
+  }
+  return out;
+}
+
 function extractJson(text) {
   if (!text) return null;
   const fence = text.match(/```json\s*([\s\S]*?)```/);
@@ -1121,6 +1147,13 @@ function extractJson(text) {
   if (brace) candidates.push(brace[0]);
   for (const c of candidates) {
     try { return JSON.parse(c); } catch (_) { /* try next */ }
+  }
+  for (const c of candidates) {
+    try {
+      const parsed = JSON.parse(escapeRawControlCharsInStrings(c));
+      console.error('[i] 模型输出含裸控制字符，已在字符串内转义后解析成功（不改可见文本）。');
+      return parsed;
+    } catch (_) { /* try next */ }
   }
   return null;
 }
@@ -2897,6 +2930,7 @@ module.exports = {
   skippedClaimedDirs,
   claimTakeoverAudit,
   unbalancedHtmlComment,
+  escapeRawControlCharsInStrings,
   stateDirOwnerPid,
   pidIsAlive,
   pipelineLogPath,

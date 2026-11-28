@@ -1004,3 +1004,10 @@ test('HTML 注释守卫：未闭合的 <!-- 会让其后全文被判缺失，必
   assert.strictEqual(unbalancedHtmlComment('正文 <!-- loopx-flow:release-authorization:1@abc\n\n## 我的整体评价\n结论'), true);
   assert.strictEqual(unbalancedHtmlComment('正文 <!-- a --> 结尾'), false);
 });
+
+test('JSON 修复：字符串内的裸换行可被转义，可见文本不变', () => {
+  const { escapeRawControlCharsInStrings } = require('../../skills/code-review/scripts/authentic-review.js');
+  const broken = '{\n  "review_body": "第一行\n第二行\t制表"\n}';
+  const parsed = JSON.parse(escapeRawControlCharsInStrings(broken));
+  assert.strictEqual(parsed.review_body, '第一行\n第二行\t制表');
+});
