@@ -83,6 +83,22 @@ README 不再重复管线细则。`docs/guides/loopx-workflow-architecture.html`
 ./bin/loopx-flow issue 1024
 ```
 
+### 4. 配置本地预集成
+
+```bash
+# 默认预演；显式 --execute 才由原生 LoopX 落盘
+./bin/loopx-flow integrate configure \
+  --base-ref main --integration-branch integration/x --source-branch feat/x
+# 可选：--replace --execute --plan-file "plans/integration plan.json"
+```
+
+| 命令 | 行为 |
+| --- | --- |
+| `integrate configure --base-ref <ref> --integration-branch <ref> --source-branch <ref> [--replace] [--execute] [--plan-file <path>]` | 精确透传原生配置；仅显式传入可选项 |
+| `integrate [--execute\|--status]` | 既有 sync 预演 / 落盘 / 状态查询 |
+
+三个必填选项各一次；缺值、空白值、重复或未知参数 exit 2，且不调用 LoopX。原生失败保留诊断并 exit 1，成功 exit 0。沿用项目根与 registry 前置条件（附属 worktree 须显式指定有效 registry）。
+
 ---
 
 ## 📂 Feature 资产胶囊结构与审阅看板

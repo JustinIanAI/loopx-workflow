@@ -215,6 +215,8 @@ usage() {
                           --prepare 打印评论模板；--interactive 走 TTY 并写评论
   issue <issue_id>        GitHub Issue 缺陷智能分流 (LoopX issue-fix feasibility 因果路由: fix_pr | comment_only | triage_only)
   integrate [--execute|--status]  LoopX 集成分支本地预集成 (默认 preview 不落盘)
+  integrate configure --base-ref <ref> --integration-branch <ref> --source-branch <ref>
+                      [--replace] [--execute] [--plan-file <path>]  配置预集成 (默认 preview)
   context <feature>       生成当前特性的长程上下文胶囊，供开发者与 AI Agent 快速穿透审阅
   archive <feature>       原子归档已合入特性的资产包 (specs/features/ -> specs/archive/)
   gate verify <stage> <f> 阶段流转物理熔断守卫 (decisions | contract)
@@ -2900,7 +2902,67 @@ process.stdout.write(String(decision.rationale ?? ""));
     esac
 }
 
+cmd_integrate_configure() {
+    local seen="|" option value execute=false
+    local -a configure_args=()
+    while [[ $# -gt 0 ]]; do
+        option="$1"
+        case "$option" in
+            --base-ref|--integration-branch|--source-branch|--plan-file|--replace|--execute) ;;
+            *)
+                printf '[-] [FAIL-CLOSED] integrate configure 未知参数: %s\n' "$option" >&2
+                return 2
+                ;;
+        esac
+        if [[ "$seen" == *"|$option|"* ]]; then
+            printf '[-] [FAIL-CLOSED] integrate configure 参数重复: %s\n' "$option" >&2
+            return 2
+        fi
+        seen+="$option|"
+        case "$option" in
+            --replace|--execute)
+                configure_args+=("$option")
+                [[ "$option" != "--execute" ]] || execute=true
+                shift
+                ;;
+            *)
+                value="${2:-}"
+                if [[ $# -lt 2 || ! "$value" =~ [^[:space:]] || "$value" == --* ]]; then
+                    printf '[-] [FAIL-CLOSED] integrate configure %s 需要非空白值\n' "$option" >&2
+                    return 2
+                fi
+                configure_args+=("$option" "$value")
+                shift 2
+                ;;
+        esac
+    done
+    for option in --base-ref --integration-branch --source-branch; do
+        if [[ "$seen" != *"|$option|"* ]]; then
+            printf '[-] [FAIL-CLOSED] integrate configure 缺少必填参数: %s\n' "$option" >&2
+            return 2
+        fi
+    done
+    if ! command -v loopx >/dev/null 2>&1; then
+        echo "[-] [FAIL-CLOSED] 未检测到 loopx CLI，无法配置集成分支。" >&2
+        return 1
+    fi
+    if ! run_loopx integration-branch configure --repo-path "$PROJECT_ROOT" "${configure_args[@]}"; then
+        echo "[-] [FAIL-CLOSED] LoopX 集成分支配置失败，操作已阻断。" >&2
+        return 1
+    fi
+    if [[ "$execute" == true ]]; then
+        echo "[✓] 集成分支配置已落盘。"
+    else
+        echo "[✓] 集成分支配置预演完成；显式传入 --execute 才会落盘。"
+    fi
+}
+
 cmd_integrate() {
+    if [[ "${1:-}" == "configure" ]]; then
+        shift
+        cmd_integrate_configure "$@"
+        return $?
+    fi
     local mode="sync"
     local execute=false
     while [[ $# -gt 0 ]]; do
