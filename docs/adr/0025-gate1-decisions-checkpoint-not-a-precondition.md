@@ -23,10 +23,12 @@ echo "- **Status**: APPROVED BY HUMAN ($operator@$timestamp)" >> "$decision_file
 
 ## 决策
 
-1. **前置改为「决策文件存在且可审阅」**：活跃路径 `specs/features/<feature>/01-decisions.md`，或归档路径 `specs/archive/<feature>/01-decisions.md`。两者都不存在 → 仍 fail-closed（`[FAIL-CLOSED] 未找到 01-decisions.md`）。
+1. **前置改为「决策文件存在、可审阅、且未被否决」**：文件必须位于 `specs/features/<feature>/01-decisions.md`（契约文件已要求在 `specs/features/`，归档胶囊在更早处退出，故不再保留 `specs/archive` 分支）。状态判定是**白名单的反面**：`REJECTED` / `DEFERRED` / `SUPERSEDED` / `DECLINED` 一律 fail-closed，其余状态（`PROPOSED` / `DRAFT` / `APPROVED`）才继续走人工授权。
+   - 为什么必须带这一层：只判断「文件存在」会让本次批准**覆盖人类显式表达的否决**，并把 `APPROVED BY HUMAN` 的语义稀释成「文件在就有」。这是 #109 评审的 P1。
 2. **落款仍由 `approve` 在人工授权通过后写入**，写入时机、格式与内容一字不改。Gate1 的授权事实依旧是 `user_gate` 记录 + GitHub `gate=1` 评论 + 契约 SHA 锁定三件套，本 ADR 不改变其中任何一件。
 3. **删除 `gate1_decisions_approved` 死代码**：它只服务于被移除的前置，保留即为第二套判定口径。
-4. **失败即停语义不变**：任一步失败非 0，不得留批准标记。
+4. **失败即停语义不变**：任一步失败非 0，不得留批准标记。决策落款写失败同样是硬失败——否则会留下「契约已冻结、`user_gate` 已写、决策未落款」的半成品，下游 `gate verify decisions` 会判未批准。
+5. **`gate verify decisions` 的修复提示改为指向命令**（`loopx-flow approve contract <feature>`），不再教人手工写 `status: APPROVED`：手工落款绕过了 `gate=1` 评论与 `user_gate` 记录。
 
 ## 否决
 

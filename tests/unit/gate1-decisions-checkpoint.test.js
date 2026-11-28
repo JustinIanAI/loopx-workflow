@@ -79,6 +79,33 @@ test('PROPOSED 决策下 --prepare 能打印签名模板，且零写入', () => 
   } finally { h.cleanup(dir); }
 });
 
+// 收紧谓词（#109 评审 P1）：放行「文件存在」会把人类显式否决的 REJECTED 一起盖成 APPROVED。
+for (const state of ['REJECTED', 'DEFERRED']) {
+  test(`01-decisions 状态 ${state} → fail-closed，不覆盖人类否决`, () => {
+    const dir = h.makeSandbox(`gate1-decisions-${state.toLowerCase()}-`);
+    try {
+      const decisions = PROPOSED.replace('PROPOSED', state);
+      const capsule = h.writeCapsule(dir, FEATURE, { decisions });
+      h.writeConfig(dir, 'independent');
+      h.publishSpecPackage(dir, FEATURE);
+      approveLoopxMock(dir);
+      h.ghGate1Mock(dir, { feature: FEATURE, sha: h.lockedShaFile(capsule.contractPath) });
+
+      const r = h.run(dir, ['approve', 'contract', FEATURE]);
+      assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+      assert.match(r.stderr + r.stdout, /不得进入 Gate1 批准/);
+      assert.strictEqual(
+        fs.readFileSync(decisionsPath(dir), 'utf8'), decisions,
+        '否决/挂起状态不得被改写',
+      );
+      assert.doesNotMatch(
+        fs.readFileSync(capsule.contractPath, 'utf8'), /FROZEN & APPROVED/,
+        '否决状态下不得冻结契约',
+      );
+    } finally { h.cleanup(dir); }
+  });
+}
+
 test('决策文件缺失 → 仍然 fail-closed，不写批准标记', () => {
   const dir = h.makeSandbox('gate1-decisions-missing-');
   try {

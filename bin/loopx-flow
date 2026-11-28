@@ -1303,17 +1303,29 @@ cmd_approve() {
     mode="$(auth_mode)"
     [[ -n "$mode" ]] || { echo "[-] [FAIL-CLOSED] 无法读取 authorization_mode" >&2; exit 1; }
     # 01-decisions 的 APPROVED 落款由本命令在人工授权通过后写入（见下方 decision_file 段），
-    # 因此这里只能校验「决策文件存在且可审阅」。历史上这里要求文件已 APPROVED，等于把
-    # 本命令自己的输出当成前置条件：新胶囊（status: PROPOSED）永远无法进入 Gate1，
-    # 连 --prepare 都拿不到签名模板。Issue #75/#85 即卡死于此。
-    local decision_source=""
-    if [[ -f "$decision_file" ]]; then
-        decision_source="$decision_file"
-    elif [[ -f "$PROJECT_ROOT/specs/archive/$feature/01-decisions.md" ]]; then
-        decision_source="$PROJECT_ROOT/specs/archive/$feature/01-decisions.md"
-    fi
-    if [[ -z "$decision_source" ]]; then
+    # 因此这里只能校验「决策文件存在、可审阅、且未被否决」。历史上这里要求文件已 APPROVED，
+    # 等于把本命令自己的输出当成前置条件：新胶囊（status: PROPOSED）永远无法进入 Gate1，
+    # 连 --prepare 都拿不到签名模板。Issue #75/#85 即卡死于此（ADR-0025）。
+    #
+    # 注意：契约文件在第 1297 行已要求位于 specs/features/<feature>/，归档胶囊在此之前就会退出，
+    # 因此不再保留 specs/archive 分支（不可达代码，见 #109 评审）。
+    if [[ ! -f "$decision_file" ]]; then
         echo "[-] [FAIL-CLOSED] 未找到 01-decisions.md: $decision_file" >&2; exit 1
+    fi
+    local decision_source="$decision_file"
+    # 显式否决/挂起必须阻断：放行会让本次批准覆盖人类已表达的 REJECTED。
+    local decision_status=""
+    decision_status="$(grep -i -m1 -E '^[[:space:]]*[-*]?[[:space:]]*\*\*Status\*\*[[:space:]]*[:：]' "$decision_source" 2>/dev/null \
+        | sed -E 's/.*\*\*Status\*\*[[:space:]]*[:：][[:space:]]*//' | tr -d '\r' | sed -E 's/[[:space:]]+$//')"
+    if [[ -n "$decision_status" ]]; then
+        local decision_state
+        decision_state="$(printf '%s' "$decision_status" | tr '[:lower:]' '[:upper:]')"
+        case "$decision_state" in
+            REJECTED*|DEFERRED*|SUPERSEDED*|DECLINED*)
+                echo "[-] [FAIL-CLOSED] 01-decisions 状态为「${decision_status}」，不得进入 Gate1 批准: ${decision_source}" >&2
+                echo "    修复指令: 显式否决/挂起必须先由人类改回 PROPOSED 并写明原因，再重跑 approve（ADR-0025）。" >&2
+                exit 1 ;;
+        esac
     fi
     if ! gate1_spec_complete "$feature"; then
         echo "[-] [FAIL-CLOSED] 规格不完整: 04-contract 需含 AC/Scope/Verification Plan/依赖顺序/REQ或ADR，且每个 story id 在 AC 矩阵中有一行" >&2; exit 1
@@ -1484,12 +1496,18 @@ fs.writeFileSync(dst, text);
     wf_unregister_temp_file "$temp_contract"
 
     if [[ -f "$decision_file" ]]; then
-        node -e '
+        # 落款写失败必须停下：否则会出现「契约已冻结、user_gate 已写、决策未落款」的半成品，
+        # gate verify decisions 会把它当未批准（见 #109 评审）。
+        if ! node -e '
 const fs=require("fs");const file=process.argv[1],op=process.argv[2],ts=process.argv[3];
 let text=fs.readFileSync(file,"utf8");const line="- **Status**: APPROVED BY HUMAN ("+op+"@"+ts+")";
 if (/^- \*\*Status\*\*: .*$/m.test(text)) text=text.replace(/^- \*\*Status\*\*: .*$/m,line); else text=line+"\n"+text;
 fs.writeFileSync(file,text);
-' "$decision_file" "$principal" "$timestamp"
+' "$decision_file" "$principal" "$timestamp"; then
+            echo "[-] [FAIL-CLOSED] 契约与 user_gate 已写入，但决策落款写失败（${decision_file}）。" >&2
+            echo "    恢复: 修好该文件权限/路径后重跑 loopx-flow approve contract <feature>（幂等）。" >&2
+            exit 1
+        fi
     fi
     if [[ -f "$index_file" ]]; then
         node -e '
@@ -2608,7 +2626,7 @@ cmd_gate() {
             fi
             if ! grep -Eq '^(status:[[:space:]]*APPROVED([[:space:]]|$)|[-*][[:space:]]*\*\*(Status|方案状态)\*\*(:|：).*APPROVED)' "$decision_file"; then
                 echo -e "${RED}[-] [GATE FAIL] 阶段 1 架构决策未标记 APPROVED: $decision_file${NC}" >&2
-                echo -e "💡 修复指令: 由人类决策者在 decisions frontmatter 落款 'status: APPROVED'（或 '- **Status**: APPROVED'）。" >&2
+                echo -e "💡 修复指令: 先完成 Gate1 人工授权，再执行 loopx-flow approve contract <feature> 由命令落款；不得手工改写 'status: APPROVED'（ADR-0025）。" >&2
                 exit 1
             fi
             echo -e "${GREEN}[✓] [GATE PASS] 阶段 1 架构决策签名通过: $decision_file${NC}"
