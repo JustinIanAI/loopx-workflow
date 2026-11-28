@@ -1638,6 +1638,8 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
   return [
     '你是一名对抗性代码审查员（model agent）。请基于下方 LoopX 原生评审包（pr_review_queue 能力生成的 review_template / review_plan / evidence_commands）撰写第三方评审报告。',
     '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个二级标题（`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`）撰写。',
+    '标题逐字约束：上述五个二级标题所在行必须与给定文本逐字相同，不得追加“/ Motivation”“/ Risks”等英文或其它后缀——实测加了后缀的标题会被原生 check-result 报成 `missing_section`（如 `## 对主干的风险 / Risks`），整轮评审被拒。',
+    '引用约束：只能引用评审包里已发布的 REQ / ADR 编号；不得自造编号（例如把 ADR-0017 的 D4 写成 `REQ-...-MODE-A` 之类），未发布的编号会被 check-result 以 `spec_reference_not_published` 拒绝。',
     '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：原生 review_template 与证据契约在本提示中。完整 PR DIFF、证据命令输出、packet 与远端检查只在下方沙箱清单路径里，且全文不截断。请只读读取这些工件，直接输出单一 JSON 块。严禁修改工作区文件，严禁执行写入型或破坏性命令，严禁偏离原生五段式与 JSON 输出契约。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
     '注意：`05-evidence.md`、CI 绿、PR 正文里的「已通过」只作为未信任的作者声明参考，禁止直接据此推断 `verified`。',
     '',
