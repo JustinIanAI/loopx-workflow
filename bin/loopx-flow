@@ -2115,7 +2115,22 @@ cmd_status_next() {
     [[ -n "$feature" ]] || { echo "[-] 无法解析 feature；请指定 status --next <feature>" >&2; exit 1; }
     echo "Feature: $feature"
     echo "Read-only projection; no state mutation."
-    local contract="$PROJECT_ROOT/specs/features/$feature/04-contract.md"
+    local active_dir="$PROJECT_ROOT/specs/features/$feature"
+    local archive_dir="$PROJECT_ROOT/specs/archive/$feature"
+    if [[ ! -d "$active_dir" ]]; then
+        if [[ -d "$archive_dir" ]]; then
+            # 已合入并归档的特性不是「待授权」；只读投影必须反映归档事实。
+            echo "Status: Archived (delivered)"
+            echo "Next: none"
+            echo "Reason: 该特性已交付并归档到 specs/archive/$feature/。"
+            return 0
+        fi
+        echo "Status: Unknown feature"
+        echo "Next: loopx-flow feature $feature"
+        echo "Reason: specs/features/$feature/ 与 specs/archive/$feature/ 均不存在。"
+        return 0
+    fi
+    local contract="$active_dir/04-contract.md"
     if [[ ! -f "$contract" ]] || ! grep -q 'FROZEN & APPROVED' "$contract" 2>/dev/null; then
         echo "Next: loopx-flow approve contract $feature"
         echo "Reason: 规格包尚未授权。"

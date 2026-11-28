@@ -366,7 +366,7 @@ function readPartialStageOutput(run) {
  * 返回：{ ok:true, stdout, resumed|salvaged, attempt, elapsed_ms }
  *   或 { ok:false, error_class, error, unavailable|stdinRejected|truncated?, attempts }
  */
-function runStageWithState(options) {
+async function runStageWithState(options) {
   const {
     repoRoot,
     pr,
@@ -471,11 +471,18 @@ function runStageWithState(options) {
     const hb = startStageHeartbeat(repoRoot, pr, stage, attempt, startedMs, heartbeatIntervalMs);
     let run;
     try {
-      run = execStage(agentBin, prompt, timeoutMs, runDir, diffText, selection);
+      const maybePromise = execStage(agentBin, prompt, timeoutMs, runDir, diffText, selection);
+      run = maybePromise && typeof maybePromise.then === 'function' ? await maybePromise : maybePromise;
     } finally {
       stopStageHeartbeat(hb);
     }
     const elapsed = Date.now() - startedMs;
+    if (Number(heartbeatIntervalMs) > 0 && elapsed >= Number(heartbeatIntervalMs)) {
+      // wait-out 证据：慢推理在既有预算内被等待完成（或按预算终止），
+      // 同窗口内心跳行可证明等待期间调用方事件循环未被阻塞。
+      appendPipelineLog(repoRoot, pr,
+        `stage=${stage} attempt=${attempt} event=wait_out elapsed_ms=${elapsed} heartbeat_interval_ms=${heartbeatIntervalMs} timeout_ms=${budgetMs} outcome=${(run && (run.error || run.timed_out)) ? 'failed' : 'ok'}`);
+    }
 
     if (run.unavailable) {
       const detail = `${agentBin} CLI unavailable on PATH`;
@@ -553,7 +560,7 @@ function runStageWithState(options) {
     });
     appendPipelineLog(repoRoot, pr,
       `stage=${stage} attempt=${attempt} event=retry trigger=${errorClass} before_status=failed after_status=retrying next_attempt=${attempt + 1} backoff_ms=${backoff} elapsed_ms=${elapsed}`);
-    if (backoff > 0) sleepSync(backoff);
+    if (backoff > 0) await new Promise((resolve) => setTimeout(resolve, backoff));
   }
 
   return {
@@ -995,6 +1002,15 @@ function gates(opts = {}) {
   }
   if (!opts.noCache) GATES_CACHE = out;
   return out;
+}
+
+// P0（G2 锚定纠偏）：仅当本地 HEAD 与审查目标精确 headRefOid 一致时才允许本地四门禁实测；
+// 否则跳过本地实测（保留远端 CI 证据），validation 行保持 unverified（宁缺毋假）。
+function localGateAnchor(repoRoot, headOid) {
+  const r = sh('git', ['-C', repoRoot, 'rev-parse', 'HEAD']);
+  const localHead = r.status === 0 ? String(r.stdout || '').trim() : '';
+  const target = String(headOid || '').trim();
+  return { match: Boolean(localHead && target && localHead === target), localHead, headOid: target };
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,7 +1547,7 @@ function buildStage2Prompt({ pr, headOid, branch, baseRef, reviewBody, diff, mis
   ].join('\n');
 }
 
-function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, selection) {
+async function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, selection) {
   const resolvedBin = findOnPath(agentBin, process.env.PATH);
   if (!resolvedBin) return { unavailable: true };
   const compact = assertCompactStdin(prompt);
@@ -1559,47 +1575,145 @@ function runReviewAgent(agentBin, prompt, timeoutMs, runDir, diffText, selection
   } catch (err) {
     return { error: err && err.message ? err.message : String(err) };
   }
+  const budget = timeoutMs || BUDGET_MS;
+  let child = null;
+  let timeoutId = null;
+  let timedOutFlag = false;
   try {
-    const r = spawnSync(resolvedBin, args, {
-      input: String(prompt || ''),
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      maxBuffer: 64 * 1024 * 1024,
-      timeout: timeoutMs || BUDGET_MS,
+    const result = await new Promise((resolve, reject) => {
+      let stdoutAcc = '';
+      let stderrAcc = '';
+      // 与改造前 spawnSync 的 maxBuffer 语义对齐：stdout/stderr 分别计数，
+      // 超过 64MB 即视为输出溢出（ENOBUFS），不得当作成功。
+      const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let overflow = false;
+      try {
+        child = spawn(resolvedBin, args, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      } catch (e) {
+        resolve({
+          __spawn_error: true,
+          error: e && e.message ? e.message : String(e),
+        });
+        return;
+      }
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        stdoutBytes += Buffer.byteLength(chunk);
+        if (stdoutBytes > MAX_OUTPUT_BYTES) { overflow = true; try { child.kill('SIGTERM'); } catch (_) { /* ignore */ } return; }
+        stdoutAcc += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderrBytes += Buffer.byteLength(chunk);
+        if (stderrBytes > MAX_OUTPUT_BYTES) { overflow = true; try { child.kill('SIGTERM'); } catch (_) { /* ignore */ } return; }
+        stderrAcc += chunk;
+      });
+      // 单次收口：'error' 与 'close' 可能都触发，只有第一次 resolve 生效。
+      let settled = false;
+      const settle = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
+        resolve(value);
+      };
+      let spawnError = null;
+      child.on('error', (err) => {
+        spawnError = err;
+        // 进程根本没拉起时不会再有携带真实退出码的 close，按 spawn 失败收口。
+        if (!child.pid) {
+          settle({ __spawn_error: true, error: err && err.message ? err.message : String(err) });
+        }
+      });
+      child.on('close', (code, signal) => {
+        settle({
+          status: code,
+          signal: signal || null,
+          stdout: stdoutAcc,
+          stderr: stderrAcc,
+          timedOut: timedOutFlag,
+          overflow,
+          spawnError: spawnError ? (spawnError.message || String(spawnError)) : null,
+        });
+      });
+      // 子进程可能不读 stdin 就退出：EPIPE 不得升级为未捕获异常（Linux CI 实测）。
+      child.stdin.on('error', () => { /* ignore */ });
+      if (prompt != null) {
+        try { child.stdin.write(String(prompt)); } catch (_) { /* ignore */ }
+      }
+      try { child.stdin.end(); } catch (_) { /* ignore */ }
+
+      if (budget > 0) {
+        timeoutId = setTimeout(() => {
+          timedOutFlag = true;
+          try { child.kill('SIGTERM'); } catch (_) { /* ignore */ }
+          // Give grace then SIGKILL (best-effort)
+          setTimeout(() => {
+            try { child.kill('SIGKILL'); } catch (_) { /* ignore */ }
+          }, 5000);
+        }, budget);
+      }
     });
-    const rawStdout = r.stdout || '';
+
+    if (result.__spawn_error) {
+      return { error: result.error };
+    }
+
+    // If timed out, set ETIMEDOUT compatible fields for upstream classifyStageFailure
+    if (result.timedOut) {
+      const rawStdout = result.stdout || '';
+      const msgOut = (tmpMsg && fs.existsSync(tmpMsg)) ? fs.readFileSync(tmpMsg, 'utf8') : '';
+      const stderr = result.stderr || '';
+      const modelChannel = String(msgOut).trim() ? msgOut : rawStdout;
+      return {
+        error: `exit ${result.status}: ${(stderr || rawStdout || msgOut || '').slice(0, 300)}`,
+        stdout: modelChannel,
+        stderr,
+        rawStdout,
+        status: result.status,
+        signal: result.signal || 'SIGTERM',
+        error_code: 'ETIMEDOUT',
+        timed_out: true,
+        timeout_ms: budget,
+        tmp_msg: tmpMsg || null,
+      };
+    }
+
+    const rawStdout = result.stdout || '';
     const msgOut = (tmpMsg && fs.existsSync(tmpMsg)) ? fs.readFileSync(tmpMsg, 'utf8') : '';
-    const stderr = r.stderr || '';
+    const stderr = result.stderr || '';
     const modelChannel = String(msgOut).trim() ? msgOut : rawStdout;
     const codex = !String(agentBin).includes('claude');
-    const modelReady = r.status === 0 && String(modelChannel).trim().length > 0;
+    const modelReady = result.status === 0 && String(modelChannel).trim().length > 0;
     const truncParts = [modelChannel];
     if (rawStdout && rawStdout !== modelChannel) truncParts.push(rawStdout);
     if (!(codex && modelReady)) truncParts.push(stderr);
     if (novelHostTruncation(diffText, ...truncParts)) {
       return { truncated: true, stdout: modelChannel, stderr, rawStdout, error: 'host truncation marker in model output' };
     }
-    if (r.status !== 0) {
-      const diag = String(stderr || rawStdout || msgOut || '');
-      // 超时判定：spawnSync 被杀时 status=null + signal=SIGTERM + error.code=ETIMEDOUT，
-      // 上层据此给出 `ETIMEDOUT after Nms` 而不是误导性的 `exit null`（原始 `error` 字段保留兼容）。
-      const errorCode = r.error && r.error.code ? String(r.error.code) : null;
-      const timedOut = errorCode === 'ETIMEDOUT' || Boolean(r.error && /ETIMEDOUT/i.test(String(r.error.message || '')));
+    if (result.status !== 0 || result.overflow || result.spawnError) {
+      const diag = result.overflow
+        ? `${String(stderr || rawStdout || msgOut || '').slice(0, 120)} (maxBuffer exceeded 64MB)`
+        : String(stderr || rawStdout || msgOut || result.spawnError || '');
       return {
-        error: `exit ${r.status}: ${diag.slice(0, 300)}`,
+        error: `exit ${result.status}: ${diag.slice(0, 300)}`,
         stdout: modelChannel,
         stderr,
         rawStdout,
-        status: r.status,
-        signal: r.signal || null,
-        error_code: errorCode,
-        timed_out: timedOut,
-        timeout_ms: timeoutMs || BUDGET_MS,
+        status: result.status,
+        signal: result.signal || null,
+        error_code: result.overflow ? 'ENOBUFS' : null,
+        timed_out: false,
+        timeout_ms: budget,
         tmp_msg: tmpMsg || null,
       };
     }
     return { stdout: modelChannel, stderr, rawStdout };
   } finally {
+    if (timeoutId) { try { clearTimeout(timeoutId); } catch (_) {} }
     if (tmpMsg && !runDir) {
       try { fs.rmSync(tmpMsg, { force: true }); } catch (_) {}
     }
@@ -1877,7 +1991,7 @@ function acceptModelOutput(raw) {
 // ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
-function main() {
+async function main() {
   const o = parseArgs(process.argv);
   if (o.help) {
     console.log(REVIEW_CLI_HELP);
@@ -2071,7 +2185,18 @@ function main() {
   });
   let validation = [];
   if (process.env.REVIEW_EVIDENCE_VALIDATION !== '0') {
-    try { validation = buildValidationMatrix(gates(), { headOid, remoteChecks }); } catch (e) { validation = []; }
+    try {
+      const anchor = localGateAnchor(repoRoot, headOid);
+      if (anchor.match) {
+        validation = buildValidationMatrix(gates(), { headOid, remoteChecks });
+      } else {
+        console.warn(`[WARN] 本地 HEAD (${anchor.localHead || 'unknown'}) != 审查目标 headRefOid (${anchor.headOid || 'unknown'})；跳过本地四门禁实测，仅保留远端 CI 证据，本地门禁行标 unverified（宁缺毋假）。`);
+        validation = buildValidationMatrix({}, { headOid, remoteChecks });
+      }
+    } catch (e) {
+      console.warn(`[WARN] 四门禁实测/validation 构建失败：${e && e.message ? e.message : e}；validation 行标 unverified。`);
+      validation = [];
+    }
   }
 
   // --- 3. 构建提示词：原生 review_template（透传，不重写）---
@@ -2099,7 +2224,7 @@ function main() {
   const primaryAgent = o.agentBin || process.env.REVIEW_AGENT_BIN || 'codex';
   const stage1PromptFile = writePromptArtifact(runDir, o.pr, headOid, prompt, 'stage1');
   console.log(`[i] 阶段 1 评审提示词已写入沙箱文件: ${stage1PromptFile} (通过 stdin 流式传入 ${primaryAgent})`);
-  const stage1Run = runStageWithState({
+  const stage1Run = await runStageWithState({
     repoRoot,
     pr: o.pr,
     stage: 'stage1',
@@ -2173,6 +2298,7 @@ function main() {
     plan: pkt.reviewPlan || {},
     diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
     modelEvidence: mergedModelEvidence,
+    repoRoot,
   });
 
   // ADR-0013 阶段 2（两阶段解耦）：当模型阶段 1 主观 verdict=APPROVE 但仍有未对齐的判断类证据行时，
@@ -2207,7 +2333,7 @@ function main() {
     });
     const stage2PromptFile = writePromptArtifact(runDir, o.pr, headOid, stage2Prompt, 'stage2');
     console.log(`[i] 阶段 2 证据对齐 (${unverifiedForStage2.length + unverifiedValidationCases.length} 项): ${stage2PromptFile}`);
-    const stage2Run = runStageWithState({
+    const stage2Run = await runStageWithState({
       repoRoot,
       pr: o.pr,
       stage: 'stage2',
@@ -2255,6 +2381,7 @@ function main() {
           plan: pkt.reviewPlan || {},
           diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
           modelEvidence: mergedModelEvidence,
+          repoRoot,
         });
       }
     }
@@ -2293,7 +2420,7 @@ function main() {
   if (o.crossValidate) {
     const secondaryAgent = primaryAgent.includes('claude') ? 'codex' : 'claude';
     console.log(`==> [S5] Cross-validating with ${secondaryAgent} (default model)...`);
-    const cv = runStageWithState({
+    const cv = await runStageWithState({
       repoRoot,
       pr: o.pr,
       stage: 'cross-validate',
@@ -2473,4 +2600,5 @@ module.exports = {
   formatStageError,
   STAGE_STATE_SCHEMA,
   MAX_STAGE_ATTEMPTS,
+  localGateAnchor,
 };
