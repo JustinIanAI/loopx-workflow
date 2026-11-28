@@ -206,7 +206,8 @@ usage() {
                           执行四大硬门禁与代码审查，生成并校验 LoopX change-quality 严格收据
                           （fix/issue-<id> 分支自动绑定 issue-<id>-goal；Issue 路径不写 05-evidence）
   pr <action> [feature]   按 PR #7545 官方标准从胶囊生成 4-Part 描述并提交/预览/更新 PR (create|preview|update|ready)
-                          pr create --issue <id> 用 Issue 正文生成 body 并写 loopx-meta / loopx-impact 标记
+                          pr create|update --issue <id> 用 Issue 正文生成 body 并写 loopx-meta / loopx-impact 标记
+                          pr update <pr> [--title <t>] 同时修正标题，避免标题宣称未交付范围
   review <pr_id> [--model <id>] [--reasoning-effort <level>]
                           执行 L2 交付审查并顶置 LoopX 原生五段式评审报告（复用 pr-review review_template）
                           可选透传模型与推理强度（CLI > REVIEW_MODEL / REVIEW_REASONING_EFFORT > runtime 默认）。
@@ -2081,6 +2082,10 @@ HELPTXT
 
             if [[ -n "$issue_id" ]]; then
                 # Issue 修复模式：不要求 Feature 胶囊，PR body 从 Issue 正文生成并写入机器标记。
+                if [[ ! "$issue_id" =~ ^[0-9]+$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法 --issue ${issue_id}（只接受数字编号）${NC}" >&2
+                    exit 1
+                fi
                 [[ -n "$goal_id" ]] || goal_id="issue-${issue_id}-goal"
                 [[ -n "$impact" ]] || impact="R1"
                 if [[ ! "$impact" =~ ^R[012]$ ]]; then
@@ -2191,7 +2196,7 @@ fs.writeFileSync(file, JSON.stringify({
             fi
             ;;
         update)
-            local upd_issue="" upd_goal="" upd_impact="" upd_contract="none"
+            local upd_issue="" upd_goal="" upd_impact="" upd_contract="none" upd_title=""
             local -a upd_adrs=()
             while [[ $# -gt 0 ]]; do
                 case "$1" in
@@ -2210,6 +2215,9 @@ fs.writeFileSync(file, JSON.stringify({
                     --adr)
                         [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --adr 需要取值 docs/adr/*.md${NC}" >&2; exit 1; }
                         upd_adrs+=("$2"); shift 2 ;;
+                    --title)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --title 需要取值${NC}" >&2; exit 1; }
+                        upd_title="$2"; shift 2 ;;
                     -*)
                         echo -e "${RED}[-] 错误: 未知参数 $1${NC}" >&2; exit 1 ;;
                     *)
@@ -2238,10 +2246,22 @@ fs.writeFileSync(file, JSON.stringify({
 
             local pr_body
             if [[ -n "$upd_issue" ]]; then
+                if [[ ! "$upd_issue" =~ ^[0-9]+$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法 --issue ${upd_issue}（只接受数字编号）${NC}" >&2
+                    exit 1
+                fi
                 [[ -n "$upd_goal" ]] || upd_goal="issue-${upd_issue}-goal"
                 [[ -n "$upd_impact" ]] || upd_impact="R1"
                 if [[ ! "$upd_impact" =~ ^R[012]$ ]]; then
                     echo -e "${RED}[-] [FAIL-CLOSED] 非法影响分级 --impact ${upd_impact}（只接受 R0|R1|R2）${NC}" >&2
+                    exit 1
+                fi
+                if [[ ! "$upd_contract" =~ ^(none|changed)$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法 --contract-impact ${upd_contract}（只接受 none|changed）${NC}" >&2
+                    exit 1
+                fi
+                if [[ "$upd_contract" == "changed" && ${#upd_adrs[@]} -eq 0 ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] --contract-impact changed 必须用 --adr 指明至少一份 ADR（merge 会核验其在 PR head 上为 Accepted）。${NC}" >&2
                     exit 1
                 fi
                 wf_run_dir pr-update
@@ -2272,7 +2292,9 @@ fs.writeFileSync(file, JSON.stringify({
             fi
 
             echo -e "${BLUE}==> [PR 更新] 正在更新 PR #${pr_id} 描述 (对齐 PR #7545 双语 4-Part 体系)...${NC}"
-            if printf '%s' "$pr_body" | gh pr edit "$pr_id" --body-file -; then
+            local -a edit_args=(--body-file -)
+            if [[ -n "$upd_title" ]]; then edit_args+=(--title "$upd_title"); fi
+            if printf '%s' "$pr_body" | gh pr edit "$pr_id" "${edit_args[@]}"; then
                 echo -e "${GREEN}[✓] PR #${pr_id} 描述已成功更新！${NC}"
             else
                 echo -e "${RED}[-] PR 更新失败。${NC}" >&2
@@ -2351,6 +2373,11 @@ cmd_release_approve() {
         echo "[WARN] Issue Goal / 非 feature PR 不绑定 Feature 契约：Gate2 评论 contract_sha=none。" >&2
     fi
 
+    # 本 PR 自己新增/修改的 ADR：Gate2 评论里必须带 Owner 的 `adr-accepted:` 行，
+    # 否则 merge 的 ADR 自证防护会阻断（作者不能给自己的 ADR 写 Accepted 就算数）。
+    local adr_accept_lines=""
+    adr_accept_lines="$(release_adr_accept_lines "$pr_id" 2>/dev/null || true)"
+
     # ADR-0019：--prepare 只打印 GitHub 签名评论模板，零写入。
     if [[ "$prepare" == "true" ]]; then
         echo "[i] Gate2 准备完成（未写入任何授权评论）"
@@ -2358,11 +2385,17 @@ cmd_release_approve() {
         echo "    head         : $head_oid"
         echo "    contract_sha : $contract_sha"
         echo "    principal    : $accepted_by"
+        if [[ -n "$adr_accept_lines" ]]; then
+            echo "    adr          : $(printf '%s' "$adr_accept_lines" | sed 's/^adr-accepted: //' | paste -sd, - 2>/dev/null || true)"
+        fi
         echo ""
         echo "请在 PR #${pr_id} 上以 ${accepted_by} 身份粘贴以下评论，然后重跑 loopx-flow merge ${pr_id}："
         echo ""
         echo "<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->"
         echo "gate=2;mode=single_owner;head=$head_oid;contract_sha=$contract_sha;principal=$accepted_by;risk_acceptance=$(auth_accepted_by)@$(auth_accepted_at)"
+        if [[ -n "$adr_accept_lines" ]]; then
+            printf '%s\n' "$adr_accept_lines"
+        fi
         exit 0
     fi
 
@@ -2397,6 +2430,10 @@ cmd_release_approve() {
     local body
     body="<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->
 gate=2;mode=single_owner;head=$head_oid;contract_sha=$contract_sha;principal=$principal;approved_at=$timestamp;risk_acceptance=$(auth_accepted_by)@$(auth_accepted_at)"
+    if [[ -n "$adr_accept_lines" ]]; then
+        body="${body}
+${adr_accept_lines}"
+    fi
     if ! gh pr comment "$pr_id" --body "$body" >/dev/null 2>&1; then
         echo "[-] [FAIL-CLOSED] 写入 release-authorization 评论失败" >&2
         exit 1
@@ -2467,10 +2504,24 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
   try { p = JSON.parse(raw); } catch (e) { console.log("INVALID"); return; }
   const body = String(p.body || "");
   const files = new Set(Array.isArray(p.files) ? p.files.map((f) => String((f && f.path) || f)) : []);
-  const tag = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/.exec(body);
-  if (!tag) { console.log("MISSING"); return; }
-  let marker = {};
-  try { marker = JSON.parse(tag[1]); } catch (e) { console.log("INVALID"); return; }
+  // PR body 里可能同时有 Issue 正文自带的标记和 pr create/update 生成的那一条。
+  // 先按本分支 Issue 编号匹配，再兜底取最后一条（生成标记永远追加在正文末尾）。
+  const re = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/g;
+  const found = [];
+  let hit;
+  while ((hit = re.exec(body)) !== null) {
+    try { found.push(JSON.parse(hit[1])); } catch (e) { found.push(null); }
+  }
+  if (!found.length) { console.log("MISSING"); return; }
+  let marker = null;
+  for (let i = found.length - 1; i >= 0; i -= 1) {
+    if (found[i] && String(found[i].issue || "") === issueId) { marker = found[i]; break; }
+  }
+  if (!marker) {
+    marker = found[found.length - 1];
+    if (!marker) { console.log("INVALID"); return; }
+    if (marker.issue !== undefined && String(marker.issue) !== issueId) { console.log("ISSUE_MISMATCH " + marker.issue); return; }
+  }
   const level = String(marker.level || "").toUpperCase();
   if (!/^R[012]$/.test(level)) { console.log("INVALID"); return; }
   if (level === "R0") {
@@ -2488,7 +2539,9 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
     if (contract === "changed") {
       const adrs = Array.isArray(marker.adrs) ? marker.adrs.map(String) : [];
       if (!adrs.length) { console.log("ADR_MISSING"); return; }
-      console.log("ADR_CHECK " + adrs.join(","));
+      // 本 PR 自己新增/修改的 ADR 不能靠作者自写「Accepted」自证，必须另有 Owner 授权。
+      const inDiff = adrs.filter((a) => files.has(a));
+      console.log("ADR_CHECK " + adrs.join(",") + "|" + inDiff.join(","));
       return;
     }
     if (contract !== "none") { console.log("INVALID"); return; }
@@ -2531,6 +2584,8 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
                 return 1
             fi
             list="${verdict#ADR_CHECK }"
+            local changed_adrs="${list#*|}"
+            list="${list%%|*}"
             IFS=',' read -r -a adrs <<< "$list"
             for adr in "${adrs[@]}"; do
                 content="$(gh api "repos/$repo/contents/$adr?ref=$head_oid" -H "Accept: application/vnd.github.raw" 2>/dev/null || true)"
@@ -2539,9 +2594,43 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
                     echo -e "${RED}[-] [FAIL-CLOSED] impact:R2 要求 $adr 在 PR head 上为 Accepted。${NC}" >&2
                     return 1
                 fi
+                # 自证防护：本 PR 自己写的 Accepted 不构成授权证据（作者可以给自己盖章）。
+                # 变更的 ADR 必须另有 accepted_by 在 PR 上的授权评论，且该评论绑定当前 head。
+                if [[ ",$changed_adrs," == *",$adr,"* ]]; then
+                    local accepted_by comments_json
+                    accepted_by="$(auth_accepted_by 2>/dev/null || true)"
+                    if [[ -z "$accepted_by" ]]; then
+                        echo -e "${RED}[-] [FAIL-CLOSED] 本 PR 变更了 $adr，但配置缺少 accepted_by，无法核验 ADR 接受授权。${NC}" >&2
+                        return 1
+                    fi
+                    comments_json="$(gh api "repos/$repo/issues/$pr_id/comments" --paginate 2>/dev/null || true)"
+                    if ! printf '%s' "$comments_json" | node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  const [login, adr, head] = process.argv.slice(1);
+  let rows;
+  try { rows = JSON.parse(raw.replace(/\]\s*\[/g, ",")); } catch (e) { process.exit(1); }
+  if (!Array.isArray(rows)) process.exit(1);
+  const ok = rows.some((r) => String((r.user || {}).login || "") === login
+    && String(r.body || "").includes("adr-accepted: " + adr)
+    && String(r.body || "").includes("head=" + head));
+  process.exit(ok ? 0 : 1);
+});
+' "$accepted_by" "$adr" "$head_oid"; then
+                        echo -e "${RED}[-] [FAIL-CLOSED] $adr 由本 PR 新增/修改，作者自写 Accepted 不能自证。${NC}" >&2
+                        echo -e "    需要 ${accepted_by} 在 PR #$pr_id 上发布含 \`adr-accepted: $adr\` 与 \`head=$head_oid\` 的授权评论（\`release-approve $pr_id --prepare\` 会自动带上该行）。${NC}" >&2
+                        return 1
+                    fi
+                fi
             done
             echo -e "    ${GREEN}[✓] impact:R2 契约变更 ADR 已在 PR head 接受${NC}"
+            if [[ -n "$changed_adrs" ]]; then
+                echo -e "    ${GREEN}[✓] 本 PR 变更的 ADR 有 accepted_by 授权评论绑定 head $head_oid${NC}"
+            fi
             return 0 ;;
+        ISSUE_MISMATCH*)
+            echo -e "${RED}[-] [FAIL-CLOSED] PR body 的 loopx-impact 标记属于 Issue #${verdict#ISSUE_MISMATCH }，与分支 issue #$issue_id 不一致。${NC}" >&2
+            return 1 ;;
         MISSING)
             echo -e "    ${YELLOW}[WARN] PR body 缺少 loopx-impact 标记；按 impact:R1 处理，并核验默认复现测试。${NC}"
             if ! gh pr view "$pr_id" --json files --jq '.files[].path' 2>/dev/null | grep -Fxq "tests/unit/issues/issue-$issue_id.test.js"; then
@@ -2553,6 +2642,30 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
             echo -e "${RED}[-] [FAIL-CLOSED] impact 核验输出无法识别: ${verdict}${NC}" >&2
             return 1 ;;
     esac
+}
+
+# Gate2 授权评论需要携带的 ADR 接受行：只针对本 PR 自己新增/修改的 ADR（自证防护）。
+# 输出每行 `adr-accepted: <path>`；未声明 contract_impact=changed 时输出为空。
+release_adr_accept_lines() {
+    local pr_id="$1" payload
+    payload="$(gh pr view "$pr_id" --json body,files --jq '{body: (.body // ""), files: [(.files // [])[].path]}' 2>/dev/null || true)"
+    [[ -n "$payload" ]] || return 0
+    node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  let p = {};
+  try { p = JSON.parse(raw); } catch (e) { return; }
+  const files = new Set(Array.isArray(p.files) ? p.files.map((f) => String((f && f.path) || f)) : []);
+  const re = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/g;
+  let m, marker = null;
+  while ((m = re.exec(String(p.body || ""))) !== null) {
+    try { marker = JSON.parse(m[1]); } catch (e) { /* 忽略非法标记，交给 merge 侧 fail-closed */ }
+  }
+  if (!marker || String(marker.contract_impact || "none") !== "changed") return;
+  const adrs = Array.isArray(marker.adrs) ? marker.adrs.map(String) : [];
+  for (const a of adrs) if (files.has(a)) console.log("adr-accepted: " + a);
+});
+' <<< "$payload"
 }
 
 cmd_merge() {
@@ -2770,10 +2883,17 @@ cmd_merge() {
         echo -e "    ${GREEN}[✓] GitHub PR 已成功 Squash 合入主干！${NC}"
     fi
 
-    echo -e "\n${BOLD}[4/4] 特性资产胶囊归档与 Goal 生命周期补偿...${NC}"
+    # Issue 修复没有 Feature 胶囊：收尾只做 Goal 停机/退役/同步，措辞不能复用 Feature 语汇。
+    if [[ -n "$feature" ]]; then
+        echo -e "\n${BOLD}[4/4] 特性资产胶囊归档与 Goal 生命周期补偿...${NC}"
+    else
+        echo -e "\n${BOLD}[4/4] Goal 生命周期收尾（Issue 修复无 Feature 胶囊）...${NC}"
+    fi
     local -a step_names=() step_states=() step_details=()
     local failed=0
     local goal_id="$merge_goal_id"
+    local teardown_reason="Feature delivered and archived"
+    if [[ -z "$feature" ]]; then teardown_reason="Issue fix delivered (PR #$pr_id)"; fi
 
     if [[ -n "$goal_id" ]]; then
         if ! command -v loopx >/dev/null 2>&1; then
@@ -2782,7 +2902,7 @@ cmd_merge() {
         fi
 
         local out status
-        if out="$(run_loopx goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "Feature delivered and archived" --execute 2>&1)"; then
+        if out="$(run_loopx goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "$teardown_reason" --execute 2>&1)"; then
             step_names+=("stop"); step_states+=("done"); step_details+=("")
             echo -e "    ${GREEN}[✓] Goal $goal_id 已停机。${NC}"
         else

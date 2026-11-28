@@ -977,7 +977,12 @@ function buildBody(feature, diff, repoRoot, opts = {}) {
   // Issue 修复模式：动机/思路/风险来自 Issue 正文，不读 Feature 胶囊（不写 05-evidence）。
   let issueBody = '';
   if (opts.issueBodyFile && fs.existsSync(opts.issueBodyFile)) {
-    issueBody = fs.readFileSync(opts.issueBodyFile, 'utf8').trim();
+    // Issue 正文常自带 loopx-meta / loopx-impact 标记；不剥离就会在 PR body 里
+    // 先于生成标记出现，让 merge 读到 Issue 的分级而不是本次交付的分级。
+    issueBody = fs.readFileSync(opts.issueBodyFile, 'utf8')
+      .replace(/<!--\s*loopx-(?:meta|impact):[\s\S]*?-->/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
   const motivation = issueBody ? issueBody.slice(0, 2000) : extractMotivation(feature, root);
   const approach = issueBody
