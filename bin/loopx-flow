@@ -763,13 +763,6 @@ sha256_file() {
     fi
 }
 
-gate1_decisions_approved() {
-    local feature="$1" file="$PROJECT_ROOT/specs/features/$feature/01-decisions.md"
-    [[ -f "$file" ]] || file="$PROJECT_ROOT/specs/archive/$feature/01-decisions.md"
-    [[ -f "$file" ]] || return 1
-    grep -Eq '^(status:[[:space:]]*APPROVED([[:space:]]|$)|[-*][[:space:]]*\*\*(Status|方案状态)\*\*(:|：).*APPROVED)' "$file"
-}
-
 gate1_spec_complete() {
     local feature="$1"
     local contract="$PROJECT_ROOT/specs/features/$feature/04-contract.md"
@@ -1309,8 +1302,18 @@ cmd_approve() {
     local mode
     mode="$(auth_mode)"
     [[ -n "$mode" ]] || { echo "[-] [FAIL-CLOSED] 无法读取 authorization_mode" >&2; exit 1; }
-    if ! gate1_decisions_approved "$feature"; then
-        echo "[-] [FAIL-CLOSED] 01-decisions.md 未标记 APPROVED" >&2; exit 1
+    # 01-decisions 的 APPROVED 落款由本命令在人工授权通过后写入（见下方 decision_file 段），
+    # 因此这里只能校验「决策文件存在且可审阅」。历史上这里要求文件已 APPROVED，等于把
+    # 本命令自己的输出当成前置条件：新胶囊（status: PROPOSED）永远无法进入 Gate1，
+    # 连 --prepare 都拿不到签名模板。Issue #75/#85 即卡死于此。
+    local decision_source=""
+    if [[ -f "$decision_file" ]]; then
+        decision_source="$decision_file"
+    elif [[ -f "$PROJECT_ROOT/specs/archive/$feature/01-decisions.md" ]]; then
+        decision_source="$PROJECT_ROOT/specs/archive/$feature/01-decisions.md"
+    fi
+    if [[ -z "$decision_source" ]]; then
+        echo "[-] [FAIL-CLOSED] 未找到 01-decisions.md: $decision_file" >&2; exit 1
     fi
     if ! gate1_spec_complete "$feature"; then
         echo "[-] [FAIL-CLOSED] 规格不完整: 04-contract 需含 AC/Scope/Verification Plan/依赖顺序/REQ或ADR，且每个 story id 在 AC 矩阵中有一行" >&2; exit 1
