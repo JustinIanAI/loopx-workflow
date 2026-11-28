@@ -248,7 +248,7 @@ bug-free.
 This section overrides the `Report` structure above when the review target is a GitHub PR that will become a formal review.
 
 - The only report format for a PR is the five-section `review_template` returned by `loopx pr-review` (动机 / 改动思路 / 具体改动 / 对主干的风险 / 我的整体评价). The `Report` structure in this file is for non-PR static review, investigation and local notes; never publish it as a PR review body.
-- The publication path is `loopx-flow review <pr>` (which drives `authentic-review.js`), not a hand-written `gh api` review. The native packet must be fetched with the same `--goal-id` used by `--check-result`.
+- The publication path is `loopx-flow review <pr>` (which drives `authentic-review.js`), not a hand-written `gh api` review. Packet and `--check-result` must describe the same review: reusing one packet file within a run is the current binding. `--goal-id` passthrough is still unimplemented (D6, see design doc §8.3), so do not claim it — and when it lands, packet fetch and `--check-result` must both pass it.
 - A formal review may be published only when the PR is not Draft, the reviewed head is exact, and `loopx pr-review --check-result` returns `ok === true`. Otherwise emit `NOT_VERIFIED` and exit non-zero.
 - The native `loopx-pr-review` skill is a read-only entry point: it does not comment, approve or merge. Any write happens in `loopx-flow review` / `respond` under the human gate (Mode A non-author approval / Mode B `release-approve`); agents publish COMMENT or REQUEST_CHANGES only, never an author-owned approval.
 - Re-review carryover and `respond` reuse the same five sections; do not invent a second report contract.

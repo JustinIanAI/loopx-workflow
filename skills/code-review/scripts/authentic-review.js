@@ -2388,46 +2388,57 @@ async function main() {
       headOid,
       force: Boolean(o.forceRecheck),
     });
-    if (stage2Run.truncated || stage2Run.stdinRejected) {
-      console.error(`[NOT_VERIFIED] 阶段 2 拒绝发布：${stage2Run.error}`);
+    // ADR-0013 增补决策 2：阶段 2 的任何失败都必须 fail-closed。
+    // 旧实现只在 truncated/stdinRejected 时退出——超时、非 0、输出不可解析会静默降级成
+    // 「证据没补到」，随后仍以封顶正文发布，正是 ADR 明令禁止的「带空白证据误发」。
+    if (!stage2Run.ok) {
+      appendPipelineLog(repoRoot, o.pr,
+        `stage=stage2 event=failed error_class=${stage2Run.error_class || 'UNKNOWN'} detail="${String(stage2Run.error || '').replace(/"/g, "'").slice(0, 200)}" retryable=false`);
+      console.error(`[NOT_VERIFIED] 阶段 2 拒绝发布（${stage2Run.error_class || 'UNKNOWN'}）：${stage2Run.error || '阶段 2 未完成'}`);
       process.exit(1);
     }
-    if (!stage2Run.unavailable && !stage2Run.error) {
-      const parsedStage2 = extractJson(stage2Run.stdout || '');
-      const stage2Evidence = parsedStage2 && parsedStage2.evidence && typeof parsedStage2.evidence === 'object'
-        ? parsedStage2.evidence
-        : null;
-      if (stage2Evidence) {
-        const nextInput = mergedModelEvidence ? { ...mergedModelEvidence } : {};
-        for (const id of unverifiedForStage2) {
-          if (stage2Evidence[id] && typeof stage2Evidence[id] === 'object') {
-            nextInput[id] = stage2Evidence[id];
-          }
+    const parsedStage2 = extractJson(stage2Run.stdout || '');
+    if (!parsedStage2 || typeof parsedStage2 !== 'object') {
+      appendPipelineLog(repoRoot, o.pr, 'stage=stage2 event=failed error_class=OUTPUT_UNPARSABLE detail="stage2 stdout is not JSON" retryable=false');
+      console.error('[NOT_VERIFIED] 阶段 2 拒绝发布（OUTPUT_UNPARSABLE）：模型输出不可解析为 JSON（ADR-0013 增补决策 2）。');
+      process.exit(1);
+    }
+    const stage2Evidence = parsedStage2.evidence
+      && typeof parsedStage2.evidence === 'object' && !Array.isArray(parsedStage2.evidence)
+      ? parsedStage2.evidence
+      : null;
+    if (stage2Evidence) {
+      const nextInput = mergedModelEvidence ? { ...mergedModelEvidence } : {};
+      for (const id of unverifiedForStage2) {
+        if (stage2Evidence[id] && typeof stage2Evidence[id] === 'object') {
+          nextInput[id] = stage2Evidence[id];
         }
-        if (unverifiedValidationCases.length && stage2Evidence.validation_matrix && typeof stage2Evidence.validation_matrix === 'object') {
-          const prevVm = nextInput.validation_matrix && typeof nextInput.validation_matrix === 'object'
-            ? { ...nextInput.validation_matrix }
-            : {};
-          for (const cid of unverifiedValidationCases) {
-            if (stage2Evidence.validation_matrix[cid] !== undefined) {
-              prevVm[cid] = stage2Evidence.validation_matrix[cid];
-            } else if (Array.isArray(stage2Evidence.validation_matrix.items)) {
-              const found = stage2Evidence.validation_matrix.items.find(it => it && it.case_id === cid);
-              if (found) prevVm[cid] = found;
-            }
-          }
-          nextInput.validation_matrix = prevVm;
-        }
-        mergedModelEvidence = nextInput;
-        autoEvidence = buildEvidenceGraph({
-          contract: pkt.evidenceContract || {},
-          plan: pkt.reviewPlan || {},
-          diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
-          modelEvidence: mergedModelEvidence,
-          repoRoot,
-          headAnchored: headAnchor.match,
-        });
       }
+      if (unverifiedValidationCases.length && stage2Evidence.validation_matrix && typeof stage2Evidence.validation_matrix === 'object') {
+        const prevVm = nextInput.validation_matrix && typeof nextInput.validation_matrix === 'object'
+          ? { ...nextInput.validation_matrix }
+          : {};
+        for (const cid of unverifiedValidationCases) {
+          if (stage2Evidence.validation_matrix[cid] !== undefined) {
+            prevVm[cid] = stage2Evidence.validation_matrix[cid];
+          } else if (Array.isArray(stage2Evidence.validation_matrix.items)) {
+            const found = stage2Evidence.validation_matrix.items.find(it => it && it.case_id === cid);
+            if (found) prevVm[cid] = found;
+          }
+        }
+        nextInput.validation_matrix = prevVm;
+      }
+      mergedModelEvidence = nextInput;
+      autoEvidence = buildEvidenceGraph({
+        contract: pkt.evidenceContract || {},
+        plan: pkt.reviewPlan || {},
+        diff, headOid, pr: o.pr, motivation: pkt.motivation, validation,
+        modelEvidence: mergedModelEvidence,
+        repoRoot,
+        // 与阶段 1 同一锚定事实：本地不在被审 head 时，阶段 2 抓到的 test_path
+        // 也不得被判 passed（否则等于在他版代码上取证，#74/#103 的 P1 会复活）。
+        headAnchored: headAnchor.match,
+      });
     }
   }
 
