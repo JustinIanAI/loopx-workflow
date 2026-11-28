@@ -457,6 +457,9 @@ async function runStageWithState(options) {
   let retryBudgetExhausted = false;
   const retryBudgetMs = resolveRetryBudgetMs(budgetMs);
   const stageStartedMs = Date.now();
+  // 每轮实际可用超时：首轮为完整单次预算，重试轮按剩余总预算裁剪，
+  // 让 `retryBudgetMs` 保持硬上限（ADR-0017 D2），而不是「剩余为正就再发一整份」。
+  let attemptTimeoutMs = budgetMs;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     attemptsUsed = attempt;
     const startedMs = Date.now();
@@ -479,18 +482,18 @@ async function runStageWithState(options) {
       output_bytes: 0,
       partial_output_path: null,
       partial_output_bytes: 0,
-      timeout_ms: budgetMs,
-      deadline_at: new Date(startedMs + budgetMs).toISOString(),
+      timeout_ms: attemptTimeoutMs,
+      deadline_at: new Date(startedMs + attemptTimeoutMs).toISOString(),
       agent_bin: agentBin,
       resumed: sameIdentity,
     });
     appendPipelineLog(repoRoot, pr,
-      `stage=${stage} attempt=${attempt} event=start head=${headOid} prompt_sha256=${promptSha} timeout_ms=${budgetMs} deadline_at=${new Date(startedMs + budgetMs).toISOString()}`);
+      `stage=${stage} attempt=${attempt} event=start head=${headOid} prompt_sha256=${promptSha} timeout_ms=${attemptTimeoutMs} deadline_at=${new Date(startedMs + attemptTimeoutMs).toISOString()}`);
 
     const hb = startStageHeartbeat(repoRoot, pr, stage, attempt, startedMs, heartbeatIntervalMs);
     let run;
     try {
-      const maybePromise = execStage(agentBin, prompt, timeoutMs, runDir, diffText, selection);
+      const maybePromise = execStage(agentBin, prompt, attemptTimeoutMs, runDir, diffText, selection);
       run = maybePromise && typeof maybePromise.then === 'function' ? await maybePromise : maybePromise;
     } finally {
       stopStageHeartbeat(hb);
@@ -500,7 +503,7 @@ async function runStageWithState(options) {
       // wait-out 证据：慢推理在既有预算内被等待完成（或按预算终止），
       // 同窗口内心跳行可证明等待期间调用方事件循环未被阻塞。
       appendPipelineLog(repoRoot, pr,
-        `stage=${stage} attempt=${attempt} event=wait_out elapsed_ms=${elapsed} heartbeat_interval_ms=${heartbeatIntervalMs} timeout_ms=${budgetMs} outcome=${(run && (run.error || run.timed_out)) ? 'failed' : 'ok'}`);
+        `stage=${stage} attempt=${attempt} event=wait_out elapsed_ms=${elapsed} heartbeat_interval_ms=${heartbeatIntervalMs} timeout_ms=${attemptTimeoutMs} outcome=${(run && (run.error || run.timed_out)) ? 'failed' : 'ok'}`);
     }
 
     if (run.unavailable) {
@@ -538,7 +541,7 @@ async function runStageWithState(options) {
 
     const errorClass = classifyStageFailure(run);
     const partial = readPartialStageOutput(run);
-    const detail = formatStageError(run, budgetMs, attempt, maxAttempts);
+    const detail = formatStageError(run, attemptTimeoutMs, attempt, maxAttempts);
     lastFailure = { error_class: errorClass, error: detail, attempts: attempt };
 
     writeStageState(repoRoot, pr, stage, {
@@ -552,7 +555,7 @@ async function runStageWithState(options) {
       partial_output_bytes: partial.bytes,
     });
     appendPipelineLog(repoRoot, pr,
-      `stage=${stage} attempt=${attempt} event=failed error_class=${errorClass} elapsed_ms=${elapsed} detail="${detail}" raw_error="${String(run.error || '').slice(0, 200)}" signal=${run.signal || '-'} timeout_ms=${budgetMs} partial_output=${partial.path || '-'} partial_bytes=${partial.bytes}`);
+      `stage=${stage} attempt=${attempt} event=failed error_class=${errorClass} elapsed_ms=${elapsed} detail="${detail}" raw_error="${String(run.error || '').slice(0, 200)}" signal=${run.signal || '-'} timeout_ms=${attemptTimeoutMs} partial_output=${partial.path || '-'} partial_bytes=${partial.bytes}`);
 
     if (partial.salvaged) {
       fs.writeFileSync(outputPath, partial.text, 'utf8');
@@ -573,6 +576,8 @@ async function runStageWithState(options) {
     // 总预算闸门：以「还剩多少总额」判定，而不是拿一次满额预算去比。
     // 真实超时后 elapsedTotal 必然包含毫秒级开销，用 `elapsedTotal + budgetMs > retryBudgetMs`
     // 会让「首轮 + 一轮完整重试」在开销 > 0 时永远不成立——差几毫秒就从重试变成停机。
+    // 同时把下一轮超时裁到剩余额度：`retryBudgetMs` 仍是硬上限（ADR-0017 D2），
+    // 而不是「剩余为正就再发一整份预算」。
     const elapsedTotal = Date.now() - stageStartedMs;
     const remainingBudgetMs = retryBudgetMs - elapsedTotal;
     if (remainingBudgetMs <= 0) {
@@ -582,6 +587,7 @@ async function runStageWithState(options) {
         `stage=${stage} attempt=${attempt} event=retry_budget_exhausted elapsed_total_ms=${elapsedTotal} retry_budget_ms=${retryBudgetMs} next_budget_ms=0 reason=no_remaining_budget`);
       break;
     }
+    attemptTimeoutMs = Math.min(budgetMs, remainingBudgetMs);
 
     const backoff = Math.min(backoffBaseMs * Math.pow(2, attempt - 1), RETRY_BACKOFF_CAP_MS);
     writeStageState(repoRoot, pr, stage, {
@@ -591,7 +597,7 @@ async function runStageWithState(options) {
       elapsed_ms: elapsed,
     });
     appendPipelineLog(repoRoot, pr,
-      `stage=${stage} attempt=${attempt} event=retry trigger=${errorClass} before_status=failed after_status=retrying next_attempt=${attempt + 1} backoff_ms=${backoff} elapsed_ms=${elapsed}`);
+      `stage=${stage} attempt=${attempt} event=retry trigger=${errorClass} before_status=failed after_status=retrying next_attempt=${attempt + 1} backoff_ms=${backoff} next_timeout_ms=${attemptTimeoutMs} elapsed_ms=${elapsed}`);
     if (backoff > 0) await new Promise((resolve) => setTimeout(resolve, backoff));
   }
 

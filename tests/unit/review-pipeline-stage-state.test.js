@@ -235,7 +235,12 @@ test('真实 fake 二进制：spawnSync 超时被归类为 ETIMEDOUT 并给出�
     const r = await runStageWithState(params(s, { timeoutMs: 200 }));
     assert.strictEqual(r.ok, false);
     assert.strictEqual(r.error_class, 'ETIMEDOUT');
-    assert.match(r.error, /^ETIMEDOUT after 200ms/);
+    // 报出的超时值是**本轮实际生效**的预算：首轮 200ms，重试轮按剩余总预算裁剪（≤200ms）。
+    const reportedMs = Number((r.error.match(/^ETIMEDOUT after (\d+)ms/) || [])[1]);
+    assert.ok(Number.isFinite(reportedMs) && reportedMs > 0 && reportedMs <= 200, r.error);
+    const log = fs.readFileSync(pipelineLogPath(s.dir, 73), 'utf8');
+    assert.match(log, /attempt=1\b[^\n]*event=start[^\n]*timeout_ms=200\b/, '首轮必须使用配置的 200ms 预算');
+    assert.match(log, /elapsed_total_ms=\d+ retry_budget_ms=400\b/, '总预算仍是 2×单次预算的硬上限');
     const state = readStageState(s.dir, 73, 'stage1');
     assert.strictEqual(state.status, 'failed');
     assert.ok(fs.existsSync(stateDir));

@@ -3,7 +3,7 @@
  * ADR-0017 / Issue #79：阶段重试必须有总预算上限。
  *
  * 单次预算 × 最大重试次数会把最长等待放大到 3×（默认 30 分钟）。
- * 默认只允许「首轮 + 至多一轮完整重试」，超出即停机并如实记录；
+ * 默认只允许「首轮 + 至多一轮按剩余额度裁剪的重试」，超出即停机并如实记录；
  * REVIEW_RETRY_BUDGET_MS 可显式放宽，非法值在模块加载期 Fail-Closed。
  */
 const { test } = require('node:test');
@@ -25,9 +25,12 @@ function sandbox(prefix) {
   return { dir, restore() { fs.rmSync(dir, { recursive: true, force: true }); } };
 }
 
+// 尊重调用方传入的超时值：真实 `execStage` 由 spawnSync 超时终止，
+// mock 若不理会超时参数，就无法验证「重试轮按剩余额度裁剪」这一不变量。
 function timedOutStage(delayMs) {
-  return async () => {
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  return async (_bin, _prompt, timeoutMs) => {
+    const waitMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(delayMs, timeoutMs) : delayMs;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
     return { error: 'exit null: timed out', error_code: 'ETIMEDOUT', timed_out: true, signal: 'SIGTERM' };
   };
 }
@@ -63,8 +66,8 @@ async function runWith(sbx, { delayMs, timeoutMs, env }) {
 test('慢轮次耗尽总预算：停止重试并标记 retry_budget_exhausted', async () => {
   const sbx = sandbox('retry-budget-slow-');
   try {
-    // timeoutMs=100 → 默认总预算 200ms；首轮花掉 ~120ms，还剩 ~80ms：
-    // 必须真的起第二轮，且第二轮的超时被裁到剩余额度，总耗时不得越过 200ms 上限。
+    // timeoutMs=100 → 默认总预算 200ms；首轮按 100ms 预算超时，还剩 ~100ms：
+    // 必须真的起第二轮，且第二轮超时被裁到剩余额度，总耗时不得越过 200ms 硬上限。
     const r = await runWith(sbx, { delayMs: 120, timeoutMs: 100 });
     assert.strictEqual(r.ok, false);
     assert.strictEqual(r.retry_budget_exhausted, true);
@@ -73,7 +76,17 @@ test('慢轮次耗尽总预算：停止重试并标记 retry_budget_exhausted', 
     assert.match(log, /event=retry_budget_exhausted/);
     const second = log.match(/attempt=2\b[^\n]*event=start[^\n]*timeout_ms=(\d+)/);
     assert.ok(second, '第二轮必须留下 start 记录');
-    assert.strictEqual(Number(second[1]), 100, '每次尝试仍用完整单次预算，上限由「是否还有剩余额度」控制');
+    const secondTimeout = Number(second[1]);
+    assert.ok(secondTimeout > 0 && secondTimeout <= 100, `第二轮超时必须裁到剩余额度，实际 ${secondTimeout}ms`);
+    const retry = log.match(/attempt=1\b[^\n]*event=retry[^\n]*next_timeout_ms=(\d+)/);
+    assert.ok(retry, '重试事件必须记录下一轮被裁剪后的超时');
+    assert.strictEqual(Number(retry[1]), secondTimeout, 'retry 事件与第二轮 start 的超时口径必须一致');
+    const exhausted = log.match(/event=retry_budget_exhausted[^\n]*elapsed_total_ms=(\d+)[^\n]*retry_budget_ms=(\d+)/);
+    assert.ok(exhausted, '预算耗尽事件必须同时记录已花与预算');
+    assert.ok(
+      Number(exhausted[1]) <= Number(exhausted[2]) + 50,
+      `总耗时不得越过 retry_budget_ms 硬上限（容差 50ms 覆盖调度开销）：${exhausted[1]}ms > ${exhausted[2]}ms`,
+    );
   } finally { sbx.restore(); }
 });
 
