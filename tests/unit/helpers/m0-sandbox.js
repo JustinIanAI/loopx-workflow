@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawnSync, execSync } = require('node:child_process');
+const { spawnSync, execSync, execFileSync } = require('node:child_process');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 
@@ -89,6 +89,45 @@ function mock(dir, name, body) {
   return p;
 }
 
+// Gate1 发布前置（REQ-PR-LIFECYCLE-1）：把规格包提交并推送到临时裸远端，
+// 让 approve 的「已跟踪 + HEAD == origin/<branch>」检查可以通过。
+function addRemote(dir) {
+  const bare = dir + '-remote.git';
+  if (!fs.existsSync(bare)) execSync(`git init -q --bare "${bare}"`, { stdio: 'ignore' });
+  try {
+    execSync('git remote get-url origin', { cwd: dir, stdio: 'ignore' });
+    execSync(`git remote set-url origin "${bare}"`, { cwd: dir, stdio: 'ignore' });
+  } catch (_) {
+    execSync(`git remote add origin "${bare}"`, { cwd: dir, stdio: 'ignore' });
+  }
+  return bare;
+}
+
+function currentBranch(dir) {
+  return execSync('git rev-parse --abbrev-ref HEAD', { cwd: dir, encoding: 'utf8' }).trim();
+}
+
+function headSha(dir) {
+  return execSync('git rev-parse HEAD', { cwd: dir, encoding: 'utf8' }).trim();
+}
+
+function publishSpecPackage(dir, feature) {
+  const bare = addRemote(dir);
+  const branch = currentBranch(dir);
+  const specPath = `specs/features/${feature}`;
+  const staged = execFileSync('git', ['status', '--porcelain', '--', specPath], { cwd: dir, encoding: 'utf8' }).trim();
+  if (staged) {
+    execFileSync('git', ['add', '--', specPath], { cwd: dir, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-qm', `docs(${feature}): publish spec package`], { cwd: dir, stdio: 'ignore' });
+  }
+  execFileSync('git', ['push', '-q', '-u', 'origin', branch], { cwd: dir, stdio: 'ignore' });
+  return { bare, branch, head: headSha(dir) };
+}
+
+function prViewJson(dir, { number = 7, state = 'OPEN', isDraft = true, url = 'https://example.test/pr/7', head } = {}) {
+  return JSON.stringify({ number, state, isDraft, url, headRefOid: head || headSha(dir) });
+}
+
 function mockLoopx(dir, body) {
   return mock(dir, 'loopx', 'echo "$*" >> "' + path.join(dir, 'loopx-calls.log') + '"\n' + require('./capability-stub').HELP_PRELUDE + body);
 }
@@ -114,6 +153,7 @@ function run(dir, args, envExtra = {}) {
 
 function cleanup(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+  try { fs.rmSync(dir + '-remote.git', { recursive: true, force: true }); } catch (_) {}
 }
 
 // 让 gate verify 通过用的 registry/loopx 侧替身
@@ -143,8 +183,8 @@ function gate1Evidence({ mode = 'single_owner', sha, spec = 'b'.repeat(40), feat
   return text;
 }
 
-// independent Gate1 的 gh 替身：返回执行者 login + 一条有效 gate=1 评论（可关闭）
-function ghGate1Mock(dir, { feature, sha, approver = 'approver1', login = 'executor', includeComment = true } = {}) {
+// independent Gate1 的 gh 替身：返回执行者 login + 一条有效 gate=1 评论（可关闭）+ 可读 PR
+function ghGate1Mock(dir, { feature, sha, approver = 'approver1', login = 'executor', includeComment = true, pr } = {}) {
   const specCommit = execSync('git rev-parse HEAD', { cwd: dir, encoding: 'utf8' }).trim();
   const comments = includeComment ? [{
     body: '<!-- loopx-flow:gate1-authorization:' + feature + '@' + sha + ' -->\n' +
@@ -153,15 +193,22 @@ function ghGate1Mock(dir, { feature, sha, approver = 'approver1', login = 'execu
   }] : [];
   const commentsFile = path.join(dir, 'comments.json');
   fs.writeFileSync(commentsFile, JSON.stringify(comments));
+  const prJson = prViewJson(dir, pr || {});
   return mockGh(dir, `if [[ "$1" == "api" && "$2" == "user" ]]; then echo "${login}"; exit 0; fi
 if [[ "$1" == "repo" && "$2" == "view" ]]; then echo "owner/repo"; exit 0; fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then echo "7"; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then printf '%s\\n' '${prJson}'; exit 0; fi
 if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/7/comments" ]]; then cat "${commentsFile}"; exit 0; fi
 exit 0`);
 }
 
 module.exports = {
   PROJECT_ROOT,
+  addRemote,
+  currentBranch,
+  headSha,
+  publishSpecPackage,
+  prViewJson,
   ghGate1Mock,
   makeSandbox,
   sha256,
