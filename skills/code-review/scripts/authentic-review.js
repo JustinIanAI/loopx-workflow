@@ -2592,13 +2592,21 @@ async function main() {
   process.exit(0);
 }
 
+// ADR-0017 Stage 1 起 main 为 async：入口统一收口 rejection，
+// 避免未捕获拒绝以崩溃栈退出而丢失 [NOT_VERIFIED] 诊断标记。
+// 退出码与 stderr 是下游（bin/loopx-flow / CI）判定「审查是否跑完」的唯一依据，
+// 因此把收口逻辑抽成可注入 exit/log 的函数，供回归用例直接驱动而不是靠读源码。
+function runEntry(mainFn, { exit = (code) => process.exit(code), log = console.error } = {}) {
+  return Promise.resolve()
+    .then(mainFn)
+    .catch((err) => {
+      log(`[NOT_VERIFIED] authentic review pipeline aborted: ${err && err.message ? err.message : String(err)}`);
+      exit(1);
+    });
+}
+
 if (require.main === module) {
-  // ADR-0017 Stage 1 起 main 为 async：入口统一收口 rejection，
-  // 避免未捕获拒绝以崩溃栈退出而丢失 [NOT_VERIFIED] 诊断标记。
-  main().catch((err) => {
-    console.error(`[NOT_VERIFIED] authentic review pipeline aborted: ${err && err.message ? err.message : String(err)}`);
-    process.exit(1);
-  });
+  runEntry(main);
 }
 
 module.exports = {
@@ -2623,6 +2631,8 @@ module.exports = {
   isolatedGateEnv,
   gates,
   resolveReviewRuntimeSelection,
+  // 入口收口（#88 回归：rejection 必须以 [NOT_VERIFIED] + exit 1 收场）
+  runEntry,
   declaredModelFamily,
   resolveReviewerDeclaration,
   // 阶段状态 / 可观测性（单测直接驱动，生产路径由 main() 调用）
