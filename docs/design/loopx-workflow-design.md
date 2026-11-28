@@ -93,9 +93,9 @@ L0 命令不是 LoopX 转发器，而是场景操作契约（遵循 [ADR-0010](.
 
 - **开关**：`loopx-workflow.config.json` 写 `"gate2_rebind": "patch_id"` 才启用；缺省/其他取值一律走精确 head 匹配，行为与本次变更前完全一致。
 - **触发**：`release_authorization_ok` 在 `gate_comment_author` 精确匹配（标记 + `head`）失败后进入；仅当存在同一 PR、同一 `accepted_by` 作者、`gate=2`/`mode`/`principal`/`contract_sha`/`risk_acceptance` 全对齐而只有 `head` 不同的评论时才有候选。
-- **判定**：对每个候选 `head` 与当前 head，比较 `git patch-id --stable` 作用于 `diff(merge-base(base, <sha>), <sha>)` 的指纹（`lib/gate2-rebind.js`，`same-change <baseRef> <signedHead> <currentHead>`）；base 用 `gh pr view --json baseRefName` 读到的分支名加 `origin/`。
+- **判定**：对每个候选 `head` 与当前 head，比较 `git patch-id --verbatim` 作用于 `git diff -U0 merge-base(base, <sha>) <sha>` 的指纹（`lib/gate2-rebind.js`，`same-change <baseRef> <signedHead> <currentHead>`）；`-U0` 剥 hunk 上下文使改动位移不变、`--verbatim` 保留空白使空白改动必变；base 用 `gh pr view --json baseRefName` 读到的分支名加 `origin/`。
 - **通过**：指纹一致 → `[WARN] Gate2 重绑（ADR-0021）：head <old> -> <new>` 后复用既有签名；**不写新评论、不改 PR**。
-- **拒绝**：指纹不等（内容改动、冲突手工解决、空 diff、未知提交、`git` 失败）或读不到 base → 非 0，`merge` 不调用 `gh pr merge`。重绑只覆盖"换 base 导致的换 head"，不覆盖内容授权。
+- **拒绝**：指纹不等（内容改动、冲突手工解决、仅空白/缩进调整、空 diff、未知提交、`git` 失败）或读不到 base → 非 0，`merge` 不调用 `gh pr merge`。重绑只覆盖"换 base 导致的换 head"，不覆盖内容授权。
 
 **上游契约锚点与三层能力探针矩阵（`REQ-CAPABILITY-1` / [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md)）**：
 

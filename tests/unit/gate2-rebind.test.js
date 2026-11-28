@@ -122,3 +122,53 @@ test('同一 head 恒等；空改动与未知 commit 一律不重绑', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('签署后只改空白/缩进：指纹必须变，不得重绑（--stable 会漏判，故用 --verbatim）', () => {
+  const dir = repo();
+  try {
+    git(dir, 'checkout', '-q', '-b', 'feature');
+    const signedHead = commit(dir, 'notes.md', '# Title\n\n- item\n', 'docs: item');
+    // 仅空白变化：四空格在 Markdown 里就是代码块，语义已变，但 git patch-id --stable
+    // 会把空白归一化掉，从而把「格式化后的提交」误判成同一份改动。
+    const reformatted = commit(dir, 'notes.md', '# Title\n\n    - item\n', 'docs: indent');
+    assert.strictEqual(
+      sameChange({ cwd: dir, baseRef: 'main', signedHead, currentHead: reformatted }),
+      false,
+      '仅空白/缩进调整也必须 fail-closed 重新签字',
+    );
+    assert.notStrictEqual(
+      changePatchId(dir, 'main', signedHead),
+      changePatchId(dir, 'main', reformatted),
+      '空白敏感：两个 head 的改动指纹必须不同',
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('base 在同一文件上方插入无关行导致改动位移：仍算同一份改动（-U0 剥上下文）', () => {
+  const dir = repo();
+  try {
+    fs.writeFileSync(path.join(dir, 'app.js'), 'head\n');
+    git(dir, 'add', '.');
+    git(dir, 'commit', '-q', '-m', 'app base');
+    git(dir, 'checkout', '-q', '-b', 'feature');
+    const signedHead = commit(dir, 'app.js', 'head\nFEATURE\n', 'feat: append');
+
+    // main 前进：在改动上方插入一行，使 rebase/合并后 FEATURE 下沉到第 3 行。
+    git(dir, 'checkout', '-q', 'main');
+    commit(dir, 'app.js', 'NEWTOP\nhead\n', 'main: insert above');
+    git(dir, 'checkout', '-q', 'feature');
+    git(dir, 'merge', '-q', '--no-edit', 'main');
+    const moved = git(dir, 'rev-parse', 'HEAD');
+
+    assert.notStrictEqual(moved, signedHead);
+    assert.strictEqual(
+      sameChange({ cwd: dir, baseRef: 'main', signedHead, currentHead: moved }),
+      true,
+      '同一改动在文件内位移（hunk 行号变化、上下文变化）不应作废签名',
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

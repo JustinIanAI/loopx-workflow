@@ -21,7 +21,9 @@
 
 1. **新增可选配置 `gate2_rebind`**，当前唯一合法值 `"patch_id"`；**字段缺失即关闭**，行为与今天完全一致（head 必须精确匹配）。
 2. 开启后，`release_authorization_ok` 在 head 精确匹配失败时，收集“其余字段（`gate`/`mode`/`principal`/`contract_sha`/`risk_acceptance`）全部对齐、只有 `head` 不同”的候选签名，交由 `lib/gate2-rebind.js` 判定：
-   - 计算 `patch-id --stable` of `git diff $(git merge-base <base> <sha>) <sha>`；
+   - 计算 `git patch-id --verbatim` of `git diff -U0 $(git merge-base <base> <sha>) <sha>`：
+     `-U0` 剥掉 hunk 上下文（base 前进导致改动在文件内位移不影响指纹），
+     `--verbatim` 保留空白（只改缩进/空白也算改动，必须重新签字）；
    - 新旧 head 的改动指纹相同 → 签名继续有效，并打印 `[WARN] Gate2 重绑（ADR-0021）` 审计行；
    - 任一环节不成立（commit 不在本地、空改动、patch-id 不同）→ 退回 fail-closed，要求重新签字。
 3. **判定实现单点化**：`lib/gate2-rebind.js` 承载语义与边界，`bin/loopx-flow` 只读配置 + 调用；单测直接覆盖模块。
@@ -29,10 +31,10 @@
 
 ## 安全边界（必须如实披露）
 
-- 授权对象从「commit」变为「改动内容」。`patch-id` 相同意味着 diff 文本（去掉行号与上下文行）完全相同。
+- 授权对象从「commit」变为「改动内容」。指纹相同意味着**增删行文本（忽略 hunk 行号与上下文行、保留空白）**完全相同；空白与缩进敏感，因为四空格在 Markdown 里是代码块、在 YAML/Makefile 里能改变语义。
 - **不覆盖** commit message、提交作者、parent 拓扑、rebase 顺序；这是刻意选择——Gate 授权的是交付内容，不是提交流水。
 - 仍然要求：评论作者 `== accepted_by`、`contract_sha` 一致、`risk_acceptance` 一致、`mode` 一致。任何一项不满足都不到达 patch-id 判定。
-- 冲突手工解决会改变 diff 文本 → patch-id 改变 → 必须重新签字。这是设计意图，不是缺陷。
+- 冲突手工解决会改变 diff 文本 → 指纹改变 → 必须重新签字。仅空白/缩进调整同样改变指纹。这是设计意图，不是缺陷。
 - 与 ADR-0019 一致：该路径仍是**账号级**证明，不宣称自然人分离。
 
 ## 否决

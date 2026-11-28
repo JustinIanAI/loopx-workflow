@@ -25,6 +25,7 @@ function makeSandbox(prefix = 'm0-sandbox-') {
   fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.sh'), path.join(dir, 'lib/paths.sh'));
   fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/paths.js'), path.join(dir, 'lib/paths.js'));
   fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/capability-probe.js'), path.join(dir, 'lib/capability-probe.js'));
+  fs.copyFileSync(path.join(PROJECT_ROOT, 'lib/gate2-rebind.js'), path.join(dir, 'lib/gate2-rebind.js'));
   fs.writeFileSync(path.join(dir, 'README.md'), '# sandbox\n');
   fs.writeFileSync(path.join(dir, '.gitignore'), '.loopx/\n');
   fs.writeFileSync(path.join(dir, '.loopx/registry.json'), JSON.stringify({ schema_version: '0.1', goals: [] }, null, 2));
@@ -100,6 +101,45 @@ function addRemote(dir) {
     execSync(`git remote add origin "${bare}"`, { cwd: dir, stdio: 'ignore' });
   }
   return bare;
+}
+
+// 在沙箱里造一段真实历史（ADR-0021 重绑需要真实 commit 与 origin/<base> ref）。
+// 回调拿到 dir，返回 { signedHead, head }：signedHead 是作者签 gate=2 时的 commit，
+// head 是补了 base 前进后的当前 head —— 两者承载同一份改动。
+function withRebindHistory(dir, opts = {}) {
+  const git = (args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
+  const file = opts.file || 'feature.js';
+  const signedContent = opts.signedContent || 'export const a = 1;\n';
+  const currentContent = opts.currentContent || signedContent;
+  // 沙箱的初始分支名取决于本机 git 默认（main/master），先记下来再切走。
+  const trunk = currentBranch(dir);
+  const workBranch = `feature/${opts.feature || 'gate2'}`;
+  if (trunk !== workBranch) git(['checkout', '-q', '-b', workBranch]);
+
+  // 签署时的改动必须落在 PR 分支上：若先提交到 trunk，PR 相对 base 的 diff 会是空。
+  fs.writeFileSync(path.join(dir, file), signedContent);
+  git(['add', '--', file]);
+  git(['commit', '-qm', 'feat: signed change']);
+  const signedHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+
+  const bare = addRemote(dir);
+  git(['checkout', '-q', trunk]);
+  fs.writeFileSync(path.join(dir, 'main-advance.txt'), 'main moved\n');
+  git(['add', '--', 'main-advance.txt']);
+  git(['commit', '-qm', 'chore: main advance']);
+  execFileSync('git', ['push', '-q', 'origin', trunk], { cwd: dir, stdio: 'ignore' });
+  execFileSync('git', ['remote', 'set-head', 'origin', '-a'], { cwd: dir, stdio: 'ignore' });
+
+  git(['checkout', '-q', workBranch]);
+  if (currentContent !== signedContent) {
+    fs.writeFileSync(path.join(dir, file), currentContent);
+    git(['add', '--', file]);
+    git(['commit', '-qm', 'feat: change after signing']);
+  }
+  // trunk 前进后合入 base：换 head 但对 base 的改动不变（真 merge commit，非快进）。
+  execFileSync('git', ['merge', '-q', '--no-edit', '-m', `merge ${trunk}`, trunk], { cwd: dir, stdio: 'ignore' });
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+  return { signedHead, head, bare, baseRefName: trunk };
 }
 
 function currentBranch(dir) {
@@ -204,6 +244,7 @@ exit 0`);
 module.exports = {
   PROJECT_ROOT,
   addRemote,
+  withRebindHistory,
   currentBranch,
   headSha,
   publishSpecPackage,
