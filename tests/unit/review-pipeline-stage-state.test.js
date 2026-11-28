@@ -696,6 +696,68 @@ test('原子认领：持有者存活但认领超龄（ADR-0017 D4 的 pid 复用
   }
 });
 
+test('所有权口径：新建运行目录同样发布 owner.lock', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const dir = ar.reviewStateDir(s.dir, 73);
+    const ownerFile = path.join(dir, 'owner.lock', 'owner');
+    assert.ok(fs.existsSync(ownerFile), '新建目录必须与复用目录使用同一套认领口径（ADR-0017 D4）');
+    const owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'));
+    assert.strictEqual(owner.pid, process.pid);
+  } finally {
+    s.restore();
+  }
+});
+
+test('跨主机认领：新鲜的外机认领不得被抢占，超龄才可并留痕', () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-foreign1');
+    writePriorState(dir);
+    const claimDir = path.join(dir, 'owner.lock');
+    fs.mkdirSync(claimDir, { recursive: true });
+    fs.writeFileSync(path.join(claimDir, 'owner'), JSON.stringify({
+      pid: 99999, host: 'other-machine', started_at: '2026-01-01T00:00:00Z',
+    }), 'utf8');
+    assert.strictEqual(ar.claimPriorStateDir(dir), false, '跨主机无法核验存活，新鲜认领一律不得抢占');
+
+    const old = new Date(Date.now() - 5 * 60 * 60 * 1000);
+    fs.utimesSync(claimDir, old, old);
+    assert.strictEqual(ar.claimPriorStateDir(dir), true, '超龄外机认领必须可抢占，否则共享 tmp 下永久卡死');
+    assert.strictEqual(ar.claimTakeoverAudit().length, 1, '跨主机抢占必须留审计行');
+    assert.strictEqual(ar.claimTakeoverAudit()[0].holder.host, 'other-machine');
+  } finally {
+    s.restore();
+  }
+});
+
+test('pid 复用兜底：目录名 pid 存活但目录超龄，可被接管与清理', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    await withLiveChild(async (livePid) => {
+      const base = path.join(s.dir, 'tmp', 'review-pr73');
+      const dir = path.join(base, `${livePid}-reused00`);
+      writePriorState(dir);
+      const old = new Date(Date.now() - 5 * 60 * 60 * 1000);
+      fs.utimesSync(dir, old, old);
+
+      clearResumeMemo(ar);
+      assert.strictEqual(ar.discoverPriorStateDir(s.dir, 73), dir, '超龄目录不得因 pid 复用被永久跳过（续跑失效）');
+
+      const memo = {};
+      Object.defineProperty(ar.reviewStateDir, '_memo', { value: memo, writable: true, configurable: true });
+      memo[`${s.dir}|73`] = dir;
+      assert.strictEqual(ar.removableStateDir(s.dir, 73), dir, '超龄目录必须可清理，否则临时目录永久泄漏');
+    });
+  } finally {
+    s.restore();
+  }
+});
+
 test('原子认领：两个子进程同时竞争同一残留目录，恰好一个成功', async () => {
   const s = sandbox();
   try {

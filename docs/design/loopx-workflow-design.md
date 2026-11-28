@@ -91,6 +91,8 @@ L0 命令不是 LoopX 转发器，而是场景操作契约（遵循 [ADR-0010](.
 
 **Gate2 重绑（`gate2_rebind`，默认关闭 · `REQ-GATE2-REBIND-1` / [ADR-0021](../adr/0021-gate2-rebind-on-base-move.md)）**：
 
+**重绑只复用人类签名，不放宽 Agent 评论**：`merge` 之后仍要求 `agent_comment_ok` 绑定当前 head 的 Agent 评审评论；`gh pr update-branch` 换 head 后虽不必重签 `gate=2`，仍须重跑一次 `loopx-flow review`，否则 merge 仍 fail-closed（显式非 0）。
+
 - **开关**：`loopx-workflow.config.json` 写 `"gate2_rebind": "patch_id"` 才启用；缺省/其他取值一律走精确 head 匹配，行为与本次变更前完全一致。
 - **触发**：`release_authorization_ok` 在 `gate_comment_author` 精确匹配（标记 + `head`）失败后进入；仅当存在同一 PR、同一 `accepted_by` 作者、`gate=2`/`mode`/`principal`/`contract_sha`/`risk_acceptance` 全对齐而只有 `head` 不同的评论时才有候选。
 - **判定**：对每个候选 `head` 与当前 head，比较 `git patch-id --verbatim` 作用于 `git diff -U0 merge-base(base, <sha>) <sha>` 的指纹（`lib/gate2-rebind.js`，`same-change <baseRef> <signedHead> <currentHead>`）；`-U0` 剥 hunk 上下文使改动位移不变、`--verbatim` 保留空白使空白改动必变；base 用 `gh pr view --json baseRefName` 读到的分支名加 `origin/`。
@@ -327,7 +329,7 @@ Stage 2 的超时、非 0、截断标记、JSON 不可解析一律 `[NOT_VERIFIE
 
 **salvage**：只有 `review_body` + `verdict` + `declaration` 三件齐全且可解析才按成功恢复；缺一即按 `TRUNCATED` fail-closed。被接受的 salvage 必须在 `## 我的整体评价` 机械披露恢复字段清单，并写入 `05-evidence.md`，`Status` 不得因 salvage 升为 `passed`。
 
-**并发与续跑**：运行子目录 `review-pr<N>/<pid>-<random>/` 的认领是 `owner.lock/`（内含 `owner` JSON `{pid, host, started_at}`），**原子发布**：临时目录写好 `owner` 再 `rename` 成 `owner.lock/`，目标已存在即放弃并另建子目录；发现候选目录必须跳过活跃认领；`pid` 不存在、`host` 不同、或认领 mtime 超过 `REVIEW_STATE_STALE_MS`（默认 `2 × REVIEW_TIMEOUT_MS_MAX`）视为陈旧，`owner` 缺失需超过 1s 宽限期；陈旧认领只能用 `rename` 搬走后重新发布（禁止 `unlink` 再建）；只删本进程认领的子目录，父目录仅在已空时删除。同一 PR 并行触发两次 `review` 会各自发布一份评审，运维上应避免。
+**并发与续跑**：运行子目录 `review-pr<N>/<pid>-<random>/` 的认领是 `owner.lock/`（内含 `owner` JSON `{pid, host, started_at}`），**新建与复用目录都发布**，**原子发布**：临时目录写好 `owner` 再 `rename` 成 `owner.lock/`，目标已存在即放弃并另建子目录；发现候选目录必须跳过活跃认领；`pid` 不存在或认领 mtime 超过 `REVIEW_STATE_STALE_MS`（默认 `2 × REVIEW_TIMEOUT_MS_MAX`）视为陈旧，`owner` 缺失需超过 1s 宽限期，`host` 不同则只有认领超龄才可抢占并落 `claim_takeover` 审计行；陈旧认领只能用 `rename` 搬走后重新发布（禁止 `unlink` 再建）；只删本进程认领的子目录，父目录仅在已空时删除；按目录名 `pid` 判活只作兜底（`pid` 复用或目录超龄视为陈旧）。同一 PR 并行触发两次 `review` 会各自发布一份评审，运维上应避免。
 
 **复用分工**：阶段状态只复用"同 head + 同 prompt + 同模型身份"的模型输出；`.loopx/cache/reviews` 只做整轮短路且命中必须重跑 `--check-result`；结论是否仍有效只由原生 `--fresh-audit-exact-head` 判定。三者都不得替代发布前的 `--check-result ok === true`。
 

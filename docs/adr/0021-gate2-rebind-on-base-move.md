@@ -36,6 +36,7 @@
 - 仍然要求：评论作者 `== accepted_by`、`contract_sha` 一致、`risk_acceptance` 一致、`mode` 一致。任何一项不满足都不到达 patch-id 判定。
 - 冲突手工解决会改变 diff 文本 → 指纹改变 → 必须重新签字。仅空白/缩进调整同样改变指纹。这是设计意图，不是缺陷。
 - **边界：签名 head 必须仍能解析出该 PR 的改动。** 判定需要 signed head 在本机对象库中可从 `merge-base(base, signedHead)` 取到 diff；`gh pr update-branch` 的 merge commit 会保留旧 head 为祖先，主场景可用。若 Owner 采用 **rebase 后 force-push**，旧 head 可能已不可达且未 fetch → `isCommit` 失败 → 指纹不可得 → 静默退回「重新签字」（fail-closed，不会误放行）。这条路径上的签名雪崩未被消除。
+- **重绑只复用人类签名，不放宽 Agent 评论**：`merge` 之后仍要求 `agent_comment_ok` 绑定**当前 head** 的 Agent 评审评论。`gh pr update-branch` 换 head 后，Owner 虽不必重签 `gate=2`，但仍须重跑一次 `loopx-flow review` 让新 head 有 Agent 评论，否则 merge 仍 fail-closed（显式非 0，不是静默放行）。
 - 与 ADR-0019 一致：该路径仍是**账号级**证明，不宣称自然人分离。
 
 ## 否决

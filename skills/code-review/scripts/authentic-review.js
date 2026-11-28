@@ -210,6 +210,11 @@ function reviewStateDir(repoRoot, pr) {
   fs.mkdirSync(dir, { recursive: true });
   if (memo) memo[key] = dir;
   stateDirOwnedSet().add(dir);
+  // 与「复用的目录」保持同一套所有权口径：新建目录同样发布 owner.lock。
+  // 失败不阻断（目录名本身已含 pid），但会记一次审计，避免两套口径悄悄分叉。
+  if (!claimPriorStateDir(dir)) {
+    try { console.error('[i] owner.lock 发布失败（按目录名 pid 兜底）'); } catch (_) { /* ignore */ }
+  }
   return dir;
 }
 
@@ -232,6 +237,11 @@ function pidIsAlive(pid) {
   }
 }
 
+// 目录年龄：用于「pid 被无关进程复用」时的兜底（ADR-0017 D4 的 mtime 陈旧判定）。
+function stateDirAgeMs(dir) {
+  try { return Date.now() - fs.statSync(dir).mtimeMs; } catch (_) { return 0; }
+}
+
 // 本次进程真正创建的目录集合（续跑复用的目录不计入，删不得）。
 function stateDirOwnedSet() {
   if (!Object.prototype.hasOwnProperty.call(reviewStateDir, '_owned')) {
@@ -250,7 +260,10 @@ function removableStateDir(repoRoot, pr) {
   if (stateDirOwnedSet().has(dir)) return dir;
   const owner = stateDirOwnerPid(dir);
   if (owner === process.pid) return dir;
-  return owner !== null && !pidIsAlive(owner) ? dir : null;
+  if (owner === null) return null;
+  // pid 复用兜底：目录年龄超过 OWNER_STALE_MS（默认 2 × 单轮硬上限）时，
+  // 即使同名 pid 仍存活也只可能是无关进程，允许清理；否则泄漏永久残留。
+  return !pidIsAlive(owner) || stateDirAgeMs(dir) >= OWNER_STALE_MS ? dir : null;
 }
 
 function resumeMemo(repoRoot, pr) {
@@ -313,7 +326,9 @@ function claimIsStale(claimDir, holder) {
   }
   if (holder.pid === process.pid) return false;
   const sameHost = holder.host === null || holder.host === os.hostname();
-  if (!sameHost) return true;
+  // 跨主机（共享临时目录）无法核验对方进程存活：只有认领足够陈旧才允许抢占，
+  // 否则会把对端正在跑的审查目录抢走，重现「共用目录 → 互相覆盖 → ENOENT」。
+  if (!sameHost) return Date.now() - stat.mtimeMs >= OWNER_STALE_MS;
   if (!pidIsAlive(holder.pid)) return true;
   return Date.now() - stat.mtimeMs >= OWNER_STALE_MS;
 }
@@ -332,6 +347,9 @@ function claimPriorStateDir(dir) {
         return true;
       }
       if (!claimIsStale(claimDir, holder)) return false;
+      if (holder.host && holder.host !== os.hostname()) {
+        claimTakeoverAudit().push({ dir, holder });
+      }
       // 陈旧认领：搬走再抢建。rename 原子，两个进程只有一个能把目录搬走，输家下一轮照常竞争。
       const stale = `${claimDir}.stale.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
       try { fs.renameSync(claimDir, stale); } catch (_) { /* 已被别人搬走，回到竞争 */ }
@@ -355,6 +373,15 @@ function claimPriorStateDir(dir) {
   return false;
 }
 
+// 跨主机抢占必须留痕：共享临时目录下这是唯一能解释「目录为何易主」的证据。
+function claimTakeoverAudit() {
+  if (!Object.prototype.hasOwnProperty.call(claimPriorStateDir, '_takeover')) {
+    Object.defineProperty(claimPriorStateDir, '_takeover', { value: [], writable: true, enumerable: false, configurable: true });
+  }
+  if (!Array.isArray(claimPriorStateDir._takeover)) claimPriorStateDir._takeover = [];
+  return claimPriorStateDir._takeover;
+}
+
 function discoverPriorStateDir(repoRoot, pr) {
   const base = path.join(resolveTmpDir(repoRoot), `review-pr${pr}`);
   let entries;
@@ -368,7 +395,7 @@ function discoverPriorStateDir(repoRoot, pr) {
     // 并发隔离硬约束：所有者进程仍存活时绝不接管它的目录。
     // 接管后对方的清理/写入会与本次运行互相踩踏（曾导致 stage 输出 ENOENT 反复重试）。
     const owner = stateDirOwnerPid(dir);
-    if (owner !== null && owner !== process.pid && pidIsAlive(owner)) {
+    if (owner !== null && owner !== process.pid && pidIsAlive(owner) && stateDirAgeMs(dir) < OWNER_STALE_MS) {
       skippedLiveStateDirs().push({ dir, owner });
       continue;
     }
@@ -585,6 +612,12 @@ async function runStageWithState(options) {
     const skipped = skippedDirs.shift();
     appendPipelineLog(repoRoot, pr,
       `event=resume_skipped reason=owner_process_alive dir=${path.basename(skipped.dir)} owner_pid=${skipped.owner} adopted_dir=${path.basename(stateDir)}`);
+  }
+  const takeoverDirs = claimTakeoverAudit();
+  while (takeoverDirs.length > 0) {
+    const t = takeoverDirs.shift();
+    appendPipelineLog(repoRoot, pr,
+      `event=claim_takeover reason=foreign_host_stale dir=${path.basename(t.dir)} holder_pid=${t.holder.pid ?? '-'} holder_host=${t.holder.host || '-'} adopted_dir=${path.basename(stateDir)}`);
   }
   const claimedDirs = skippedClaimedDirs();
   while (claimedDirs.length > 0) {
@@ -2825,6 +2858,7 @@ module.exports = {
   removableStateDir,
   claimPriorStateDir,
   skippedClaimedDirs,
+  claimTakeoverAudit,
   stateDirOwnerPid,
   pidIsAlive,
   pipelineLogPath,
