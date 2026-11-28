@@ -2441,7 +2441,7 @@ process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
             echo -e "    ${GREEN}[✓] impact:${verdict#OK } 回归路径已随 PR 变更${NC}"
             return 0 ;;
         WARN_NO_REGRESSION*)
-            echo -e "    ${YELLOW}[WARN] loopx-impact 未声明 regression[]；已按默认路径 tests/unit/issues/issue-$issue_id.test.js 核验。${NC}"
+            echo -e "    ${YELLOW}[WARN] loopx-impact 未声明 regression[]；已确认默认路径 tests/unit/issues/issue-$issue_id.test.js 在 PR 变更中（否则会以 REGRESSION_MISSING 阻断）。${NC}"
             return 0 ;;
         REGRESSION_MISSING*)
             echo -e "${RED}[-] [FAIL-CLOSED] impact 回归证据缺失：PR 未包含 ${verdict#REGRESSION_MISSING }。${NC}" >&2
