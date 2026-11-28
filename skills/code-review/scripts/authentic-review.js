@@ -75,6 +75,22 @@ if (!_budgetValid) {
   process.exit(1);
 }
 const REVIEW_CACHE_SCHEMA_V1 = 'loopx_flow_review_cache_v1';
+
+// ADR-0017：阶段重试总预算上限。单次预算 × 最大重试次数会让最长等待放大到 3×（默认 30 分钟）。
+// 默认只允许「首轮 + 至多一轮完整重试」；仍可通过 REVIEW_RETRY_BUDGET_MS 显式放宽，非法值 Fail-Closed。
+const _retryBudgetRaw = process.env.REVIEW_RETRY_BUDGET_MS;
+if (_retryBudgetRaw !== undefined && _retryBudgetRaw !== '') {
+  const parsed = Number(_retryBudgetRaw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.error(`[-] [FAIL-CLOSED] REVIEW_RETRY_BUDGET_MS 必须是正有限毫秒数（当前值: ${_retryBudgetRaw}）。`);
+    process.exit(1);
+  }
+}
+function resolveRetryBudgetMs(budgetMs) {
+  const override = Number(process.env.REVIEW_RETRY_BUDGET_MS);
+  if (Number.isFinite(override) && override > 0) return override;
+  return budgetMs * 2;
+}
 let _legacyCacheNoticePrinted = false;
 
 // 评审缓存目录（D2：锚定目标仓库 REPO_ROOT/.loopx/cache/reviews，可丢弃缓存，非权威状态）
@@ -438,6 +454,9 @@ async function runStageWithState(options) {
 
   let lastFailure = null;
   let attemptsUsed = 0;
+  let retryBudgetExhausted = false;
+  const retryBudgetMs = resolveRetryBudgetMs(budgetMs);
+  const stageStartedMs = Date.now();
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     attemptsUsed = attempt;
     const startedMs = Date.now();
@@ -551,6 +570,16 @@ async function runStageWithState(options) {
 
     if (errorClass !== 'ETIMEDOUT' || attempt >= maxAttempts) break;
 
+    // 总预算闸门：再来一轮最多再花 budgetMs；超出上限就停机，不把 3× 模型预算当成默认。
+    const elapsedTotal = Date.now() - stageStartedMs;
+    if (elapsedTotal + budgetMs > retryBudgetMs) {
+      retryBudgetExhausted = true;
+      writeStageState(repoRoot, pr, stage, { status: 'failed', error_class: errorClass, error_detail: detail, elapsed_ms: elapsed });
+      appendPipelineLog(repoRoot, pr,
+        `stage=${stage} attempt=${attempt} event=retry_budget_exhausted elapsed_total_ms=${elapsedTotal} retry_budget_ms=${retryBudgetMs} next_budget_ms=${budgetMs} reason=would_exceed_total_budget`);
+      break;
+    }
+
     const backoff = Math.min(backoffBaseMs * Math.pow(2, attempt - 1), RETRY_BACKOFF_CAP_MS);
     writeStageState(repoRoot, pr, stage, {
       status: 'retried',
@@ -568,6 +597,8 @@ async function runStageWithState(options) {
     error_class: lastFailure ? lastFailure.error_class : 'OTHER',
     error: lastFailure ? lastFailure.error : 'unknown stage failure',
     attempts: attemptsUsed,
+    retry_budget_exhausted: retryBudgetExhausted,
+    retry_budget_ms: retryBudgetMs,
   };
 }
 
