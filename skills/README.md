@@ -1,6 +1,6 @@
 # LoopX AI-Native 研发与交付流 Skills 资产库 (v2.0)
 
-本目录维护并聚合了 **LoopX AI-Native 研发与交付流**（遵循 Feature 自包含资产胶囊与 LoopX 原生能力驱动规范）的 **10 项核心 AI Agent Skills 资产**。
+本目录维护并聚合了 **LoopX AI-Native 研发与交付流**（遵循 Feature 自包含资产胶囊与 LoopX 原生能力驱动规范）的 **11 项核心 AI Agent Skills 资产**。
 
 ---
 
@@ -14,7 +14,8 @@
    - 原 `loopx-pr-merge` ➔ 下沉为 `loopx pr-review --check-merge-readiness` 物理防偷跑核验与官方程序。
 2. **纯认知思维模型保留（保留 8 项 Prompt Skills）**：
    - 聚焦人类与大模型的深度推理：第一性原理方案压力测试、精益 PRD、红队攻击、Job Story 拆解、TDD 红绿重构、七层因果根因排查与代码退役。
-3. **审查与质量门禁一体化（Code Review & OCR 改造）**：
+3. **真实表面验证与审查质量门禁一体化（Verification Harness / Code Review / OCR）**：
+   - `verification-harness`：复用并适配 `pstack@0.15.46`（MIT）五维验证模型（`Surface / Run / Drive / Observe / Isolate`）与 4-H2 Feature Map，内置 `scripts/prove-cli-surface.js` 冷启动驱动真实 CLI 表面并留存 Proof 证据，严格区分 `Doc Drift / Harness Gap / Product Bug`。
    - `code-review`：默认跨边界语义契约审查，内置 `scripts/ingest-to-loopx-quality.js` 适配器，将审查结论直接编译为 LoopX `change_quality_agent_result_v2` 并回写 `specs/features/<feature>/05-evidence.md`。
    - `open-code-review`：定位为**选配能力**，内置 `run-ocr.sh` 脚本自主完成环境自检、自动安装、扫描并接入 LoopX 质量门禁。
 4. **规划中技能（未落地，勿当作已生效能力引用）**：
@@ -24,7 +25,7 @@
 
 ---
 
-## 二、核心 10 项 Skills 资产清单
+## 二、核心 11 项 Skills 资产清单
 
 | 技能目录 | 管线节点 / 角色 | 核心职责与思维范式 |
 |---|---|---|
@@ -35,17 +36,20 @@
 | `prioritize-features` | 阶段 3：排期与优先级 | 基于 Impact × Confidence / Effort 评估矩阵进行价值排期。 |
 | `test-driven-development` | 阶段 5：TDD 实现 | 严格执行 Red-Green-Refactor，单测必须先红后绿，四大门禁 100% 通过。 |
 | `anti-entropy-governance` | 阶段 5 / 收尾：反熵增 | 执行 `delete-first` 原则，彻底清除旧废弃路径、孤儿代码与无意义兜底层。 |
+| **`verification-harness`** | 阶段 4～7：真实表面验证 | 复用 `pstack@0.15.46`（MIT）五维模型与 Feature Map，冷启动 Prove 真实 CLI 入口并沉淀可复核 Proof。 |
 | `systematic-debugging` | 管线 B / 疑难排查 | 七层因果追踪 (`L1 症状 ➔ ... ➔ L7 规格缺口`)，定位 Canonical Owner（根本所有者）。 |
 | **`code-review`** | 阶段 6：代码审查 (默认) | 默认跨边界语义审查 (0 Blocker)，内置适配脚本直通 LoopX change-quality。 |
 | **`open-code-review`** | 阶段 6：代码审查 (选配) | 阿里 OCR 深度扫描，技能内自检、按需安装与审查闭环。 |
 
 ---
 
-## 三、Code Review 交付物融合使用方式
-
-审查结论通过 `skills/code-review/scripts/ingest-to-loopx-quality.js` 自动转入 LoopX 质量内核：
+## 三、真实表面 Prove 与 Code Review 交付物融合使用方式
 
 ```bash
+# 0. 冷启动验证真实 CLI 表面并留存 Proof（沙箱自动销毁，宿主机零残留）:
+LC_ALL=en_US.UTF-8 node skills/verification-harness/scripts/prove-cli-surface.js \
+  --output-dir specs/features/<feature-name>/proofs
+
 # 1. 默认语义契约审查并生成不可篡改 Receipt:
 node skills/code-review/scripts/ingest-to-loopx-quality.js --feature <feature-name>
 
@@ -53,4 +57,4 @@ node skills/code-review/scripts/ingest-to-loopx-quality.js --feature <feature-na
 ./skills/open-code-review/run-ocr.sh origin/main <feature-name>
 ```
 
-产出将自动持久化至当前特性的自包含资产包 `specs/features/<feature-name>/05-evidence.md`。
+产出将自动持久化至当前特性的自包含资产包 `specs/features/<feature-name>/`。

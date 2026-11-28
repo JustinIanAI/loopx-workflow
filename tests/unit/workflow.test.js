@@ -59,7 +59,8 @@ test('2. Core AI-Native Prompt & Review skills integrity check', () => {
     'test-driven-development',
     'open-code-review',
     'systematic-debugging',
-    'anti-entropy-governance'
+    'anti-entropy-governance',
+    'verification-harness'
   ];
 
   for (const skill of coreSkills) {
