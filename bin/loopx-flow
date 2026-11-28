@@ -188,6 +188,40 @@ else process.stdout.write("OK");
     return 0
 }
 
+# ADR-0022（默认关闭）：合入前核验 change-quality 严格收据。
+# LoopX `change-quality` 是唯一质量裁决（ADR-0011 决策 4），收据缺失/失效/未验证不得推进
+# （决策 8）。本函数只验收据，绝不重跑四大门禁或二次审查。
+# 返回 0 = 通过；非 0 = fail-closed（原因已打印）。
+merge_quality_receipt_ok() {
+    local goal_id="${1:-}" base_ref="${2:-main}" payload rc ok
+    if [[ -z "$goal_id" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] merge_require_quality_receipt 已启用，但无法解析 Goal（缺少 feature 胶囊）。${NC}" >&2
+        echo -e "🛠️ 修复指令: 显式传入 --feature <name>，或在 loopx-workflow.config.json 关闭 merge_require_quality_receipt。${NC}" >&2
+        return 1
+    fi
+    if ! command -v loopx >/dev/null 2>&1; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，无法核验 change-quality 收据，禁止合并。${NC}" >&2
+        return 1
+    fi
+    rc=0
+    payload="$(read_loopx_json change-quality.verify change-quality verify --goal-id "$goal_id" --repo-path "$PROJECT_ROOT" --base-ref "$base_ref" --format json)" || rc=$?
+    ok="$(node -e '
+let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{
+let p={};try{p=JSON.parse(d)}catch(_){}
+process.stdout.write(p.ok===true?"1":"0");
+})' <<< "$payload")"
+    if [[ "$rc" -ne 0 || "$ok" != "1" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] change-quality 严格收据核验未通过（ok!=true），禁止合并（ADR-0022）。${NC}" >&2
+        echo -e "[-] 为什么阻断？ADR-0011 决策 8：收据缺失/失效/未验证 → 非 0 且不得推进。" >&2
+        echo -e "    verify 退出码: ${rc}；输出: ${payload:0:400}" >&2
+        echo -e "🛠️ 修复指令: 先在目标 head 上跑 loopx-flow check 生成收据；若 Goal 未启用资格: loopx configure-goal --goal-id $goal_id --change-quality-enabled --execute" >&2
+        echo -e "🛠️ 诊断指令: loopx change-quality verify --goal-id $goal_id --repo-path $PROJECT_ROOT --base-ref $base_ref --format json" >&2
+        return 1
+    fi
+    echo -e "    ${GREEN}[✓] change-quality 严格收据核验通过 (goal=${goal_id}, base=${base_ref})${NC}"
+    return 0
+}
+
 usage() {
     cat << 'USAGETXT'
 ===============================================================================
@@ -747,6 +781,21 @@ auth_accepted_by() {
 
 auth_accepted_at() {
     node -e 'const fs=require("fs");const d=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write((d.single_owner_risk_acceptance||{}).accepted_at||"")' "$(auth_config_path)" 2>/dev/null || true
+}
+
+# 读取 loopx-workflow.config.json 的布尔开关（ADR-0022 等「默认关闭」特性统一走这里）。
+# 只认 JSON 布尔 true：字符串 "true"、1、缺失、配置损坏一律视为关闭——
+# 交付门禁的开关不允许被配置歧义意外点亮。
+config_flag_enabled() {
+    local key="${1:-}"
+    [[ -n "$key" ]] || { printf '0'; return 0; }
+    node -e '
+const fs=require("fs");
+const [ file, key ] = process.argv.slice(1);
+let d={};
+try { d=JSON.parse(fs.readFileSync(file,"utf8")); } catch (_) { process.stdout.write("0"); process.exit(0); }
+process.stdout.write(d && typeof d === "object" && d[key] === true ? "1" : "0");
+' "$(auth_config_path)" "$key" 2>/dev/null || printf '0'
 }
 
 gh_login() {
@@ -2411,6 +2460,16 @@ cmd_merge() {
             exit 1
         fi
         echo -e "    ${GREEN}[✓] 物理防偷跑核验通过 (Lock: UNLOCKED @ $head_oid)。${NC}"
+
+        # ADR-0022（默认关闭）：交付门禁的最后一环——`check` 生成的 change-quality 收据
+        # 必须在合入前仍然有效。开关只认 JSON 布尔 true；关闭时不新增任何 loopx 调用。
+        if [[ "$(config_flag_enabled merge_require_quality_receipt)" == "1" ]]; then
+            echo -e "\n${BOLD}[2.5/4] 核验 change-quality 严格收据 (ADR-0022)...${NC}"
+            if ! merge_quality_receipt_ok "${merge_goal_id:-}" "${base_ref:-main}"; then
+                exit 1
+            fi
+        fi
+
         echo -e "\n${BOLD}[3/4] 执行原子 Squash 合并并删除特性分支...${NC}"
         if ! gh pr merge "$pr_id" --squash --delete-branch --match-head-commit "$head_oid"; then
             echo -e "${RED}[-] [FAIL-CLOSED] gh pr merge 失败，禁止继续补偿。${NC}" >&2
