@@ -347,9 +347,13 @@ function claimPriorStateDir(dir) {
         return true;
       }
       if (!claimIsStale(claimDir, holder)) return false;
-      if (holder.host && holder.host !== os.hostname()) {
-        claimTakeoverAudit().push({ dir, holder });
-      }
+      // 每次抢占都留痕：跨主机与「同机 pid 存活但认领超龄」都必须能解释「目录为何易主」。
+      const reason = holder.host && holder.host !== os.hostname()
+        ? 'foreign_host_stale'
+        : (holder.pid !== null && holder.pid !== process.pid && pidIsAlive(holder.pid)
+          ? 'host_live_over_stale'
+          : 'owner_dead');
+      claimTakeoverAudit().push({ dir, holder, reason });
       // 陈旧认领：搬走再抢建。rename 原子，两个进程只有一个能把目录搬走，输家下一轮照常竞争。
       const stale = `${claimDir}.stale.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
       try { fs.renameSync(claimDir, stale); } catch (_) { /* 已被别人搬走，回到竞争 */ }
@@ -617,7 +621,7 @@ async function runStageWithState(options) {
   while (takeoverDirs.length > 0) {
     const t = takeoverDirs.shift();
     appendPipelineLog(repoRoot, pr,
-      `event=claim_takeover reason=foreign_host_stale dir=${path.basename(t.dir)} holder_pid=${t.holder.pid ?? '-'} holder_host=${t.holder.host || '-'} adopted_dir=${path.basename(stateDir)}`);
+      `event=claim_takeover reason=${t.reason || 'unknown'} dir=${path.basename(t.dir)} holder_pid=${t.holder.pid ?? '-'} holder_host=${t.holder.host || '-'} adopted_dir=${path.basename(stateDir)}`);
   }
   const claimedDirs = skippedClaimedDirs();
   while (claimedDirs.length > 0) {

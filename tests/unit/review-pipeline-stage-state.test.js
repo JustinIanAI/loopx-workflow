@@ -687,6 +687,8 @@ test('原子认领：持有者存活但认领超龄（ADR-0017 D4 的 pid 复用
       const old = new Date(Date.now() - 5 * 60 * 60 * 1000); // 超过默认 2 × REVIEW_TIMEOUT_MS_MAX
       fs.utimesSync(claimDir, old, old);
       assert.strictEqual(ar.claimPriorStateDir(dir), true, '超龄认领必须可被抢占，否则 pid 复用会让残留目录永久卡死');
+      const audit = ar.claimTakeoverAudit();
+      assert.strictEqual(audit[audit.length - 1].reason, 'host_live_over_stale', '同机 pid 存活但认领超龄的抢占同样必须留痕');
       const owner = JSON.parse(fs.readFileSync(path.join(claimDir, 'owner'), 'utf8'));
       assert.strictEqual(owner.pid, process.pid);
       assert.notStrictEqual(owner.pid, child.pid);
@@ -726,9 +728,12 @@ test('跨主机认领：新鲜的外机认领不得被抢占，超龄才可并�
 
     const old = new Date(Date.now() - 5 * 60 * 60 * 1000);
     fs.utimesSync(claimDir, old, old);
+    const before = ar.claimTakeoverAudit().length;
     assert.strictEqual(ar.claimPriorStateDir(dir), true, '超龄外机认领必须可抢占，否则共享 tmp 下永久卡死');
-    assert.strictEqual(ar.claimTakeoverAudit().length, 1, '跨主机抢占必须留审计行');
-    assert.strictEqual(ar.claimTakeoverAudit()[0].holder.host, 'other-machine');
+    const audit = ar.claimTakeoverAudit();
+    assert.strictEqual(audit.length, before + 1, '跨主机抢占必须留审计行');
+    assert.strictEqual(audit[before].holder.host, 'other-machine');
+    assert.strictEqual(audit[before].reason, 'foreign_host_stale');
   } finally {
     s.restore();
   }

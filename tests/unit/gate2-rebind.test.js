@@ -172,3 +172,21 @@ test('base 在同一文件上方插入无关行导致改动位移：仍算同一
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('CLI：fetch 失败必须显式告警，不得与「指纹不等」在错误面上混淆', () => {
+  const dir = repo();
+  try {
+    // 无 origin：fetch 必然失败，但本地 origin/main 也不存在 → 仍 fail-closed（退出 1）。
+    const signed = commit(dir, 'feature.js', 'export const a = 1;\n', 'feat');
+    const current = commit(dir, 'feature.js', 'export const a = 2;\n', 'feat2');
+    const r = require('node:child_process').spawnSync(
+      process.execPath,
+      [path.join(__dirname, '../../lib/gate2-rebind.js'), 'same-change', 'origin/main', signed, current],
+      { cwd: dir, encoding: 'utf8', env: { ...process.env } },
+    );
+    assert.strictEqual(r.status, 1, '取不到 ref 必须 fail-closed');
+    assert.match(r.stderr, /无法 fetch origin\/main/, 'fetch 失败必须显式告警，否则离线与指纹不等无法区分');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
