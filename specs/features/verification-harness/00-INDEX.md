@@ -4,8 +4,8 @@
 - **Feature Name**: `verification-harness`
 - **Branch**: `feat/verification-harness-w5`
 - **LoopX Goal**: `verification-harness-goal`
-- **Current Status**: `STAGE_A_IMPLEMENTED (Awaiting Stage B Independent Review & Gate 2)`
-- **Contract Status**: `DRAFT (Stage A Ready — Single-Owner TTY Gate 1 Pending if Required)`
+- **Current Status**: APPROVED (Stage 5 TDD Ready)
+- **Contract Status**: FROZEN & APPROVED
 
 ## 过程文档索引
 1. [01-decisions.md](01-decisions.md) - 阶段 1：本胶囊实现取舍（关联 ADR-0011 / ADR-0007 / ADR-0014）

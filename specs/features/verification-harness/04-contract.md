@@ -1,6 +1,6 @@
 # Feature Contract & Tasks: verification-harness
 
-- **Contract-Status**: DRAFT (Pending Approval)
+- **Contract-Status**: FROZEN & APPROVED
 - **Feature Branch**: `feat/verification-harness-w5`
 - **LoopX Goal**: `verification-harness-goal`
 - **Scope**: `skills/verification-harness/**`, `skills/README.md`, `scripts/preflight-check.sh`, `tests/unit/workflow.test.js`, `tests/unit/verification-harness.test.js`, `specs/features/verification-harness/**`
