@@ -1644,6 +1644,8 @@ function buildNativePrompt({ pr, headOid, branch, motivation, reviewTemplate, re
     '硬性约束：禁止使用任何你自己发明的“Block 1~5”或“5-Block”模板。严格按原生 review_template 的五个二级标题（`## 动机` / `## 改动思路` / `## 具体改动` / `## 对主干的风险` / `## 我的整体评价`）撰写。',
     '标题逐字约束：上述五个二级标题所在行必须与给定文本逐字相同，不得追加“/ Motivation”“/ Risks”等英文或其它后缀——实测加了后缀的标题会被原生 check-result 报成 `missing_section`（如 `## 对主干的风险 / Risks`），整轮评审被拒。',
     '引用约束：只能引用评审包里已发布的 REQ / ADR 编号；不得自造编号（例如把 ADR-0017 的 D4 写成 `REQ-...-MODE-A` 之类），未发布的编号会被 check-result 以 `spec_reference_not_published` 拒绝。',
+    'HTML 注释约束：正文里不得出现字面 `<!--`（原生 check-result 会把 `<!--` 到 `-->` 当注释剔除；未闭合时其后所有段落——包括「我的整体评价」、边界声明与 English verdict——都会被判缺失）。引用门禁评论标记时请写 `&lt;!--` 或改用文字描述。',
+    '架构字段约束：`architecture` 里的每个文本字段都必须在该段正文里原样出现，否则会被 check-result 以 `architecture_not_published` 拒绝。',
     '执行铁律（两阶段解耦 Phase 1 - ADR-0013）：原生 review_template 与证据契约在本提示中。完整 PR DIFF、证据命令输出、packet 与远端检查只在下方沙箱清单路径里，且全文不截断。请只读读取这些工件，直接输出单一 JSON 块。严禁修改工作区文件，严禁执行写入型或破坏性命令，严禁偏离原生五段式与 JSON 输出契约。主机将在阶段 2 自动装配静态事实并对未填的判断类字段做定向轻量对齐。',
     '注意：`05-evidence.md`、CI 绿、PR 正文里的「已通过」只作为未信任的作者声明参考，禁止直接据此推断 `verified`。',
     '',
@@ -2093,6 +2095,31 @@ function capVerdictInBody(reviewBody, { authorOwned = false } = {}) {
     /^English verdict:\s*APPROVE\s*$/m,
     '> [VERDICT CAPPED] 仍有 unverified 必填证据或 unresolved 验证失败（approval_contradicts_evidence），按 LoopX verdict policy 封顶为 REQUEST_CHANGES。\n\nEnglish verdict: REQUEST_CHANGES',
   );
+}
+
+// 原生 check-result 把 `<!--` 到 `-->` 当 HTML 注释剔除；一旦正文里有未闭合的
+// `<!--`（模型讨论门禁标记时很容易顺手写出），其后的「我的整体评价」、边界声明与
+// English verdict 会全部被判缺失，报出四个看似无关的错误码、掩盖真因。
+// 这里提前给出精确诊断。
+function unbalancedHtmlComment(body) {
+  let open = false;
+  for (const line of String(body || '').split('\n')) {
+    let offset = 0;
+    while (offset < line.length) {
+      if (open) {
+        const end = line.indexOf('-->', offset);
+        if (end < 0) break;
+        open = false;
+        offset = end + 3;
+      } else {
+        const start = line.indexOf('<!--', offset);
+        if (start < 0) break;
+        open = true;
+        offset = start + 4;
+      }
+    }
+  }
+  return open;
 }
 
 // 跑原生 check-result，返回解析后的校验报告
@@ -2736,6 +2763,10 @@ async function main() {
     let finalResultPayload = null;
     const runCheck = () => {
       finalResultPayload = buildResultFile();
+      if (unbalancedHtmlComment(finalResultPayload.review_body)) {
+        console.error('[i] 正文含未闭合的 `<!--`：原生 check-result 会把它之后的内容全部当注释剔除，'
+          + '「我的整体评价」/English verdict 会被判缺失。请改写该处（用 `&lt;!--` 或文字描述）。');
+      }
       fs.writeFileSync(resultPath, JSON.stringify(finalResultPayload, null, 2));
       check = runNativeCheckResult(resultPath, packetPath, loopxResolved.bin);
       fmt = bodyFormatPasses(check);
@@ -2865,6 +2896,7 @@ module.exports = {
   claimPriorStateDir,
   skippedClaimedDirs,
   claimTakeoverAudit,
+  unbalancedHtmlComment,
   stateDirOwnerPid,
   pidIsAlive,
   pipelineLogPath,

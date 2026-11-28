@@ -997,3 +997,10 @@ describe('host truncation fail-closed guard', () => {
     fs.rmSync(pre, { recursive: true, force: true });
   });
 });
+
+test('HTML 注释守卫：未闭合的 <!-- 会让其后全文被判缺失，必须能提前识别', () => {
+  const { unbalancedHtmlComment } = require('../../skills/code-review/scripts/authentic-review.js');
+  assert.strictEqual(unbalancedHtmlComment('正常正文\n\n## 我的整体评价\n结论'), false);
+  assert.strictEqual(unbalancedHtmlComment('正文 <!-- loopx-flow:release-authorization:1@abc\n\n## 我的整体评价\n结论'), true);
+  assert.strictEqual(unbalancedHtmlComment('正文 <!-- a --> 结尾'), false);
+});
