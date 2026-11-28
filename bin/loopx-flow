@@ -202,18 +202,29 @@ usage() {
   approve contract <name> [--prepare|--interactive]
                           【断点 1】规格授权：默认校验 accepted_by 的 GitHub gate=1 评论；
                           --prepare 打印评论模板；--interactive 走本机 TTY
-  check [--with-ocr]      执行四大硬门禁与代码审查，生成并校验 LoopX change-quality 严格收据
+  check [--with-ocr] [--goal-id <gid>]
+                          执行四大硬门禁与代码审查，生成并校验 LoopX change-quality 严格收据
+                          （fix/issue-<id> 分支自动绑定 issue-<id>-goal；Issue 路径不写 05-evidence）
   pr <action> [feature]   按 PR #7545 官方标准从胶囊生成 4-Part 描述并提交/预览/更新 PR (create|preview|update|ready)
+                          pr create|update --issue <id> 用 Issue 正文生成 body 并写 loopx-meta / loopx-impact 标记
+                          pr update <pr> [--title <t>] 同时修正标题，避免标题宣称未交付范围
   review <pr_id> [--model <id>] [--reasoning-effort <level>]
                           执行 L2 交付审查并顶置 LoopX 原生五段式评审报告（复用 pr-review review_template）
                           可选透传模型与推理强度（CLI > REVIEW_MODEL / REVIEW_REASONING_EFFORT > runtime 默认）。
                           未传且未设置环境变量时不附加参数。详见 review --help。
   respond <pr_id>         复用 LoopX 原生五段式格式提交针对 Review findings 的逐项闭环汇报
-  merge <pr_id> [feature] 【断点 2】按 authorization_mode 核验 Mode A/B 授权与 readiness，Squash 合入并原子归档
+  merge <pr_id> [feature] [--goal-id <gid>]
+                          【断点 2】按 authorization_mode 核验 Mode A/B 授权与 readiness，Squash 合入并原子归档
+                          fix/issue-<id> 自动绑定 issue-<id>-goal 并核验 loopx-impact 分级
   release-approve <pr> [--prepare|--interactive]
                           【断点 2 / Mode B】默认校验 accepted_by 的 GitHub gate=2 评论；
                           --prepare 打印评论模板；--interactive 走 TTY 并写评论
-  issue <issue_id>        GitHub Issue 缺陷智能分流 (LoopX issue-fix feasibility 因果路由: fix_pr | comment_only | triage_only)
+  issue <issue_id> [--goal-id <gid>] [--impact R0|R1|R2] [--init-goal] [--execute]
+                          Issue 修复管线：feasibility 因果路由 + workflow-plan；--execute 才建/领 fix/issue-<id>
+                          （默认 dry-run 不写 domain state；--execute 必须绑定每 Issue Goal）
+        [--reproduction confirmed|planned|missing|blocked] [--scope bounded|uncertain|oversized]
+        [--reproduction-label <l>] [--validation-label <l>] [--comment-value none|clarification|diagnosis]
+        [--repository-context-json <path|->]   观察量决定 fix_pr 路由；label 缺失时用公开安全默认值
   integrate [--execute|--status]  LoopX 集成分支本地预集成 (默认 preview 不落盘)
   context <feature>       生成当前特性的长程上下文胶囊，供开发者与 AI Agent 快速穿透审阅
   archive <feature>       原子归档已合入特性的资产包 (specs/features/ -> specs/archive/)
@@ -994,12 +1005,23 @@ current_branch_pr() {
 # ADR-0019：解析 PR 对应 feature。优先 feature/<name> 分支，其次 PR body 的 loopx-meta goal_id（<feature>-goal）。
 resolve_pr_feature() {
     local pr_id="$1" head_ref="$2" feature="" goal=""
+    # Issue 修复不接受 Feature 胶囊：fix/issue-<id> 与 issue-<id>-goal 一律返回空 feature，
+    # 否则 issue-<id> 会被误读成特性名并去找不存在的 specs/features/issue-<id>/。
+    if [[ "$head_ref" =~ ^fix/issue-[0-9]+ ]]; then printf ''; return 0; fi
     if [[ "$head_ref" =~ ^feature/(.+) ]]; then feature="${BASH_REMATCH[1]}"; fi
     if [[ -z "$feature" ]]; then
-        goal="$(gh pr view "$pr_id" --json body --jq '.body' 2>/dev/null | sed -n 's/.*"goal_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        goal="$(resolve_pr_goal_id "$pr_id")"
+        if [[ "$goal" =~ ^issue-[0-9]+-goal$ ]]; then printf ''; return 0; fi
         if [[ "$goal" == *-goal ]]; then feature="${goal%-goal}"; fi
     fi
     printf '%s' "$feature"
+}
+
+# 从 PR body 的 loopx-meta 读取 Goal id（Issue/Feature 共用同一机器标记）。
+resolve_pr_goal_id() {
+    local pr_id="$1"
+    gh pr view "$pr_id" --json body --jq '.body' 2>/dev/null \
+        | sed -n 's/.*"goal_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
 }
 
 # ADR-0019：single_owner 的 Gate1 由 accepted_by 本人在 PR 上的 gate=1 评论签发。
@@ -1523,18 +1545,25 @@ cmd_check() {
         esac
     done
 
-    if [[ -z "$feature" ]]; then
-        local branch
-        branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
-        if [[ "$branch" =~ ^feature/(.+) ]]; then
-            feature="${BASH_REMATCH[1]}"
-        fi
+    local branch
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+    if [[ -z "$feature" && "$branch" =~ ^feature/(.+) ]]; then
+        feature="${BASH_REMATCH[1]}"
+    fi
+    # Issue 修复分支直接绑定每 Issue Goal；feature 保持为空，不写 05-evidence。
+    if [[ -z "$feature" && -z "$goal_id" && "$branch" =~ ^fix/issue-([0-9]+) ]]; then
+        goal_id="issue-${BASH_REMATCH[1]}-goal"
+        echo -e "    ${BLUE}[i] 从修复分支 $branch 推断 Issue Goal: $goal_id${NC}"
     fi
 
     if [[ -z "$feature" && -z "$goal_id" ]]; then
-        echo -e "${RED}[-] [FAIL-CLOSED] check 无法解析 Goal 身份：既不在 feature/<name> 分支，也没有显式 feature 或 --goal-id。${NC}" >&2
+        echo -e "${RED}[-] [FAIL-CLOSED] check 无法解析 Goal 身份：既不在 feature/<name> 或 fix/issue-<id> 分支，也没有显式 feature 或 --goal-id。${NC}" >&2
         echo -e "💡 为什么阻断？没有 Goal 就无法核验 change-quality 严格收据，不能进入交付。${NC}" >&2
-        echo -e "🛠️ 修复指令: 检出 feature/<name> 分支，或执行: loopx-flow check --goal-id <goal-id>${NC}" >&2
+        echo -e "🛠️ 修复指令: 检出 feature/<name> / fix/issue-<id> 分支，或执行: loopx-flow check --goal-id <goal-id>${NC}" >&2
+        exit 1
+    fi
+    if [[ "$with_ocr" == "true" && -z "$feature" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] --with-ocr 只适用于 Feature 胶囊（OCR 证据需回写 05-evidence）；Issue 修复不写 05-evidence。${NC}" >&2
         exit 1
     fi
     local resolved_goal="${goal_id:-${feature}-goal}"
@@ -1603,6 +1632,16 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
 ' "$gate_results_file" "$gate_name" "$gate_code" "$gate_status"
         if [[ "$gate_code" -ne 0 ]]; then gate_failed=1; fi
     done
+    # 把本次实测固化为 PR 可直接引用的证据（带 head，避免用旧结果冒充新提交）。
+    local gate_state_dir="$PROJECT_ROOT/.loopx/state" # loopx-allow: run-state dir under the project, ignored by git
+    mkdir -p "$gate_state_dir"
+    node -e '
+const fs = require("fs");
+const [src, dst, head] = process.argv.slice(1);
+const d = JSON.parse(fs.readFileSync(src, "utf8"));
+d.head = head;
+fs.writeFileSync(dst, JSON.stringify(d, null, 2));
+' "$gate_results_file" "$gate_state_dir/gate-results.json" "$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo '')"
     if [[ "$gate_failed" -ne 0 ]]; then
         echo -e "${RED}[-] [FAIL-CLOSED] 四大硬门禁未全绿；仍会写 05-evidence 的 failed/not_run 实测，但禁止进入交付。${NC}" >&2
         echo -e "    四门禁实测结果文件: $gate_results_file" >&2
@@ -1612,10 +1651,6 @@ fs.writeFileSync(file, JSON.stringify(d, null, 2));
 
     echo -e "\n${BOLD}[2/3] 正在执行代码级审查与质量适配映射...${NC}"
     if [[ "$with_ocr" == "true" && "$gate_failed" -eq 0 ]]; then
-        if [[ -z "$feature" ]]; then
-            echo -e "${RED}[-] [FAIL-CLOSED] --with-ocr 需要 feature 胶囊。${NC}" >&2
-            exit 1
-        fi
         echo -e "    检测到启用阿里 OCR 选配项，调用技能内自闭环脚本..."
         "$WORKFLOW_ROOT/skills/open-code-review/run-ocr.sh" "$cq_base_ref" "$feature" "$gate_results_file"
     else
@@ -1858,7 +1893,18 @@ HELPTXT
     echo -e "    [5/5] 执行 LoopX Status..."
     local loopx_status="PASSED"
     if command -v loopx >/dev/null 2>&1; then
-        if ! run_loopx status >/dev/null 2>&1; then
+        # 只核验本次交付的 Goal：全局 status 会因其它项目的 stale goal 非 0，
+        # 那与本次回复无关，不应阻断（也不能因此跳过核验）。
+        local respond_goal="" respond_branch
+        respond_branch="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+        if [[ "$respond_branch" =~ ^fix/issue-([0-9]+) ]]; then
+            respond_goal="issue-${BASH_REMATCH[1]}-goal"
+        fi
+        local -a respond_status_args=(status)
+        if [[ -n "$respond_goal" ]]; then
+            respond_status_args+=(--goal-id "$respond_goal")
+        fi
+        if ! run_loopx "${respond_status_args[@]}" >/dev/null 2>&1; then
             echo -e "${RED}[-] [FAIL-CLOSED] LoopX status 检查失败，阻断回复发布！${NC}" >&2
             exit 1
         fi
@@ -1930,12 +1976,14 @@ cmd_pr() {
         cat << 'HELPTXT'
 用法:
   loopx-flow pr create [feature] [--title "feat(...)"] [--base "main"] [--draft]
+  loopx-flow pr create --issue <id> [--goal-id <gid>] [--impact R0|R1|R2]
   loopx-flow pr preview [feature]
   loopx-flow pr update <pr_id> [feature]
   loopx-flow pr ready <pr_id>
 
 说明:
   按照 LoopX PR #7545 官方标准，从特性胶囊与真实 Git Diff 自动生成双语 4-Part 结构的 PR 描述（包含动机剖析、架构思路、关键代码逐文件讲解、主干风险及四大门禁实测矩阵），并直接发起或更新 GitHub PR。
+  --issue 模式从 Issue 正文生成动机/风险，并在 body 写入 loopx-meta / loopx-impact 机器标记（不读 Feature 胶囊）。
 HELPTXT
         exit 0
     fi
@@ -1970,15 +2018,46 @@ HELPTXT
         create)
             local base="main"
             local draft="false"
+            local issue_id="" goal_id="" impact="" impact_explicit="false"
+            local contract_impact="none"
+            local -a adrs=()
             local passthru_args=()
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --title)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --title 需要取值${NC}" >&2; exit 1; }
                         title="$2"
                         shift 2
                         ;;
                     --base)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --base 需要取值${NC}" >&2; exit 1; }
                         base="$2"
+                        shift 2
+                        ;;
+                    --issue)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --issue 需要 Issue 编号${NC}" >&2; exit 1; }
+                        issue_id="$2"
+                        shift 2
+                        ;;
+                    --goal-id)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --goal-id 需要取值${NC}" >&2; exit 1; }
+                        goal_id="$2"
+                        shift 2
+                        ;;
+                    --impact)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --impact 需要取值 R0|R1|R2${NC}" >&2; exit 1; }
+                        impact="$2"
+                        impact_explicit="true"
+                        shift 2
+                        ;;
+                    --contract-impact)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --contract-impact 需要取值 none|changed${NC}" >&2; exit 1; }
+                        contract_impact="$2"
+                        shift 2
+                        ;;
+                    --adr)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --adr 需要取值 docs/adr/*.md${NC}" >&2; exit 1; }
+                        adrs+=("$2")
                         shift 2
                         ;;
                     --draft)
@@ -1986,7 +2065,7 @@ HELPTXT
                     --no-draft)
                         draft="false"; shift ;;
                     *)
-                        if [[ -z "$feature" ]]; then
+                        if [[ -z "$feature" && -z "$issue_id" ]]; then
                             feature="$1"
                             shift
                         else
@@ -1997,53 +2076,125 @@ HELPTXT
                 esac
             done
 
-            if [[ -z "$feature" ]]; then
+            if ! command -v gh >/dev/null 2>&1; then
+                echo -e "${RED}[-] 错误: 未安装 gh CLI，无法自动创建 PR。${NC}" >&2
+                exit 1
+            fi
+
+            if [[ -n "$issue_id" ]]; then
+                # Issue 修复模式：不要求 Feature 胶囊，PR body 从 Issue 正文生成并写入机器标记。
+                if [[ ! "$issue_id" =~ ^[0-9]+$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法 --issue ${issue_id}（只接受数字编号）${NC}" >&2
+                    exit 1
+                fi
+                [[ -n "$goal_id" ]] || goal_id="issue-${issue_id}-goal"
+                # 未显式传 --impact 时从 Issue 正文读取（loopx-impact 标记或 Impact: 行），
+                # 与 cmd_issue 同一解析，避免 R0 纯文档 Issue 被静默写成 R1。
+                if [[ "$impact_explicit" != "true" ]]; then
+                    local issue_impact_probe issue_impact_parsed
+                    issue_impact_probe="$(gh issue view "$issue_id" --json body --jq '.body // ""' 2>/dev/null || true)"
+                    if [[ -n "$issue_impact_probe" ]]; then
+                        issue_impact_parsed="$(printf '%s' "$issue_impact_probe" | issue_impact_from_body)"
+                        case "$issue_impact_parsed" in
+                            R0|R1|R2) impact="$issue_impact_parsed" ;;
+                            INVALID:*)
+                                echo -e "${RED}[-] [FAIL-CLOSED] Issue #$issue_id 的 impact 分级非法（${issue_impact_parsed#INVALID:}），只接受 R0|R1|R2。${NC}" >&2
+                                exit 1 ;;
+                        esac
+                    fi
+                fi
+                [[ -n "$impact" ]] || impact="R1"
+                if [[ ! "$impact" =~ ^R[012]$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法影响分级 --impact ${impact}（只接受 R0|R1|R2）${NC}" >&2
+                    exit 1
+                fi
+                if [[ ! "$contract_impact" =~ ^(none|changed)$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法 --contract-impact ${contract_impact}（只接受 none|changed）${NC}" >&2
+                    exit 1
+                fi
+                if [[ "$contract_impact" == "changed" && ${#adrs[@]} -eq 0 ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] --contract-impact changed 必须用 --adr 指明至少一份 ADR（merge 会核验其在 PR head 上为 Accepted）。${NC}" >&2
+                    exit 1
+                fi
+                if [[ "$current_branch" =~ ^fix/issue-([0-9]+) && "${BASH_REMATCH[1]}" != "$issue_id" ]]; then
+                    echo -e "${YELLOW}[WARN] 当前分支 $current_branch 与 --issue $issue_id 不一致。${NC}" >&2
+                fi
+            elif [[ -z "$feature" ]]; then
                 if [[ "$current_branch" =~ ^feature/(.+) ]]; then
                     feature="${BASH_REMATCH[1]}"
                 elif [[ "$current_branch" =~ ^fix/(.+) ]]; then
                     feature="${BASH_REMATCH[1]}"
                 fi
             fi
-            if [[ -z "$feature" ]]; then
-                echo -e "${RED}[-] 错误: 请指定特性名称或检出 feature/<name> 分支。${NC}" >&2
+            if [[ -z "$feature" && -z "$issue_id" ]]; then
+                echo -e "${RED}[-] 错误: 请指定特性名称、--issue <id>，或检出 feature/<name> 分支。${NC}" >&2
                 exit 1
             fi
 
-            if ! command -v gh >/dev/null 2>&1; then
-                echo -e "${RED}[-] 错误: 未安装 gh CLI，无法自动创建 PR。${NC}" >&2
-                exit 1
+            if [[ -z "$title" && -n "$issue_id" ]]; then
+                local issue_title
+                issue_title="$(gh issue view "$issue_id" --json title --jq .title 2>/dev/null || true)"
+                title="fix(issue-${issue_id}): ${issue_title:-resolve issue #$issue_id}"
             fi
-
             if [[ -z "$title" ]]; then
                 title="feat(${feature}): implement ${feature} aligned with PR #7545 protocol"
             fi
 
             local pr_body
-            pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
+            if [[ -n "$issue_id" ]]; then
+                wf_run_dir pr-create
+                local issue_body_file="$WF_RUN_DIR/issue-${issue_id}-body.md"
+                wf_register_temp_file "$issue_body_file"
+                if ! gh issue view "$issue_id" --json body --jq '.body // ""' > "$issue_body_file" 2>/dev/null || [[ ! -s "$issue_body_file" ]]; then
+                    wf_unregister_temp_file "$issue_body_file"
+                    rm -f "$issue_body_file"
+                    echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Issue #$issue_id 正文，拒绝生成无动机的 PR。${NC}" >&2
+                    exit 1
+                fi
+                local -a body_args=(--generate-pr-body --issue-body-file "$issue_body_file" --impact "$impact" --goal-id "$goal_id")
+                local gate_evidence="$PROJECT_ROOT/.loopx/state/gate-results.json" # loopx-allow: check 固化的实测证据
+                if [[ -f "$gate_evidence" ]]; then body_args+=(--gate-results "$gate_evidence"); fi
+                pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" "${body_args[@]}")"
+                wf_unregister_temp_file "$issue_body_file"
+                rm -f "$issue_body_file"
+                local adrs_json="[]"
+                if [[ ${#adrs[@]} -gt 0 ]]; then
+                    adrs_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "${adrs[@]}")"
+                fi
+                pr_body="${pr_body}
+
+<!-- loopx-meta: {\"goal_id\":\"${goal_id}\"} -->
+<!-- loopx-impact: {\"level\":\"${impact}\",\"issue\":${issue_id},\"contract_impact\":\"${contract_impact}\",\"adrs\":${adrs_json},\"regression\":[\"tests/unit/issues/issue-${issue_id}.test.js\"],\"rollback\":\"revert the squash commit of this PR\"} -->"
+            else
+                pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
+            fi
 
             echo -e "${BLUE}==> [PR 提交] 正在通过 GitHub CLI 创建 PR (对齐 PR #7545 双语 4-Part 体系)...${NC}"
-            local pr_url pr_err_file pr_err marker draft_hint=""
+            local pr_url pr_err_file pr_err marker="" draft_hint=""
             local -a draft_args=()
             if [[ "$draft" == "true" ]]; then
                 draft_args=(--draft)
                 draft_hint=" --draft"
             fi
-            marker="$(presentation_state_file "$feature")"
+            # Issue 修复没有 Feature 胶囊，也没有 Gate1，因此不落 presentation 标记。
+            if [[ -n "$feature" ]]; then marker="$(presentation_state_file "$feature")"; fi
             wf_run_dir pr-create
             pr_err_file="$WF_RUN_DIR/gh-pr-create.err"
             wf_register_temp_file "$pr_err_file"
             if pr_url="$(printf '%s' "$pr_body" | gh pr create --title "$title" --base "$base" --body-file - ${draft_args[@]+"${draft_args[@]}"} ${passthru_args[@]+"${passthru_args[@]}"} 2>"$pr_err_file")"; then
                 wf_unregister_temp_file "$pr_err_file"
-                rm -f "$pr_err_file" "$marker"
+                rm -f "$pr_err_file"
+                if [[ -n "$marker" ]]; then rm -f "$marker"; fi
                 echo -e "${GREEN}[✓] PR 创建成功: ${pr_url}${NC}"
                 echo "presentation=published"
             else
                 pr_err="$(tr '\n' ' ' < "$pr_err_file" 2>/dev/null | cut -c1-400 || true)"
                 wf_unregister_temp_file "$pr_err_file"
                 rm -f "$pr_err_file"
-                # presentation=pending 必须可观测且持久：Gate1 approve 读取该标记并 BLOCK（不再是 WARN）。
-                mkdir -p "$(dirname "$marker")"
-                node -e '
+                if [[ -n "$marker" ]]; then
+                    # presentation=pending 必须可观测且持久：Gate1 approve 读取该标记并 BLOCK（不再是 WARN）。
+                    mkdir -p "$(dirname "$marker")"
+                    node -e '
 const fs = require("fs");
 const [file, feature, draft, reason] = process.argv.slice(1);
 fs.writeFileSync(file, JSON.stringify({
@@ -2055,39 +2206,121 @@ fs.writeFileSync(file, JSON.stringify({
   recorded_at: new Date().toISOString()
 }, null, 2) + "\n");
 ' "$marker" "$feature" "$draft" "${pr_err:-gh pr create failed}"
-                echo -e "${RED}[-] PR 创建失败（presentation=pending）。${NC}" >&2
+                    echo -e "${RED}[-] PR 创建失败（presentation=pending）。${NC}" >&2
+                else
+                    echo -e "${RED}[-] PR 创建失败（Issue 修复路径无 Feature 胶囊，不写 presentation 标记）。${NC}" >&2
+                fi
                 if [[ -n "$pr_err" ]]; then
                     echo -e "    gh 输出: ${pr_err}${NC}" >&2
                 fi
-                echo -e "🛠️ 修复指令: 修复 gh 认证/网络后重跑 loopx-flow pr create $feature${draft_hint}；presentation=pending 会阻断 Gate1 approve。${NC}" >&2
+                if [[ -n "$issue_id" ]]; then
+                    echo -e "🛠️ 修复指令: 修复 gh 认证/网络后重跑 loopx-flow pr create --issue $issue_id --goal-id ${goal_id} --impact ${impact}${draft_hint}。${NC}" >&2
+                else
+                    echo -e "🛠️ 修复指令: 修复 gh 认证/网络后重跑 loopx-flow pr create $feature${draft_hint}；presentation=pending 会阻断 Gate1 approve。${NC}" >&2
+                fi
                 exit 1
             fi
             ;;
         update)
-            pr_id="${1:-}"
-            shift || true
-            feature="${1:-}"
+            local upd_issue="" upd_goal="" upd_impact="" upd_contract="none" upd_title=""
+            local -a upd_adrs=()
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --issue)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --issue 需要 Issue 编号${NC}" >&2; exit 1; }
+                        upd_issue="$2"; shift 2 ;;
+                    --goal-id)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --goal-id 需要取值${NC}" >&2; exit 1; }
+                        upd_goal="$2"; shift 2 ;;
+                    --impact)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --impact 需要取值 R0|R1|R2${NC}" >&2; exit 1; }
+                        upd_impact="$2"; shift 2 ;;
+                    --contract-impact)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --contract-impact 需要取值 none|changed${NC}" >&2; exit 1; }
+                        upd_contract="$2"; shift 2 ;;
+                    --adr)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --adr 需要取值 docs/adr/*.md${NC}" >&2; exit 1; }
+                        upd_adrs+=("$2"); shift 2 ;;
+                    --title)
+                        [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --title 需要取值${NC}" >&2; exit 1; }
+                        upd_title="$2"; shift 2 ;;
+                    -*)
+                        echo -e "${RED}[-] 错误: 未知参数 $1${NC}" >&2; exit 1 ;;
+                    *)
+                        if [[ -z "$pr_id" ]]; then pr_id="$1"; elif [[ -z "$feature" ]]; then feature="$1"; fi
+                        shift ;;
+                esac
+            done
             if [[ -z "$pr_id" ]]; then
                 echo -e "${RED}[-] 错误: 请指定待更新的 PR 编号，例如: loopx-flow pr update 13${NC}" >&2
                 exit 1
             fi
-            if [[ -z "$feature" ]]; then
+            if [[ -z "$upd_issue" && "$current_branch" =~ ^fix/issue-([0-9]+) ]]; then
+                upd_issue="${BASH_REMATCH[1]}"
+            fi
+            if [[ -z "$feature" && -z "$upd_issue" ]]; then
                 if [[ "$current_branch" =~ ^feature/(.+) ]]; then
                     feature="${BASH_REMATCH[1]}"
                 elif [[ "$current_branch" =~ ^fix/(.+) ]]; then
                     feature="${BASH_REMATCH[1]}"
                 fi
             fi
-            if [[ -z "$feature" ]]; then
-                echo -e "${RED}[-] 错误: 请指定特性名称或检出 feature/<name> 分支。${NC}" >&2
+            if [[ -z "$feature" && -z "$upd_issue" ]]; then
+                echo -e "${RED}[-] 错误: 请指定特性名称、--issue <id>，或检出 feature/<name> 分支。${NC}" >&2
                 exit 1
             fi
 
             local pr_body
-            pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
+            if [[ -n "$upd_issue" ]]; then
+                if [[ ! "$upd_issue" =~ ^[0-9]+$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法 --issue ${upd_issue}（只接受数字编号）${NC}" >&2
+                    exit 1
+                fi
+                [[ -n "$upd_goal" ]] || upd_goal="issue-${upd_issue}-goal"
+                [[ -n "$upd_impact" ]] || upd_impact="R1"
+                if [[ ! "$upd_impact" =~ ^R[012]$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法影响分级 --impact ${upd_impact}（只接受 R0|R1|R2）${NC}" >&2
+                    exit 1
+                fi
+                if [[ ! "$upd_contract" =~ ^(none|changed)$ ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] 非法 --contract-impact ${upd_contract}（只接受 none|changed）${NC}" >&2
+                    exit 1
+                fi
+                if [[ "$upd_contract" == "changed" && ${#upd_adrs[@]} -eq 0 ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] --contract-impact changed 必须用 --adr 指明至少一份 ADR（merge 会核验其在 PR head 上为 Accepted）。${NC}" >&2
+                    exit 1
+                fi
+                wf_run_dir pr-update
+                local upd_body_file="$WF_RUN_DIR/issue-${upd_issue}-body.md"
+                wf_register_temp_file "$upd_body_file"
+                if ! gh issue view "$upd_issue" --json body --jq '.body // ""' > "$upd_body_file" 2>/dev/null || [[ ! -s "$upd_body_file" ]]; then
+                    wf_unregister_temp_file "$upd_body_file"
+                    rm -f "$upd_body_file"
+                    echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Issue #$upd_issue 正文。${NC}" >&2
+                    exit 1
+                fi
+                local -a upd_args=(--generate-pr-body --issue-body-file "$upd_body_file" --impact "$upd_impact" --goal-id "$upd_goal")
+                local upd_gate_evidence="$PROJECT_ROOT/.loopx/state/gate-results.json" # loopx-allow: check 固化的实测证据
+                if [[ -f "$upd_gate_evidence" ]]; then upd_args+=(--gate-results "$upd_gate_evidence"); fi
+                pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" "${upd_args[@]}")"
+                wf_unregister_temp_file "$upd_body_file"
+                rm -f "$upd_body_file"
+                local upd_adrs_json="[]"
+                if [[ ${#upd_adrs[@]} -gt 0 ]]; then
+                    upd_adrs_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "${upd_adrs[@]}")"
+                fi
+                pr_body="${pr_body}
+
+<!-- loopx-meta: {\"goal_id\":\"${upd_goal}\"} -->
+<!-- loopx-impact: {\"level\":\"${upd_impact}\",\"issue\":${upd_issue},\"contract_impact\":\"${upd_contract}\",\"adrs\":${upd_adrs_json},\"regression\":[\"tests/unit/issues/issue-${upd_issue}.test.js\"],\"rollback\":\"revert the squash commit of this PR\"} -->"
+            else
+                pr_body="$(node "$WORKFLOW_ROOT/skills/code-review/scripts/authentic-review.js" --generate-pr-body --feature "$feature")"
+            fi
 
             echo -e "${BLUE}==> [PR 更新] 正在更新 PR #${pr_id} 描述 (对齐 PR #7545 双语 4-Part 体系)...${NC}"
-            if printf '%s' "$pr_body" | gh pr edit "$pr_id" --body-file -; then
+            local -a edit_args=(--body-file -)
+            if [[ -n "$upd_title" ]]; then edit_args+=(--title "$upd_title"); fi
+            if printf '%s' "$pr_body" | gh pr edit "$pr_id" "${edit_args[@]}"; then
                 echo -e "${GREEN}[✓] PR #${pr_id} 描述已成功更新！${NC}"
             else
                 echo -e "${RED}[-] PR 更新失败。${NC}" >&2
@@ -2163,8 +2396,13 @@ cmd_release_approve() {
         contract_sha="$(contract_sha_for "$feature" || true)"
         [[ -n "$contract_sha" ]] || { echo "[-] [FAIL-CLOSED] 缺少 feature ${feature} 的 04-contract.md" >&2; exit 1; }
     else
-        echo "[WARN] 非 feature 分支且 PR body 无 loopx-meta：Gate2 评论不绑定契约（contract_sha=none）。" >&2
+        echo "[WARN] Issue Goal / 非 feature PR 不绑定 Feature 契约：Gate2 评论 contract_sha=none。" >&2
     fi
+
+    # 本 PR 自己新增/修改的 ADR：Gate2 评论里必须带 Owner 的 `adr-accepted:` 行，
+    # 否则 merge 的 ADR 自证防护会阻断（作者不能给自己的 ADR 写 Accepted 就算数）。
+    local adr_accept_lines=""
+    adr_accept_lines="$(release_adr_accept_lines "$pr_id" 2>/dev/null || true)"
 
     # ADR-0019：--prepare 只打印 GitHub 签名评论模板，零写入。
     if [[ "$prepare" == "true" ]]; then
@@ -2173,11 +2411,17 @@ cmd_release_approve() {
         echo "    head         : $head_oid"
         echo "    contract_sha : $contract_sha"
         echo "    principal    : $accepted_by"
+        if [[ -n "$adr_accept_lines" ]]; then
+            echo "    adr          : $(printf '%s' "$adr_accept_lines" | sed 's/^adr-accepted: //' | paste -sd, - 2>/dev/null || true)"
+        fi
         echo ""
         echo "请在 PR #${pr_id} 上以 ${accepted_by} 身份粘贴以下评论，然后重跑 loopx-flow merge ${pr_id}："
         echo ""
         echo "<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->"
         echo "gate=2;mode=single_owner;head=$head_oid;contract_sha=$contract_sha;principal=$accepted_by;risk_acceptance=$(auth_accepted_by)@$(auth_accepted_at)"
+        if [[ -n "$adr_accept_lines" ]]; then
+            printf '%s\n' "$adr_accept_lines"
+        fi
         exit 0
     fi
 
@@ -2212,6 +2456,10 @@ cmd_release_approve() {
     local body
     body="<!-- loopx-flow:release-authorization:$pr_id@$head_oid -->
 gate=2;mode=single_owner;head=$head_oid;contract_sha=$contract_sha;principal=$principal;approved_at=$timestamp;risk_acceptance=$(auth_accepted_by)@$(auth_accepted_at)"
+    if [[ -n "$adr_accept_lines" ]]; then
+        body="${body}
+${adr_accept_lines}"
+    fi
     if ! gh pr comment "$pr_id" --body "$body" >/dev/null 2>&1; then
         echo "[-] [FAIL-CLOSED] 写入 release-authorization 评论失败" >&2
         exit 1
@@ -2260,9 +2508,277 @@ cmd_status_next() {
     echo "Reason: 契约已批准、证据存在；进入交付审查（Gate2 未授权）。"
 }
 
+# Issue 正文的 impact 分级（唯一实现）：优先 loopx-impact 机器标记，其次 `Impact:` 行。
+# 空输出 = 未声明；INVALID:<值> = 声明了非法值。cmd_issue 与 pr create --issue 共用。
+issue_impact_from_body() {
+    node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  const tag = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/.exec(raw);
+  if (tag) {
+    try {
+      const marker = JSON.parse(tag[1]);
+      if (marker && typeof marker.level === "string") {
+        const level = marker.level.toUpperCase();
+        process.stdout.write(/^R[012]$/.test(level) ? level : `INVALID:${marker.level}`);
+        return;
+      }
+    } catch (e) { /* 落到人读行 */ }
+  }
+  const line = /(?:^|\n)[ \t]*(?:[-*][ \t]*)?\**[ \t]*impact[ \t]*\**[ \t]*[:：][ \t]*`?\**[ \t]*([A-Za-z0-9]+)/i.exec(raw);
+  if (line) {
+    const value = String(line[1] || "").toUpperCase();
+    process.stdout.write(/^R[012]$/.test(value) ? value : `INVALID:${line[1]}`);
+  }
+});
+'
+}
+
+# impact 标记等级解析（唯一实现）：与 merge_enforce_issue_impact 同一规则——
+# 按本分支 Issue 编号优先匹配，匹配不到才兜底取最后一条；避免两处解析各读一条
+# 标记导致「校验按 R1、Goal 门读 R0」的自相矛盾。
+pr_impact_level() {
+    local pr_id="$1" issue_id="$2" body
+    body="$(gh pr view "$pr_id" --json body --jq '.body // ""' 2>/dev/null || true)"
+    [[ -n "$body" ]] || return 0
+    printf '%s' "$body" | node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  const issueId = String(process.argv[1] || "");
+  const re = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/g;
+  const found = [];
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    try { found.push(JSON.parse(m[1])); } catch (e) { found.push(null); }
+  }
+  let pick = null;
+  for (let i = found.length - 1; i >= 0; i -= 1) {
+    if (found[i] && String(found[i].issue || "") === issueId) { pick = found[i]; break; }
+  }
+  if (!pick) pick = found.length ? found[found.length - 1] : null;
+  if (pick && typeof pick.level === "string") process.stdout.write(pick.level.toUpperCase());
+});
+' "$issue_id"
+}
+
+# Issue 修复 PR 的影响分级检查（ADR-0023）：只对 fix/issue-<id> 分支生效。
+# R0 免 Goal/Receipt 但出现任何代码文件即取消豁免；R1 必须有随 PR 变更的复现测试；
+# R2 额外要求 rollback，contract_impact=changed 时要求 ADR 在 PR head 上为 Accepted。
+merge_enforce_issue_impact() {
+    local pr_id="$1" head_oid="$2" head_ref="$3" issue_id
+    [[ "$head_ref" =~ ^fix/issue-([0-9]+) ]] || return 0
+    issue_id="${BASH_REMATCH[1]}"
+
+    local payload verdict
+    payload="$(gh pr view "$pr_id" --json body,files --jq '{body: (.body // ""), files: [(.files // [])[].path]}' 2>/dev/null || true)"
+    if [[ -z "$payload" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 PR #$pr_id 的 body/files，无法核验 impact 分级。${NC}" >&2
+        return 1
+    fi
+    verdict="$(node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  const issueId = process.argv[1];
+  let p = {};
+  try { p = JSON.parse(raw); } catch (e) { console.log("INVALID"); return; }
+  const body = String(p.body || "");
+  const files = new Set(Array.isArray(p.files) ? p.files.map((f) => String((f && f.path) || f)) : []);
+  // PR body 里可能同时有 Issue 正文自带的标记和 pr create/update 生成的那一条。
+  // 先按本分支 Issue 编号匹配，再兜底取最后一条（生成标记永远追加在正文末尾）。
+  const re = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/g;
+  const found = [];
+  let hit;
+  while ((hit = re.exec(body)) !== null) {
+    try { found.push(JSON.parse(hit[1])); } catch (e) { found.push(null); }
+  }
+  if (!found.length) { console.log("MISSING"); return; }
+  let marker = null;
+  for (let i = found.length - 1; i >= 0; i -= 1) {
+    if (found[i] && String(found[i].issue || "") === issueId) { marker = found[i]; break; }
+  }
+  if (!marker) {
+    marker = found[found.length - 1];
+    if (!marker) { console.log("INVALID"); return; }
+    if (marker.issue !== undefined && String(marker.issue) !== issueId) { console.log("ISSUE_MISMATCH " + marker.issue); return; }
+  }
+  const level = String(marker.level || "").toUpperCase();
+  if (!/^R[012]$/.test(level)) { console.log("INVALID"); return; }
+  if (level === "R0") {
+    const codeFiles = [...files].filter((f) => !/^(docs\/|\.github\/ISSUE_TEMPLATE\/|README|LICENSE|CHANGELOG|AGENTS\.md|GLOSSARY\.md)/.test(f));
+    console.log(codeFiles.length ? "R0_WITH_CODE " + codeFiles.slice(0, 5).join(",") : "OK R0");
+    return;
+  }
+  const regression = Array.isArray(marker.regression) ? marker.regression.map(String) : [];
+  const required = regression.length ? regression : ["tests/unit/issues/issue-" + issueId + ".test.js"];
+  const missing = required.filter((f) => !files.has(f));
+  if (missing.length) { console.log("REGRESSION_MISSING " + missing.join(",")); return; }
+  if (level === "R2") {
+    if (!String(marker.rollback || "").trim()) { console.log("ROLLBACK_MISSING"); return; }
+    const contract = String(marker.contract_impact || "none");
+    if (contract === "changed") {
+      const adrs = Array.isArray(marker.adrs) ? marker.adrs.map(String) : [];
+      if (!adrs.length) { console.log("ADR_MISSING"); return; }
+      // 本 PR 自己新增/修改的 ADR 不能靠作者自写「Accepted」自证，必须另有 Owner 授权。
+      const inDiff = adrs.filter((a) => files.has(a));
+      console.log("ADR_CHECK " + adrs.join(",") + "|" + inDiff.join(","));
+      return;
+    }
+    if (contract !== "none") { console.log("INVALID"); return; }
+  }
+  console.log((regression.length ? "OK " : "WARN_NO_REGRESSION ") + level);
+});
+' "$issue_id" <<< "$payload")"
+
+    local repo adr content list
+    local -a adrs
+    case "$verdict" in
+        "OK R0")
+            echo -e "    ${YELLOW}[i] impact:R0 纯文档/隔离配置 PR，免 check 收据，仍走 Gate2。${NC}"
+            return 0 ;;
+        R0_WITH_CODE*)
+            echo -e "${RED}[-] [FAIL-CLOSED] PR 标记 impact:R0，但包含代码文件：${verdict#R0_WITH_CODE }。R0 豁免失效，请改为 R1/R2 并提供复现测试与 Goal。${NC}" >&2
+            return 1 ;;
+        "OK R1"|"OK R2")
+            echo -e "    ${GREEN}[✓] impact:${verdict#OK } 回归路径已随 PR 变更${NC}"
+            return 0 ;;
+        WARN_NO_REGRESSION*)
+            echo -e "    ${YELLOW}[WARN] loopx-impact 未声明 regression[]；已确认默认路径 tests/unit/issues/issue-$issue_id.test.js 在 PR 变更中（否则会以 REGRESSION_MISSING 阻断）。${NC}"
+            return 0 ;;
+        REGRESSION_MISSING*)
+            echo -e "${RED}[-] [FAIL-CLOSED] impact 回归证据缺失：PR 未包含 ${verdict#REGRESSION_MISSING }。${NC}" >&2
+            return 1 ;;
+        ROLLBACK_MISSING)
+            echo -e "${RED}[-] [FAIL-CLOSED] impact:R2 缺少 rollback 说明。${NC}" >&2
+            return 1 ;;
+        INVALID)
+            echo -e "${RED}[-] [FAIL-CLOSED] PR body 的 loopx-impact 标记非法（level 只接受 R0|R1|R2）。${NC}" >&2
+            return 1 ;;
+        ADR_MISSING)
+            echo -e "${RED}[-] [FAIL-CLOSED] impact:R2 且 contract_impact=changed，但 adrs[] 为空。${NC}" >&2
+            return 1 ;;
+        ADR_CHECK*)
+            repo="$(github_repo || true)"
+            if [[ -z "$repo" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 无法解析 GitHub 仓库，无法核验 ADR 状态。${NC}" >&2
+                return 1
+            fi
+            list="${verdict#ADR_CHECK }"
+            local changed_adrs="${list#*|}"
+            list="${list%%|*}"
+            IFS=',' read -r -a adrs <<< "$list"
+            for adr in "${adrs[@]}"; do
+                content="$(gh api "repos/$repo/contents/$adr?ref=$head_oid" -H "Accept: application/vnd.github.raw" 2>/dev/null || true)"
+                # 本仓库 ADR 模板用「**状态**：Accepted」，英文 Status 只是别名；两种都要认。
+                if ! printf '%s' "$content" | grep -Eq '(状态|[Ss]tatus)[^A-Za-z]{0,8}Accepted'; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] impact:R2 要求 $adr 在 PR head 上为 Accepted。${NC}" >&2
+                    return 1
+                fi
+                # 自证防护：本 PR 自己新增/修改的 ADR，head 上的 Accepted 必须另有
+                # accepted_by 在 PR 上绑定当前 head 的授权评论佐证，否则只是作者单方面声明。
+                if [[ ",$changed_adrs," != *",$adr,"* ]]; then
+                    :
+                elif [[ "$(auth_mode)" != "single_owner" ]]; then
+                    # independent 模式：非作者批准本身就是外部授权，ADR 接受由 Mode A 覆盖。
+                    echo -e "    ${YELLOW}[i] independent 模式：$adr 由本 PR 新增/修改，接受证据由非作者批准覆盖。${NC}"
+                else
+                    local accepted_by comments_json
+                    accepted_by="$(auth_accepted_by 2>/dev/null || true)"
+                    if [[ -z "$accepted_by" ]]; then
+                        echo -e "${RED}[-] [FAIL-CLOSED] 本 PR 变更了 $adr，但配置缺少 accepted_by，无法核验 ADR 接受授权。${NC}" >&2
+                        return 1
+                    fi
+                    comments_json="$(gh api "repos/$repo/issues/$pr_id/comments" --paginate 2>/dev/null || true)"
+                    if ! printf '%s' "$comments_json" | node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  const [login, adr, head] = process.argv.slice(1);
+  let rows;
+  try { rows = JSON.parse(raw.replace(/\]\s*\[/g, ",")); } catch (e) { process.exit(1); }
+  if (!Array.isArray(rows)) process.exit(1);
+  const ok = rows.some((r) => String((r.user || {}).login || "") === login
+    && String(r.body || "").includes("adr-accepted: " + adr)
+    && String(r.body || "").includes("head=" + head));
+  process.exit(ok ? 0 : 1);
+});
+' "$accepted_by" "$adr" "$head_oid"; then
+                        echo -e "${RED}[-] [FAIL-CLOSED] $adr 由本 PR 新增/修改，作者自写 Accepted 不能自证。${NC}" >&2
+                        echo -e "    需要 ${accepted_by} 在 PR #$pr_id 上发布含 \`adr-accepted: $adr\` 与 \`head=$head_oid\` 的授权评论（\`release-approve $pr_id --prepare\` 会自动带上该行）。${NC}" >&2
+                        return 1
+                    fi
+                fi
+            done
+            echo -e "    ${GREEN}[✓] impact:R2 契约变更 ADR 已在 PR head 接受${NC}"
+            if [[ -n "$changed_adrs" ]]; then
+                echo -e "    ${GREEN}[✓] 本 PR 变更的 ADR 有 accepted_by 授权评论绑定 head $head_oid${NC}"
+            fi
+            return 0 ;;
+        ISSUE_MISMATCH*)
+            echo -e "${RED}[-] [FAIL-CLOSED] PR body 的 loopx-impact 标记属于 Issue #${verdict#ISSUE_MISMATCH }，与分支 issue #$issue_id 不一致。${NC}" >&2
+            return 1 ;;
+        MISSING)
+            echo -e "    ${YELLOW}[WARN] PR body 缺少 loopx-impact 标记；按 impact:R1 处理，并核验默认复现测试。${NC}"
+            if ! gh pr view "$pr_id" --json files --jq '.files[].path' 2>/dev/null | grep -Fxq "tests/unit/issues/issue-$issue_id.test.js"; then
+                echo -e "${RED}[-] [FAIL-CLOSED] 缺少 loopx-impact 标记，且 PR 未包含 tests/unit/issues/issue-$issue_id.test.js。${NC}" >&2
+                return 1
+            fi
+            return 0 ;;
+        *)
+            echo -e "${RED}[-] [FAIL-CLOSED] impact 核验输出无法识别: ${verdict}${NC}" >&2
+            return 1 ;;
+    esac
+}
+
+# Gate2 授权评论需要携带的 ADR 接受行：只针对本 PR 自己新增/修改的 ADR（自证防护）。
+# 输出每行 `adr-accepted: <path>`；未声明 contract_impact=changed 时输出为空。
+release_adr_accept_lines() {
+    local pr_id="$1" payload
+    payload="$(gh pr view "$pr_id" --json body,files --jq '{body: (.body // ""), files: [(.files // [])[].path]}' 2>/dev/null || true)"
+    [[ -n "$payload" ]] || return 0
+    node -e '
+let raw = "";
+process.stdin.on("data", (c) => { raw += c; }).on("end", () => {
+  let p = {};
+  try { p = JSON.parse(raw); } catch (e) { return; }
+  const files = new Set(Array.isArray(p.files) ? p.files.map((f) => String((f && f.path) || f)) : []);
+  const re = /<!--\s*loopx-impact:\s*(\{[\s\S]*?\})\s*-->/g;
+  let m, marker = null;
+  while ((m = re.exec(String(p.body || ""))) !== null) {
+    try { marker = JSON.parse(m[1]); } catch (e) { /* 忽略非法标记，交给 merge 侧 fail-closed */ }
+  }
+  if (!marker || String(marker.contract_impact || "none") !== "changed") return;
+  const adrs = Array.isArray(marker.adrs) ? marker.adrs.map(String) : [];
+  for (const a of adrs) if (files.has(a)) console.log("adr-accepted: " + a);
+});
+' <<< "$payload"
+}
+
 cmd_merge() {
-    local pr_id="${1:-}"
-    local feature="${2:-}"
+    local pr_id="" feature="" goal_id_flag=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --feature)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --feature 需要取值${NC}" >&2; exit 1; }
+                feature="$2"; shift 2 ;;
+            --goal-id)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --goal-id 需要取值${NC}" >&2; exit 1; }
+                goal_id_flag="$2"; shift 2 ;;
+            --)
+                shift; break ;;
+            -*)
+                echo -e "${RED}[-] 错误: 未知参数 $1${NC}" >&2
+                exit 1 ;;
+            *)
+                if [[ -z "$pr_id" ]]; then
+                    pr_id="$1"
+                elif [[ -z "$feature" ]]; then
+                    feature="$1"
+                else
+                    echo -e "${RED}[-] 错误: 多余的位置参数 $1${NC}" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
 
     if [[ -z "$pr_id" ]]; then
         echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow merge 12${NC}" >&2
@@ -2280,7 +2796,41 @@ cmd_merge() {
     if [[ -z "$feature" && "$head_ref" =~ ^feature/(.+) ]]; then
         feature="${BASH_REMATCH[1]}"
     fi
-    if [[ -z "$feature" ]]; then feature="$(resolve_pr_feature "$pr_id" "$head_ref")"; fi
+    if [[ -z "$feature" && ! "$head_ref" =~ ^fix/issue-[0-9]+ ]]; then
+        feature="$(resolve_pr_feature "$pr_id" "$head_ref")"
+    fi
+    # Goal 解析优先级：显式 --goal-id > fix/issue-<id> 分支 > feature > PR body loopx-meta。
+    local merge_goal_id="$goal_id_flag"
+    if [[ -z "$merge_goal_id" ]]; then
+        if [[ "$head_ref" =~ ^fix/issue-([0-9]+) ]]; then
+            merge_goal_id="issue-${BASH_REMATCH[1]}-goal"
+        elif [[ -n "$feature" ]]; then
+            merge_goal_id="${feature}-goal"
+        else
+            merge_goal_id="$(resolve_pr_goal_id "$pr_id" || true)"
+        fi
+    fi
+    if [[ "$state" != "MERGED" && -z "$merged_at" ]]; then
+        merge_enforce_issue_impact "$pr_id" "$head_oid" "$head_ref" || exit 1
+    fi
+    # R0 纯文档 / 首次接入没有 Goal：绝不能对未登记的 Goal 做 stop/retire/sync，
+    # 否则合入后必然以「已合入、未闭环」非 0 退出（Review P0）。
+    # 显式 --goal-id 是操作者断言，仍按原样传递；只有从分支/PR body 推导出的
+    # Goal 才要求已登记，避免为 R0 凭空补偿一个不存在的 Goal。
+    if [[ -z "$goal_id_flag" && -n "$merge_goal_id" && "$head_ref" =~ ^fix/issue-[0-9]+ ]] \
+        && ! issue_goal_registered "$merge_goal_id"; then
+        local derived_level derived_issue="${head_ref#fix/issue-}"
+        derived_issue="${derived_issue%%[!0-9]*}"
+        derived_level="$(pr_impact_level "$pr_id" "$derived_issue" || true)"
+        if [[ "$derived_level" == "R0" ]]; then
+            echo -e "    ${YELLOW}[i] impact:R0 不建 Goal，跳过 Goal 补偿步骤。${NC}"
+            merge_goal_id=""
+        else
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal ${merge_goal_id} 未登记：R1/R2 必须有 Goal 与 check 收据，不得静默跳过补偿。${NC}" >&2
+            echo -e "    💡 修复: loopx-flow issue <id> --init-goal，或显式传 --goal-id <gid>（操作者断言）。" >&2
+            exit 1
+        fi
+    fi
     local auth_mode_val=""
     if [[ -f "$(auth_config_path)" ]]; then
         # 文件在但解析失败或 mode 非法时，禁止退回「无配置」的 reviewDecision 路径（ADR-0009：非法配置即非 0）。
@@ -2379,10 +2929,8 @@ cmd_merge() {
             fi
             echo -e "    ${GREEN}[✓] 分支保护满足 ${auth_mode_val}（必须走 PR + Four Gates）${NC}"
         fi
-        local merge_goal_id=""
         local -a goal_flag=()
-        if [[ -n "$feature" ]]; then
-            merge_goal_id="${feature}-goal"
+        if [[ -n "$merge_goal_id" ]]; then
             goal_flag=(--goal-id "$merge_goal_id")
         fi
         if [[ "$auth_mode_val" == "single_owner" ]]; then
@@ -2419,20 +2967,26 @@ cmd_merge() {
         echo -e "    ${GREEN}[✓] GitHub PR 已成功 Squash 合入主干！${NC}"
     fi
 
-    echo -e "\n${BOLD}[4/4] 特性资产胶囊归档与 Goal 生命周期补偿...${NC}"
+    # Issue 修复没有 Feature 胶囊：收尾只做 Goal 停机/退役/同步，措辞不能复用 Feature 语汇。
+    if [[ -n "$feature" ]]; then
+        echo -e "\n${BOLD}[4/4] 特性资产胶囊归档与 Goal 生命周期补偿...${NC}"
+    else
+        echo -e "\n${BOLD}[4/4] Goal 生命周期收尾（Issue 修复无 Feature 胶囊）...${NC}"
+    fi
     local -a step_names=() step_states=() step_details=()
     local failed=0
-    local goal_id=""
-    [[ -n "$feature" ]] && goal_id="${feature}-goal"
+    local goal_id="$merge_goal_id"
+    local teardown_reason="Feature delivered and archived"
+    if [[ -z "$feature" ]]; then teardown_reason="Issue fix delivered (PR #$pr_id)"; fi
 
-    if [[ -n "$feature" ]]; then
+    if [[ -n "$goal_id" ]]; then
         if ! command -v loopx >/dev/null 2>&1; then
             echo -e "${RED}[-] [FAIL-CLOSED] 未检测到 loopx CLI，无法完成 Goal 停机/退役/同步补偿。${NC}" >&2
             exit 1
         fi
 
         local out status
-        if out="$(run_loopx goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "Feature delivered and archived" --execute 2>&1)"; then
+        if out="$(run_loopx goal-lifecycle --goal-id "$goal_id" --operation stop --actor-kind controller --reason "$teardown_reason" --execute 2>&1)"; then
             step_names+=("stop"); step_states+=("done"); step_details+=("")
             echo -e "    ${GREEN}[✓] Goal $goal_id 已停机。${NC}"
         else
@@ -2572,7 +3126,7 @@ cmd_merge() {
 
     if [[ "$failed" -ne 0 ]]; then
         echo -e "\n${RED}[-] [FAIL-CLOSED] PR #$pr_id 已合入，但 archive/stop/retire/sync 未闭环。${NC}" >&2
-        echo -e "🛠️ 修复后重跑: loopx-flow merge $pr_id${feature:+ $feature}" >&2
+        echo -e "🛠️ 修复后重跑: loopx-flow merge $pr_id${merge_goal_id:+ --goal-id $merge_goal_id}" >&2
         exit 1
     fi
 
@@ -2795,10 +3349,78 @@ cmd_archive() {
     fi
 }
 
+# Issue 修复管线的 Goal 是否已登记（项目 registry 或全局 registry 任一命中即可）。
+issue_goal_registered() {
+    local gid="$1"
+    node -e '
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const gid = process.argv[1];
+// 与 doctor 同源：显式 registry、~/.loopx 全局 registry、CODEX_HOME 下的全局 registry 都要认。
+const files = [process.argv[2], path.join(os.homedir(), ".loopx", "registry.global.json"),
+  process.argv[3] ? path.join(process.argv[3], "loopx", "registry.global.json") : ""].filter(Boolean);
+for (const file of files) {
+  let data = {};
+  try { data = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { continue; }
+  const hit = (data.goals || []).some((goal) => goal && (goal.id === gid || goal.goal_id === gid));
+  if (hit) process.exit(0);
+}
+process.exit(1);
+' "$gid" "$LOOPX_REGISTRY_PATH" "$(wf_codex_home)"
+}
+
+# 为 Issue 修复创建（或幂等复用）每 Issue Goal，并启用 change-quality 严格收据。
+issue_ensure_goal() {
+    local gid="$1" title="$2"
+    if issue_goal_registered "$gid"; then
+        echo -e "    ${YELLOW}[i] Goal ${gid} 已登记，跳过 bootstrap${NC}"
+    else
+        echo -e "${BLUE}==> 初始化每 Issue Goal: ${gid}${NC}"
+        local state_file
+        state_file=".loopx/goals/${gid}/ACTIVE_GOAL_STATE.md" # loopx-allow: repo-relative path passed to --project "$PROJECT_ROOT"
+        if ! run_loopx bootstrap \
+            --project "$PROJECT_ROOT" \
+            --goal-id "$gid" \
+            --display-name "Issue fix: ${title:-$gid}" \
+            --state-file "$state_file"; then
+            echo -e "${RED}[-] [FAIL-CLOSED] Goal bootstrap 失败: ${gid}${NC}" >&2
+            return 1
+        fi
+    fi
+    if ! run_loopx configure-goal \
+        --goal-id "$gid" \
+        --change-quality-enabled \
+        --change-quality-strict-receipt \
+        --execute >/dev/null; then
+        echo -e "${RED}[-] [FAIL-CLOSED] configure-goal 失败: ${gid}（无法启用 change-quality 严格收据）${NC}" >&2
+        return 1
+    fi
+    echo -e "    ${GREEN}[✓] Goal ${gid} 已启用 change-quality 严格收据${NC}"
+}
+
+# 从能力矩阵 JSON 读取单个能力的探测状态（PASS / WARN / BLOCK / UNKNOWN）。
+capability_status_of() {
+    local capability_id="$1" matrix_json="$2"
+    node -e '
+let raw = "";
+process.stdin.on("data", (chunk) => { raw += chunk; }).on("end", () => {
+  let payload = {};
+  try { payload = JSON.parse(raw); } catch (e) { process.exit(0); }
+  const entry = (payload.entries || []).find((item) => item && item.id === process.argv[1]);
+  process.stdout.write(entry ? String(entry.status || "") : "");
+});
+' "$capability_id" <<< "$matrix_json"
+}
+
 cmd_issue() {
     local issue_id="${1:-}"
     shift || true
 
+    if [[ "$issue_id" == "-h" || "$issue_id" == "--help" ]]; then
+        usage
+        exit 0
+    fi
     if [[ -z "$issue_id" ]]; then
         echo -e "${RED}[-] 错误: 请指定 Issue 编号，例如: loopx-flow issue 123${NC}" >&2
         exit 1
@@ -2819,48 +3441,151 @@ cmd_issue() {
         exit 1
     }
 
-    # 解析 Agent 观察量 (reproduction / scope)
-    local repro="missing" scope="uncertain"
+    # 解析 Agent 观察量与 Issue 修复管线参数
+    local repro="missing" scope="uncertain" goal_id="" project_root="$PROJECT_ROOT"
+    local impact="" base_branch="main" issue_branch="" execute="false" init_goal="false"
+    local repro_label="" validation_label="" comment_value="none" context_json=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --reproduction)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --reproduction 需要取值${NC}" >&2; exit 1; }
                 repro="$2"; shift 2 ;;
+            --reproduction-label)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --reproduction-label 需要取值${NC}" >&2; exit 1; }
+                repro_label="$2"; shift 2 ;;
+            --validation-label)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --validation-label 需要取值${NC}" >&2; exit 1; }
+                validation_label="$2"; shift 2 ;;
+            --comment-value)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --comment-value 需要取值${NC}" >&2; exit 1; }
+                comment_value="$2"; shift 2 ;;
+            --repository-context-json)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --repository-context-json 需要文件路径或 '-'${NC}" >&2; exit 1; }
+                context_json="$2"; shift 2 ;;
             --scope)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --scope 需要取值${NC}" >&2; exit 1; }
                 scope="$2"; shift 2 ;;
+            --goal-id)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --goal-id 需要取值${NC}" >&2; exit 1; }
+                goal_id="$2"; shift 2 ;;
+            --project)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --project 需要取值${NC}" >&2; exit 1; }
+                project_root="$2"; shift 2 ;;
+            --impact)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --impact 需要取值 R0|R1|R2${NC}" >&2; exit 1; }
+                impact="$2"; shift 2 ;;
+            --base-branch)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --base-branch 需要取值${NC}" >&2; exit 1; }
+                base_branch="$2"; shift 2 ;;
+            --issue-branch)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}[-] 错误: --issue-branch 需要取值${NC}" >&2; exit 1; }
+                issue_branch="$2"; shift 2 ;;
+            --execute)
+                execute="true"; shift ;;
+            --init-goal)
+                init_goal="true"; shift ;;
+            -h|--help)
+                usage; exit 0 ;;
             *)
-                shift ;;
+                echo -e "${RED}[-] 错误: 未知参数 $1${NC}" >&2
+                exit 1 ;;
         esac
     done
 
+    if [[ -z "$issue_branch" ]]; then
+        issue_branch="fix/issue-$issue_id"
+    fi
+    if [[ -n "$impact" && ! "$impact" =~ ^R[012]$ ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 非法影响分级 --impact ${impact}（只接受 R0|R1|R2）${NC}" >&2
+        exit 1
+    fi
+
     echo -e "${BLUE}==> 正在提取 GitHub Issue #$issue_id 真实元数据...${NC}"
     local issue_json repo_label
-    issue_json="$(gh issue view "$issue_id" --json number,title,state 2>/dev/null || echo '{}')"
+    issue_json="$(gh issue view "$issue_id" --json number,title,state,body,labels 2>/dev/null || echo '{}')"
     repo_label="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo '')"
 
-    local issue_title
+    if [[ -z "$issue_json" || "$issue_json" == "{}" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 无法读取 Issue #$issue_id 元数据（gh issue view 失败）。${NC}" >&2
+        exit 1
+    fi
+
+    local issue_title issue_impact_raw
     issue_title="$(node -e '
 const fs = require("fs");
 let d = {};
 try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {}
 process.stdout.write(String(d.title ?? ""));
 ' <<< "$issue_json")"
+    # 影响分级：优先读机器标记 loopx-impact，其次读正文的 Impact: 行；缺省 R1，非法值非 0。
+    issue_impact_raw="$(node -e 'const d = JSON.parse(require("fs").readFileSync(0, "utf8")); process.stdout.write(String(d.body || ""))' <<< "$issue_json" | issue_impact_from_body)"
+
+    if [[ "$issue_impact_raw" == INVALID:* ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] Issue #$issue_id 的影响分级非法: ${issue_impact_raw#INVALID:}（只接受 R0|R1|R2）。${NC}" >&2
+        exit 1
+    fi
+    if [[ -n "$impact" && -n "$issue_impact_raw" && "$impact" != "$issue_impact_raw" ]]; then
+        echo -e "    ${YELLOW}[WARN] CLI --impact $impact 覆盖 Issue body 的 $issue_impact_raw${NC}"
+    fi
+    if [[ -z "$impact" ]]; then
+        impact="${issue_impact_raw:-R1}"
+    fi
+    # ADR-0023：R0 是纯文档/隔离配置，0 Goal、不建分支；impact 在这里是约束而非建议。
+    if [[ "$impact" == "R0" && ( "$init_goal" == "true" || "$execute" == "true" ) ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] impact:R0 不建 Goal、不建分支（ADR-0023）；请在 PR body 标记 loopx-impact 后直接走 Gate2。${NC}" >&2
+        exit 1
+    fi
 
     echo -e "    Issue 标题: ${BOLD}${issue_title:-<unknown>}${NC} | Repo: ${BOLD}${repo_label:-unknown}${NC}"
-    echo -e "    观察量: reproduction=$repro | scope=$scope"
+    # feasibility 的枚举与互斥约束来自 LoopX 2.3.0 --help：越界值在本地先 fail-closed，
+    # 且 confirmed/planned 必须带 compact public-safe 的 reproduction-label。
+    if [[ ! "$repro" =~ ^(confirmed|planned|missing|blocked)$ ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 非法 --reproduction ${repro}（只接受 confirmed|planned|missing|blocked）${NC}" >&2
+        exit 1
+    fi
+    if [[ ! "$scope" =~ ^(bounded|uncertain|oversized)$ ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 非法 --scope ${scope}（只接受 bounded|uncertain|oversized）${NC}" >&2
+        exit 1
+    fi
+    if [[ ! "$comment_value" =~ ^(none|clarification|diagnosis)$ ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] 非法 --comment-value ${comment_value}（只接受 none|clarification|diagnosis）${NC}" >&2
+        exit 1
+    fi
+    if [[ -n "$context_json" && "$context_json" != "-" && ! -f "$context_json" ]]; then
+        echo -e "${RED}[-] [FAIL-CLOSED] --repository-context-json 指向的文件不存在: ${context_json}${NC}" >&2
+        exit 1
+    fi
+    if [[ -z "$repro_label" && ( "$repro" == "confirmed" || "$repro" == "planned" ) ]]; then
+        repro_label="issue-${issue_id}-repro"
+        echo -e "    ${YELLOW}[i] 未提供 --reproduction-label，使用公开安全的默认标签: ${repro_label}${NC}"
+    fi
+    # fix_pr 的第二个必要条件：LoopX 要求具名验证面（validation_label）。
+    if [[ -z "$validation_label" ]]; then
+        validation_label="npm-run-test"
+        echo -e "    ${YELLOW}[i] 未提供 --validation-label，使用默认验证面标签: ${validation_label}${NC}"
+    fi
+
+    echo -e "    影响分级: ${BOLD}impact:$impact${NC} | 观察量: reproduction=$repro | scope=$scope"
     echo -e "${BLUE}==> 调用 LoopX issue-fix feasibility 执行因果路由裁决...${NC}"
 
-    local feasibility_json
-    if ! feasibility_json="$(run_loopx issue-fix feasibility \
+    local -a feasibility_args=(issue-fix feasibility \
         --repo "$repo_label" \
         --issue-ref "$issue_id" \
         --reproduction-status "$repro" \
         --scope-class "$scope" \
-        --format json)"; then
+        --format json)
+    if [[ -n "$repro_label" ]]; then feasibility_args+=(--reproduction-label "$repro_label"); fi
+    if [[ -n "$validation_label" ]]; then feasibility_args+=(--validation-label "$validation_label"); fi
+    if [[ "$comment_value" != "none" ]]; then feasibility_args+=(--comment-value "$comment_value"); fi
+    if [[ -n "$context_json" ]]; then feasibility_args+=(--repository-context-json "$context_json"); fi
+
+    local feasibility_json
+    if ! feasibility_json="$(run_loopx "${feasibility_args[@]}")"; then
         echo -e "${RED}[-] [FAIL-CLOSED] LoopX 缺陷可行性裁决失败: Issue #$issue_id 无法获取因果路由，操作已阻断。${NC}" >&2
         exit 1
     fi
 
-    local route rationale
+    local route reason_codes
     # 路由事实在 decision.route（LoopX issue-fix schema），不在顶层 route（ADR-0012 决策 7）
     route="$(node -e '
 const fs = require("fs");
@@ -2869,12 +3594,14 @@ try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {}
 const decision = (d && typeof d.decision === "object" && d.decision) ? d.decision : {};
 process.stdout.write(String(decision.route ?? ""));
 ' <<< "$feasibility_json")"
-    rationale="$(node -e '
+    # LoopX 2.3.0 feasibility schema 只提供 decision.reason_codes[]（没有 rationale）。
+    reason_codes="$(node -e '
 const fs = require("fs");
 let d = {};
 try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) {}
 const decision = (d && typeof d.decision === "object" && d.decision) ? d.decision : {};
-process.stdout.write(String(decision.rationale ?? ""));
+const codes = Array.isArray(decision.reason_codes) ? decision.reason_codes : [];
+process.stdout.write(codes.map((code) => String(code)).join(", "));
 ' <<< "$feasibility_json")"
 
     if [[ -z "$route" ]]; then
@@ -2882,10 +3609,122 @@ process.stdout.write(String(decision.rationale ?? ""));
         exit 1
     fi
 
-    echo -e "    ${GREEN}[✓] LoopX 因果路由裁决: ${BOLD}$route${NC}${GREEN}${rationale:+ ($rationale)}${NC}"
+    echo -e "    ${GREEN}[✓] LoopX 因果路由裁决: ${BOLD}$route${NC}${GREEN}${reason_codes:+ ($reason_codes)}${NC}"
     case "$route" in
         fix_pr)
-            echo -e "  - 裁决为 ${BOLD}标准 PR 修复管线${NC}: 建立 tests/unit/issues/issue-$issue_id.test.ts 先红后绿，随后走 feature 胶囊管线与 PR 审查。"
+            if [[ "$init_goal" == "true" ]]; then
+                [[ -n "$goal_id" ]] || goal_id="issue-$issue_id-goal"
+                issue_ensure_goal "$goal_id" "$issue_title" || exit 1
+            fi
+            if [[ "$execute" == "true" && -z "$goal_id" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] --execute 需要 --goal-id <gid> 或 --init-goal：Issue 修复必须绑定每 Issue Goal。${NC}" >&2
+                echo -e "    💡 修复: loopx-flow issue $issue_id --init-goal  或  loopx-flow issue $issue_id --goal-id issue-$issue_id-goal --execute" >&2
+                exit 1
+            fi
+
+            local matrix_json wp_status crb_status
+            matrix_json="$(probe_loopx_capabilities --scope issue --format json 2>/dev/null || true)"
+            wp_status="$(capability_status_of issue-fix.workflow-plan "$matrix_json")"
+            crb_status="$(capability_status_of issue-fix.caller-repo-branch "$matrix_json")"
+
+            if [[ "$execute" == "true" && "$crb_status" != "PASS" ]]; then
+                echo -e "${RED}[-] [FAIL-CLOSED] --execute 需要 LoopX issue-fix caller-repo-branch 能力（当前: ${crb_status:-UNKNOWN}）。${NC}" >&2
+                exit 1
+            fi
+
+            if [[ "$wp_status" == "PASS" || "$execute" == "true" ]]; then
+                local -a plan_args=(issue-fix workflow-plan \
+                    --repo "$repo_label" \
+                    --issue-ref "$issue_id" \
+                    --repo-path "$PROJECT_ROOT" \
+                    --base-branch "$base_branch" \
+                    --issue-branch "$issue_branch" \
+                    --format json)
+                if [[ -n "$goal_id" ]]; then
+                    plan_args+=(--goal-id "$goal_id" --project "$project_root")
+                fi
+                if [[ -n "$validation_label" ]]; then
+                    plan_args+=(--validation-label "$validation_label")
+                fi
+                if [[ -n "$context_json" ]]; then
+                    plan_args+=(--repository-context-json "$context_json")
+                fi
+                if [[ "$execute" != "true" ]]; then
+                    plan_args+=(--no-write-domain-state)
+                fi
+                local plan_json
+                if ! plan_json="$(run_loopx "${plan_args[@]}")"; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] LoopX issue-fix workflow-plan 失败，操作已阻断。${NC}" >&2
+                    exit 1
+                fi
+                echo -e "    ${GREEN}[✓] workflow-plan 已生成（Todo 预览仅供规划，不自动写入）${NC}"
+                node -e '
+let raw = "";
+process.stdin.on("data", (chunk) => { raw += chunk; }).on("end", () => {
+  let payload = {};
+  try { payload = JSON.parse(raw); } catch (e) { console.log("    [WARN] workflow-plan 输出不是 JSON"); return; }
+  const keys = ["branch_plan", "validation_plan", "next_safe_action", "ordered_loopx_todo_writeback_preview"];
+  for (const key of keys) {
+    if (payload[key] !== undefined && payload[key] !== null) {
+      console.log(`    ${key}: ${JSON.stringify(payload[key])}`);
+    }
+  }
+});
+' <<< "$plan_json"
+            else
+                echo -e "    ${YELLOW}[WARN] 当前 loopx 缺少 issue-fix workflow-plan（${wp_status:-UNKNOWN}）；dry-run 跳过计划生成。${NC}"
+            fi
+
+            if [[ "$execute" == "true" ]]; then
+                if [[ -z "$repo_label" ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] --execute 需要可解析的 GitHub 仓库标识（gh repo view 失败）。${NC}" >&2
+                    exit 1
+                fi
+                local dirty
+                dirty="$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null || true)"
+                if [[ -n "$dirty" ]]; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] --execute 要求工作区干净：请先提交或暂存改动。${NC}" >&2
+                    printf '%s\n' "$dirty" >&2
+                    exit 1
+                fi
+                local branch_json
+                if ! branch_json="$(run_loopx issue-fix caller-repo-branch \
+                    --repo-path "$PROJECT_ROOT" \
+                    --repo "$repo_label" \
+                    --issue-ref "$issue_id" \
+                    --base-branch "$base_branch" \
+                    --issue-branch "$issue_branch" \
+                    --validation-command "npm run test" \
+                    --execute \
+                    --format json)"; then
+                    echo -e "${RED}[-] [FAIL-CLOSED] LoopX issue-fix caller-repo-branch 失败，未创建修复分支。${NC}" >&2
+                    exit 1
+                fi
+                node -e '
+let raw = "";
+process.stdin.on("data", (chunk) => { raw += chunk; }).on("end", () => {
+  let payload = {};
+  try { payload = JSON.parse(raw); } catch (e) { return; }
+  const action = payload.branch_action || payload.action || "unknown";
+  const branch = payload.issue_branch || payload.branch || "";
+  console.log(`    branch_action: ${action}${branch ? ` | issue_branch: ${branch}` : ""}`);
+});
+' <<< "$branch_json"
+                echo -e "    ${GREEN}[✓] 修复分支已就绪: ${BOLD}$issue_branch${NC}"
+            fi
+
+            echo -e "  - 裁决为 ${BOLD}Issue 修复管线${NC}: 复现测试先 FAIL (tests/unit/issues/issue-$issue_id.test.js) → 修复 → 四门禁 → check → PR → Gate2。Impact=${BOLD}$impact${NC}"
+            if [[ -n "$goal_id" ]]; then
+                echo -e "${BLUE}下一步:${NC}"
+                echo -e "  1. loopx-flow check --goal-id $goal_id"
+                echo -e "  2. loopx-flow pr create --issue $issue_id --goal-id $goal_id --impact $impact"
+                echo -e "  3. loopx-flow review <pr_id>"
+                echo -e "  4. loopx-flow release-approve <pr_id> --prepare"
+                echo -e "  5. loopx-flow merge <pr_id> --goal-id $goal_id"
+            else
+                echo -e "  首次接入: loopx-flow issue $issue_id --init-goal（创建 issue-$issue_id-goal）"
+                echo -e "  或指定既有 Goal: loopx-flow issue $issue_id --goal-id <gid>"
+            fi
             ;;
         comment_only)
             echo -e "  - 裁决为 ${BOLD}仅评论响应${NC}: 在 GitHub Issue #$issue_id 补充澄清/诊断评论，不启动代码修复。"
@@ -3836,12 +4675,6 @@ if [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
         release-approve)
             if [[ -z "${1:-}" ]]; then
                 echo -e "${RED}[-] 错误: 请指定 PR 编号，例如: loopx-flow release-approve 12${NC}" >&2
-                exit 1
-            fi
-            ;;
-        check)
-            if [[ -z "${1:-}" ]]; then
-                echo -e "${RED}[-] 错误: 请指定 Goal ID，例如: loopx-flow check --goal-id G123${NC}" >&2
                 exit 1
             fi
             ;;

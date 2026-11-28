@@ -95,7 +95,7 @@ if [[ "$args" == *"issue-fix feasibility"* ]]; then
     echo "[Mock LoopX] feasibility engine error" >&2
     exit 1
   fi
-  echo '{"decision": {"route": "fix_pr", "rationale": "bounded scope with confirmed reproduction"}}'
+  echo '{"decision": {"route": "fix_pr", "reason_codes": ["bounded_scope", "reproduction_confirmed"]}}'
   exit 0
 fi
 
@@ -263,6 +263,12 @@ test('5. Issue feasibility routing: must consult loopx issue-fix feasibility and
     assert.strictEqual(calls.includes('--scope-class bounded'), true, 'must pass scope observation');
     assert.strictEqual(calls.includes('--issue-ref 123'), true, 'must pass issue ref');
     assert.strictEqual(res.stdout.includes('fix_pr'), true, `must honor feasibility route verdict, got: ${res.stdout}`);
+    assert.strictEqual(res.stdout.includes('bounded_scope'), true, 'must print decision.reason_codes');
+
+    fs.rmSync(CALLS_LOG, { force: true });
+    const noGoal = runFlow(['issue', '123', '--execute']);
+    assert.strictEqual(noGoal.status, 1, '--execute without a Goal must fail closed');
+    assert.match(noGoal.stderr, /--execute 需要 --goal-id/);
 
     fs.rmSync(CALLS_LOG, { force: true });
     const blocked = runFlow(['issue', '123'], { MOCK_FEASIBILITY_FAIL: '1' });

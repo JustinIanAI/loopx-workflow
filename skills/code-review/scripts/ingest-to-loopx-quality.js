@@ -526,12 +526,16 @@ function main() {
   for (const m of scopeDiff.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)) {
     if (!changedFiles.includes(m[2])) changedFiles.push(m[2]);
   }
-  const fallbackRefs = opts.feature
-    ? [`path:specs/features/${opts.feature}/05-evidence.md`]
-    : [`path:package.json`];
   // 证据 refs 必须落在「已提交 exact scope」内；工作区 diff 里的运行时锁文件与
   // 落后基线的反向改动都在此被过滤（否则 record 会 fail-closed）。
   const committedFiles = scope && scope.baseCommit ? committedScopeFiles(scope.baseCommit, repoRoot) : [];
+  if (!opts.feature && committedFiles.length === 0 && changedFiles.length === 0) {
+    console.error('[BLOCKED] Issue 修复路径没有可锚定的变更文件（committed/changed 均为空），拒绝用 package.json 冒充证据。');
+    process.exit(1);
+  }
+  const fallbackRefs = opts.feature
+    ? [`path:specs/features/${opts.feature}/05-evidence.md`]
+    : [];
   const groundedRefs = committedFiles.length > 0
     ? committedFiles.slice(0, 3).map(f => `path:${f}`)
     : (changedFiles.length > 0

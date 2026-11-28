@@ -34,12 +34,20 @@ function setup(opts = {}) {
   const readiness = opts.readiness || JSON.stringify({ ready: true, blocking_reasons: [] });
   const login = opts.login || 'owner';
 
-  const files = { reviews: path.join(dir, 'reviews.json'), comments: path.join(dir, 'comments.json'), pullReviews: path.join(dir, 'pull-reviews.json'), readiness: path.join(dir, 'readiness.json'), mergeLog: path.join(dir, 'gh-merge.log') };
+  const files = { reviews: path.join(dir, 'reviews.json'), comments: path.join(dir, 'comments.json'), pullReviews: path.join(dir, 'pull-reviews.json'), readiness: path.join(dir, 'readiness.json'), mergeLog: path.join(dir, 'gh-merge.log'), impact: path.join(dir, 'impact.json'), body: path.join(dir, 'pr-body.txt') };
   fs.writeFileSync(files.reviews, reviews);
   fs.writeFileSync(files.comments, comments);
   fs.writeFileSync(files.pullReviews, pullReviews);
   fs.writeFileSync(files.readiness, readiness);
   fs.writeFileSync(files.mergeLog, '');
+  fs.writeFileSync(files.body, 'no marker');
+  // gh api contents 的原始文本（impact:R2 且 contract_impact=changed 时核验 ADR 状态）
+  files.adr = path.join(dir, 'adr-content.md');
+  fs.writeFileSync(files.adr, '');
+  fs.writeFileSync(files.impact, JSON.stringify({
+    body: '<!-- loopx-impact: {"level":"R1","issue":19,"contract_impact":"none","adrs":[],"regression":["tests/unit/issues/issue-19.test.js"],"rollback":"revert"} -->',
+    files: [{ path: 'tests/unit/issues/issue-19.test.js' }]
+  }));
 
   const gh = [
     'if [[ "$1" == "repo" && "$2" == "view" ]]; then echo "owner/repo"; exit 0; fi',
@@ -48,12 +56,16 @@ function setup(opts = {}) {
     '  args="$*"',
     '  if [[ "$args" == *"reviews,author,reviewDecision,isDraft"* ]]; then cat "' + files.reviews + '"; exit 0; fi',
     '  if [[ "$args" == *"state,mergedAt,reviewDecision,headRefOid,headRefName,baseRefName"* ]]; then echo "' + state + '%%' + decision + '%' + head + '%' + headRef + '%main"; exit 0; fi',
+    '  if [[ "$args" == *"body,files"* ]]; then cat "' + files.impact + '"; exit 0; fi',
+    '  if [[ "$args" == *"--json body"* ]]; then cat "' + files.body + '"; exit 0; fi',
+    '  if [[ "$args" == *"--json files"* ]]; then printf "%s\\n" "tests/unit/issues/issue-19.test.js"; exit 0; fi',
     '  if [[ "$args" == *"headRefOid,headRefName,isDraft"* ]]; then echo "' + head + '%' + headRef + '%' + draft + '"; exit 0; fi',
     '  if [[ "$args" == *"isDraft"* ]]; then echo "' + draft + '"; exit 0; fi',
     '  if [[ "$args" == *"headRefOid"* ]]; then echo "' + head + '"; exit 0; fi',
     '  exit 0',
     'fi',
     'if [[ "$1" == "pr" && "$2" == "merge" ]]; then echo "merged $*" >> "' + files.mergeLog + '"; exit 0; fi',
+    'if [[ "$1" == "api" && "$2" == *"/contents/"* ]]; then cat "' + files.adr + '"; exit 0; fi',
     'if [[ "$1" == "api" && "$2" == *"/issues/"* && "$2" == *"/comments"* ]]; then cat "' + files.comments + '"; exit 0; fi',
     'if [[ "$1" == "api" && "$2" == *"/pulls/"* && "$2" == *"/reviews"* ]]; then cat "' + files.pullReviews + '"; exit 0; fi',
     'if [[ "$1" == "pr" && "$2" == "comment" ]]; then echo "commented" >> "' + files.mergeLog + '.comment"; exit 0; fi',
@@ -272,7 +284,35 @@ test('Mode B 兼容 GitHub formal review COMMENTED 状态与多页 --paginate �
   } finally { h.cleanup(dir); }
 });
 
-test('Mode B 支持非 feature/* 分支（fix/issue-* / fast-fix/*）走 Gate2 merge（contract_sha=none）', () => {
+function registerGoal(dir, gid) {
+  fs.writeFileSync(path.join(dir, '.loopx/registry.json'), JSON.stringify({
+    schema_version: '0.1', goals: [{ id: gid }]
+  }, null, 2));
+}
+
+test('Mode B 支持 fix/issue-* 分支走 Gate2 merge，并从分支推导每 Issue Goal（contract_sha=none）', () => {
+  const { dir } = setup({
+    mode: 'single_owner',
+    headRef: 'fix/issue-19',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  registerGoal(dir, 'issue-19-goal');
+  fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment('none'));
+  try {
+    const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), /merged/);
+    const calls = fs.readFileSync(path.join(dir, 'loopx-calls.log'), 'utf8');
+    assert.match(calls, /pr-review --goal-id issue-19-goal --check-merge-readiness/);
+    assert.match(calls, /goal-lifecycle --goal-id issue-19-goal/);
+    assert.doesNotMatch(calls, /--goal-id\s+-goal/);
+    // Issue 修复没有 Feature 胶囊，收尾措辞不能复用 Feature 语汇。
+    assert.match(calls, /--reason Issue fix delivered/);
+    assert.doesNotMatch(calls, /Feature delivered and archived/);
+  } finally { h.cleanup(dir); }
+});
+
+test('merge --goal-id 显式覆盖分支推导，并原样传给 readiness 与补偿', () => {
   const { dir } = setup({
     mode: 'single_owner',
     headRef: 'fix/issue-19',
@@ -280,10 +320,201 @@ test('Mode B 支持非 feature/* 分支（fix/issue-* / fast-fix/*）走 Gate2 m
   });
   fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment('none'));
   try {
+    const r = h.run(dir, ['merge', '1', '--goal-id', 'issue-19-goal'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    const calls = fs.readFileSync(path.join(dir, 'loopx-calls.log'), 'utf8');
+    assert.match(calls, /pr-review --goal-id issue-19-goal --check-merge-readiness/);
+    assert.match(calls, /sync-global --goal-id issue-19-goal/);
+  } finally { h.cleanup(dir); }
+});
+
+function setImpact(dir, marker, files = ['tests/unit/issues/issue-19.test.js']) {
+  const body = marker ? `<!-- loopx-impact: ${JSON.stringify(marker)} -->` : 'no marker';
+  fs.writeFileSync(path.join(dir, 'impact.json'), JSON.stringify({
+    body,
+    files: files.map((file) => ({ path: file }))
+  }));
+  fs.writeFileSync(path.join(dir, 'pr-body.txt'), body);
+}
+
+test('impact:R0 纯文档 PR 免收据但必须仍走 Gate2；出现代码文件即取消豁免', () => {
+  const docs = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  setImpact(docs.dir, { level: 'R0', issue: 19, contract_impact: 'none', adrs: [], regression: [], rollback: '' }, ['docs/adr/0023-x.md']);
+  try {
+    const ok = h.run(docs.dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(ok.status, 0, ok.stdout + ok.stderr);
+    assert.match(ok.stdout, /impact:R0/);
+    assert.match(ok.stdout, /跳过 Goal 补偿步骤/, 'R0 没有 Goal，合入后不得对未登记 Goal 做补偿');
+  } finally { h.cleanup(docs.dir); }
+
+  const code = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  setImpact(code.dir, { level: 'R0', issue: 19, contract_impact: 'none', adrs: [], regression: [], rollback: '' }, ['bin/loopx-flow']);
+  try {
+    const blocked = h.run(code.dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(blocked.status, 1);
+    assert.match(blocked.stderr, /R0 豁免失效/);
+  } finally { h.cleanup(code.dir); }
+});
+
+test('impact:R1 缺少随 PR 变更的复现测试 → merge 非 0', () => {
+  const { dir } = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  setImpact(dir, { level: 'R1', issue: 19, contract_impact: 'none', adrs: [], regression: ['tests/unit/issues/issue-19.test.js'], rollback: '' }, ['bin/loopx-flow']);
+  try {
+    const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /回归证据缺失/);
+  } finally { h.cleanup(dir); }
+});
+
+test('impact:R2 的 ADR 接受判定认中文「状态」行，且 Proposed 仍阻断', () => {
+  const accepted = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  setImpact(accepted.dir, {
+    level: 'R2', issue: 19, contract_impact: 'changed',
+    adrs: ['docs/adr/0023-x.md'], regression: ['tests/unit/issues/issue-19.test.js'], rollback: 'revert'
+  });
+  fs.writeFileSync(accepted.files.adr, '# ADR-0023\n\n- **状态**：Accepted\n');
+  try {
+    const r = h.run(accepted.dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.doesNotMatch(r.stderr, /在 PR head 上为 Accepted/, '中文「状态」行必须被识别');
+  } finally { h.cleanup(accepted.dir); }
+
+  const proposed = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  setImpact(proposed.dir, {
+    level: 'R2', issue: 19, contract_impact: 'changed',
+    adrs: ['docs/adr/0023-x.md'], regression: ['tests/unit/issues/issue-19.test.js'], rollback: 'revert'
+  });
+  fs.writeFileSync(proposed.files.adr, '# ADR-0023\n\n- **状态**：Proposed\n');
+  try {
+    const r = h.run(proposed.dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /在 PR head 上为 Accepted/);
+  } finally { h.cleanup(proposed.dir); }
+});
+
+test('impact:R2 缺少 rollback 或非法 level → merge 非 0', () => {
+  const noRollback = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  setImpact(noRollback.dir, { level: 'R2', issue: 19, contract_impact: 'none', adrs: [], regression: ['tests/unit/issues/issue-19.test.js'], rollback: '' });
+  try {
+    const r = h.run(noRollback.dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /rollback/);
+  } finally { h.cleanup(noRollback.dir); }
+
+  const invalid = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  setImpact(invalid.dir, { level: 'R9', issue: 19 });
+  try {
+    const r = h.run(invalid.dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /loopx-impact 标记非法/);
+  } finally { h.cleanup(invalid.dir); }
+});
+
+test('PR body 同时含 Issue 自带标记与生成标记时，按本 Issue 编号取生成的那一条', () => {
+  const { dir } = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  registerGoal(dir, 'issue-19-goal');
+  const issueMarker = { level: 'R0', contract_impact: 'none', adrs: [], regression: [], rollback: '' };
+  const generated = {
+    level: 'R1', issue: 19, contract_impact: 'none',
+    adrs: [], regression: ['tests/unit/issues/issue-19.test.js'], rollback: 'revert'
+  };
+  const body = '<!-- loopx-impact: ' + JSON.stringify(issueMarker) + ' -->\n\n## 动机\n\nIssue 正文\n\n'
+    + '<!-- loopx-impact: ' + JSON.stringify(generated) + ' -->';
+  fs.writeFileSync(path.join(dir, 'impact.json'), JSON.stringify({
+    body, files: [{ path: 'tests/unit/issues/issue-19.test.js' }]
+  }));
+  fs.writeFileSync(path.join(dir, 'pr-body.txt'), body);
+  try {
     const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
     assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /impact:R1/, '必须读生成标记，而不是 Issue 正文自带的 R0');
+  } finally { h.cleanup(dir); }
+});
+
+test('loopx-impact 标记的 issue 与分支不一致 → merge 非 0', () => {
+  const { dir } = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  setImpact(dir, {
+    level: 'R1', issue: 77, contract_impact: 'none',
+    adrs: [], regression: ['tests/unit/issues/issue-19.test.js'], rollback: 'revert'
+  });
+  try {
+    const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /不一致/);
+  } finally { h.cleanup(dir); }
+});
+
+test('本 PR 新增/修改的 ADR 不能自证：需 accepted_by 的 adr-accepted + head 授权评论', () => {
+  const { dir } = setup({
+    mode: 'single_owner',
+    headRef: 'fix/issue-19',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  registerGoal(dir, 'issue-19-goal');
+  setImpact(dir, {
+    level: 'R2', issue: 19, contract_impact: 'changed',
+    adrs: ['docs/adr/0023-x.md'], regression: ['tests/unit/issues/issue-19.test.js'], rollback: 'revert'
+  }, ['tests/unit/issues/issue-19.test.js', 'docs/adr/0023-x.md']);
+  fs.writeFileSync(dir + '/adr-content.md', '# ADR-0023\n\n- **状态**：Accepted\n');
+  fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment('none'));
+  try {
+    const blocked = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(blocked.status, 1, blocked.stdout + blocked.stderr);
+    assert.match(blocked.stderr, /自证/);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), '');
+  } finally { h.cleanup(dir); }
+
+  const authed = setup({
+    mode: 'single_owner',
+    headRef: 'fix/issue-19',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  registerGoal(authed.dir, 'issue-19-goal');
+  setImpact(authed.dir, {
+    level: 'R2', issue: 19, contract_impact: 'changed',
+    adrs: ['docs/adr/0023-x.md'], regression: ['tests/unit/issues/issue-19.test.js'], rollback: 'revert'
+  }, ['tests/unit/issues/issue-19.test.js', 'docs/adr/0023-x.md']);
+  fs.writeFileSync(authed.dir + '/adr-content.md', '# ADR-0023\n\n- **状态**：Accepted\n');
+  const comment = JSON.parse(releaseComment('none'));
+  comment[0].body += '\nadr-accepted: docs/adr/0023-x.md';
+  fs.writeFileSync(path.join(authed.dir, 'comments.json'), JSON.stringify(comment));
+  try {
+    const r = h.run(authed.dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /adr-accepted|授权评论/);
+  } finally { h.cleanup(authed.dir); }
+});
+
+test('Goal 门与 impact 校验共用同一标记解析：尾部追加无 issue 的 R0 不能绕过 Goal 与收据', () => {
+  const { dir } = setup({ mode: 'independent', headRef: 'fix/issue-19' });
+  const generated = {
+    level: 'R1', issue: 19, contract_impact: 'none',
+    adrs: [], regression: ['tests/unit/issues/issue-19.test.js'], rollback: 'revert'
+  };
+  const body = '<!-- loopx-impact: ' + JSON.stringify(generated) + ' -->\n\n<!-- loopx-impact: {"level":"R0"} -->';
+  fs.writeFileSync(path.join(dir, 'impact.json'), JSON.stringify({
+    body, files: [{ path: 'tests/unit/issues/issue-19.test.js' }]
+  }));
+  fs.writeFileSync(path.join(dir, 'pr-body.txt'), body);
+  try {
+    const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1' });
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr, /未登记/, 'R1 PR 缺 Goal 必须 fail-closed');
+    assert.doesNotMatch(r.stdout, /跳过 Goal 补偿步骤/, '不能被尾部伪造的 R0 标记降级为免 Goal');
+  } finally { h.cleanup(dir); }
+});
+
+test('issue_goal_registered 认 CODEX_HOME 下的全局 registry（与 doctor 同源）', () => {
+  const { dir } = setup({
+    mode: 'single_owner',
+    headRef: 'fix/issue-19',
+    readiness: JSON.stringify({ blocking_reasons: ['current_head_conclusion_not_approval'] })
+  });
+  h.write(dir, 'codexhome/loopx/registry.global.json', JSON.stringify({ schema_version: '0.1', goals: [{ id: 'issue-19-goal' }] }));
+  fs.writeFileSync(path.join(dir, 'comments.json'), releaseComment('none'));
+  try {
+    const r = h.run(dir, ['merge', '1'], { LOOPX_FLOW_MERGE_SKIP_GIT_SYNC: '1', CODEX_HOME: path.join(dir, 'codexhome') });
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
     assert.match(fs.readFileSync(path.join(dir, 'gh-merge.log'), 'utf8'), /merged/);
-    assert.doesNotMatch(fs.readFileSync(path.join(dir, 'loopx-calls.log'), 'utf8'), /--goal-id\s+-goal/);
   } finally { h.cleanup(dir); }
 });
 

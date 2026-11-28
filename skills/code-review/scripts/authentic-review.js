@@ -691,6 +691,10 @@ function parseArgs(argv) {
     else if (a === '--pr') o.pr = argv[++i];
     else if (a === '--repo') o.repo = argv[++i];
     else if (a === '--feature') o.feature = argv[++i];
+    else if (a === '--issue-body-file') o.issueBodyFile = argv[++i];
+    else if (a === '--impact') o.impact = argv[++i];
+    else if (a === '--goal-id') o.goalId = argv[++i];
+    else if (a === '--gate-results') o.gateResultsFile = argv[++i];
     else if (a === '--agent-bin' || a.startsWith('--agent-bin=')) {
       if (!a.startsWith('--agent-bin=')) o.agentBin = argv[++i];
       else o.agentBin = a.slice(a.indexOf('=') + 1);
@@ -962,7 +966,7 @@ function extractRisks(feature, repoRoot) {
   return 'NOT_PROVIDED';
 }
 
-function buildBody(feature, diff, repoRoot) {
+function buildBody(feature, diff, repoRoot, opts = {}) {
   const root = repoRoot || resolveRepoRoot(process.cwd());
   const files = [...new Set([...diff.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)].map(m => m[2]))];
   const fileDiffs = splitFileDiffs(diff);
@@ -970,21 +974,40 @@ function buildBody(feature, diff, repoRoot) {
     ? files.map(f => `- **\`${f}\`**:\n  - ${describeFile(f, fileDiffs.get(f))}`).join('\n')
     : 'NOT_PROVIDED';
 
+  // Issue 修复模式：动机/思路/风险来自 Issue 正文，不读 Feature 胶囊（不写 05-evidence）。
+  let issueBody = '';
+  if (opts.issueBodyFile && fs.existsSync(opts.issueBodyFile)) {
+    // Issue 正文常自带 loopx-meta / loopx-impact 标记；不剥离就会在 PR body 里
+    // 先于生成标记出现，让 merge 读到 Issue 的分级而不是本次交付的分级。
+    issueBody = fs.readFileSync(opts.issueBodyFile, 'utf8')
+      .replace(/<!--\s*loopx-(?:meta|impact):[\s\S]*?-->/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+  const motivation = issueBody ? issueBody.slice(0, 2000) : extractMotivation(feature, root);
+  const approach = issueBody
+    ? '按 Issue 的根因诊断（L1→L7）定位根本所有者，实施外科手术修复；复现测试先 FAIL，修复后四门禁全绿。详见 Issue 正文与讨论。'
+    : extractApproach(feature, root);
+  const risks = issueBody
+    ? '回归与回滚说明见 PR body 的 `loopx-impact` 机器标记与 Issue 正文；本次修复不改变 Gate1/Gate2 授权模型。'
+    : extractRisks(feature, root);
+
   let body = '';
-  body += '## 动机 / Motivation\n\n' + extractMotivation(feature, root) + '\n\n';
-  body += '---\n\n## 改动思路 / Approach\n\n' + extractApproach(feature, root) + '\n\n';
+  body += '## 动机 / Motivation\n\n' + motivation + '\n\n';
+  body += '---\n\n## 改动思路 / Approach\n\n' + approach + '\n\n';
   body += '---\n\n## 具体改动 / Changes (关键代码讲解)\n\n' + changes + '\n\n';
-  body += '---\n\n## 对主干的风险 / Risks\n\n' + extractRisks(feature, root) + '\n\n';
+  body += '---\n\n## 对主干的风险 / Risks\n\n' + risks + '\n\n';
 
   let matrix = '';
-  const evFile = path.join(root, 'specs', 'features', feature, '05-evidence.md');
-  if (fs.existsSync(evFile)) {
+  const evFile = feature ? path.join(root, 'specs', 'features', feature, '05-evidence.md') : '';
+  if (evFile && fs.existsSync(evFile)) {
     const evText = fs.readFileSync(evFile, 'utf8');
     const mMatch = evText.match(/###\s+验证矩阵[\s\S]*?(?=\n##|$)/);
     if (mMatch) matrix = mMatch[0];
   }
   if (!matrix) {
-    const items = buildValidationMatrix(gates());
+    const recorded = opts.gateResultsFile ? recordedGates(opts.gateResultsFile, root) : null;
+    const items = buildValidationMatrix(recorded || gates());
     matrix = '### 验证矩阵\n\n| Check | Result | Details |\n|---|---|---|\n' +
       items.map(i => `| \`${i.command_or_check}\` | ${i.status.toUpperCase()} | ${i.result} |`).join('\n');
   }
@@ -1019,6 +1042,24 @@ function isolatedGateEnv(baseEnv = process.env, opts = {}) {
     }
   }
   return clean;
+}
+
+// 复用 `loopx-flow check` 刚跑出的四大门禁实测，但只在记录里的 head 与当前 HEAD
+// 完全一致时才采信；否则回落到现场实测，宁可慢也不拿旧结果冒充新提交。
+function recordedGates(file, repoRoot) {
+  try {
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const r = sh('git', ['-C', repoRoot, 'rev-parse', 'HEAD']);
+    const head = r.status === 0 ? String(r.stdout || '').trim() : '';
+    if (!d.head || !head || d.head !== head) return null;
+    const out = {};
+    for (const g of d.gates || []) {
+      out[g.name] = g.status === 'passed' ? 'PASSED' : `FAILED (${g.status})`;
+    }
+    return Object.keys(out).length ? out : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 function gates(opts = {}) {
@@ -2051,7 +2092,7 @@ async function main() {
   const repoRoot = resolveRepoRoot(process.cwd());
   if (o.generatePrBody) {
     let feature = o.feature || '';
-    if (!feature) {
+    if (!feature && !o.issueBodyFile) {
       const branchRes = sh('git', ['-C', repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD']);
       const branch = branchRes.stdout ? branchRes.stdout.trim() : '';
       if (branch.startsWith('feature/')) feature = branch.replace(/^feature\//, '');
@@ -2073,7 +2114,7 @@ async function main() {
         diff = (fbMain.status === 0 && fbMain.stdout) ? fbMain.stdout : (sh('git', ['-C', repoRoot, 'diff', 'master...HEAD']).stdout || '');
       }
     }
-    const body = buildBody(feature, diff, repoRoot);
+    const body = buildBody(feature, diff, repoRoot, { issueBodyFile: o.issueBodyFile, gateResultsFile: o.gateResultsFile });
     if (o.outputFile) {
       fs.writeFileSync(o.outputFile, body, 'utf8');
       console.log(`[✓] Generated PR #7545 compliant body to ${o.outputFile}`);

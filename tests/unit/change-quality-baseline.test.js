@@ -62,12 +62,6 @@ exit 0
   }
 }
 
-const REVIEW_REQUIRED = JSON.stringify({
-  ok: true,
-  status: 'review_required',
-  policy: { enabled: true, safe_fix: false, strict_receipt: true },
-  scope: { scope_fingerprint: 'abcdef123456', base_commit: 'HEAD', base_ref: 'origin/master' },
-});
 const QUALIFICATION_DISABLED = JSON.stringify({
   ok: true,
   status: 'disabled',
@@ -116,6 +110,10 @@ describe('discoverBaseRef：远程默认基线解析（GitHub Issue #13）', () 
 describe('ingest 适配器：--base-ref 透传与资格前置诊断', () => {
   test('prepare/record/verify 均收到解析出的 --base-ref origin/master', () => {
     const repo = makeTrunkRepo(['master']);
+    // Issue 修复路径必须能锚定真实变更文件（不再回退 package.json）。
+    fs.writeFileSync(path.join(repo, 'fix.txt'), 'changed\n');
+    execFileSync('git', ['add', 'fix.txt'], { cwd: repo });
+    execFileSync('git', ['commit', '-qm', 'fix'], { cwd: repo });
     const gateFile = path.join(repo, '.loopx-gate-results.json');
     fs.writeFileSync(gateFile, JSON.stringify({
       schema_version: 'loopx_flow_gate_results_v0',
@@ -126,8 +124,15 @@ describe('ingest 适配器：--base-ref 透传与资格前置诊断', () => {
         { name: 'test', command: 'npm run test', exit_code: 0, status: 'passed' }
       ]
     }));
+    const baseCommit = execFileSync('git', ['rev-parse', 'HEAD~1'], { cwd: repo, encoding: 'utf8' }).trim();
+    const prepareJson = JSON.stringify({
+      ok: true,
+      status: 'review_required',
+      policy: { enabled: true, safe_fix: false, strict_receipt: true },
+      scope: { scope_fingerprint: 'abcdef123456', base_commit: baseCommit, base_ref: 'origin/master' },
+    });
     try {
-      withMockLoopx(repo, REVIEW_REQUIRED, ({ env, logFile }) => {
+      withMockLoopx(repo, prepareJson, ({ env, logFile }) => {
         const res = spawnSync(process.execPath, [INGEST_SCRIPT, '--goal-id', 'issue-13-goal', '--gate-results', gateFile], {
           cwd: repo, env, encoding: 'utf8',
         });
