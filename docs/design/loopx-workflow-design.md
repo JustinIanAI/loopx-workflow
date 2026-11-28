@@ -319,7 +319,7 @@ Stage 2 的超时、非 0、截断标记、JSON 不可解析一律 `[NOT_VERIFIE
 
 #### 8.2.2 审查管线可靠性契约（ADR-0017）
 
-以下契约以 ADR-0017（Proposed）为准；`REVIEW_MAX_TOTAL_ATTEMPTS`、`REVIEW_MAX_TOTAL_MS`、`REVIEW_STATE_STALE_MS`、`owner.lock` 与三件齐全 salvage 判据为提案项，ADR 接受并实现前不改变现有行为与失败条件。
+以下契约以 ADR-0017（Proposed）为准；`REVIEW_MAX_TOTAL_ATTEMPTS`、`REVIEW_MAX_TOTAL_MS` 与三件齐全 salvage 判据为提案项（`owner.lock` 认领与 `REVIEW_STATE_STALE_MS` 陈旧判定已随并发隔离落地），ADR 接受并实现前不改变现有行为与失败条件。
 
 **阶段状态**：`loopx_flow_review_stage_state_v1` 是本地运行状态，不是证据。身份组（`pr`/`stage`/`head_oid`/`prompt_sha256`/`agent_bin`/`selection_hash`）任一变化即作废旧状态；`attempts_total` 跨进程累计；产物只落本进程运行目录；`pipeline.log` 写失败只告警，不阻断审查。
 
@@ -327,7 +327,7 @@ Stage 2 的超时、非 0、截断标记、JSON 不可解析一律 `[NOT_VERIFIE
 
 **salvage**：只有 `review_body` + `verdict` + `declaration` 三件齐全且可解析才按成功恢复；缺一即按 `TRUNCATED` fail-closed。被接受的 salvage 必须在 `## 我的整体评价` 机械披露恢复字段清单，并写入 `05-evidence.md`，`Status` 不得因 salvage 升为 `passed`。
 
-**并发与续跑**：运行子目录 `review-pr<N>/<pid>-<random>/` 创建时原子写 `owner.lock`（`O_EXCL`）；发现候选目录必须跳过活跃锁；`pid` 不存在或 mtime 超过 `REVIEW_STATE_STALE_MS`（默认 `2 × REVIEW_TIMEOUT_MS_MAX`）视为陈旧；只删本进程子目录，父目录仅在已空时删除。
+**并发与续跑**：运行子目录 `review-pr<N>/<pid>-<random>/` 的认领是 `owner.lock/`（内含 `owner` JSON `{pid, host, started_at}`），**原子发布**：临时目录写好 `owner` 再 `rename` 成 `owner.lock/`，目标已存在即放弃并另建子目录；发现候选目录必须跳过活跃认领；`pid` 不存在、`host` 不同、或认领 mtime 超过 `REVIEW_STATE_STALE_MS`（默认 `2 × REVIEW_TIMEOUT_MS_MAX`）视为陈旧，`owner` 缺失需超过 1s 宽限期；陈旧认领只能用 `rename` 搬走后重新发布（禁止 `unlink` 再建）；只删本进程认领的子目录，父目录仅在已空时删除。同一 PR 并行触发两次 `review` 会各自发布一份评审，运维上应避免。
 
 **复用分工**：阶段状态只复用"同 head + 同 prompt + 同模型身份"的模型输出；`.loopx/cache/reviews` 只做整轮短路且命中必须重跑 `--check-result`；结论是否仍有效只由原生 `--fresh-audit-exact-head` 判定。三者都不得替代发布前的 `--check-result ok === true`。
 

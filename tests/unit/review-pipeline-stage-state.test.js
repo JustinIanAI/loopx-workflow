@@ -596,13 +596,16 @@ test('原子认领：所有者已死的残留目录可被新进程抢占（陈�
     const deadDir = path.join(base, '99999-deadbeef');
     writePriorState(deadDir);
     // 上一轮进程留下的陈旧认领（持有者早已死亡）
-    fs.mkdirSync(path.join(deadDir, '.resume-claim'), { recursive: true });
-    fs.writeFileSync(path.join(deadDir, '.resume-claim', 'owner'), '99999\n2026-01-01T00:00:00Z\n', 'utf8');
+    fs.mkdirSync(path.join(deadDir, 'owner.lock'), { recursive: true });
+    fs.writeFileSync(path.join(deadDir, 'owner.lock', 'owner'), JSON.stringify({
+      pid: 99999, host: os.hostname(), started_at: '2026-01-01T00:00:00Z',
+    }) + '\n', 'utf8');
 
     clearResumeMemo(ar);
     assert.strictEqual(ar.discoverPriorStateDir(s.dir, 73), deadDir, '陈旧认领必须可被抢占，跨进程续跑不能因此失效');
-    const owner = fs.readFileSync(path.join(deadDir, '.resume-claim', 'owner'), 'utf8');
-    assert.match(owner, new RegExp(`^${process.pid}\\b`), '抢占后认领必须归属本进程');
+    const owner = JSON.parse(fs.readFileSync(path.join(deadDir, 'owner.lock', 'owner'), 'utf8'));
+    assert.strictEqual(owner.pid, process.pid, '抢占后认领必须归属本进程');
+    assert.strictEqual(owner.host, os.hostname(), 'ADR-0017 D4：认领必须记录 host');
   } finally {
     s.restore();
   }
@@ -647,7 +650,7 @@ test('原子认领：空 owner 的认领目录在宽限期内不得被抢占（�
     const base = path.join(s.dir, 'tmp', 'review-pr73');
     const dir = path.join(base, '99999-cafebabe');
     writePriorState(dir);
-    fs.mkdirSync(path.join(dir, '.resume-claim'), { recursive: true }); // 尚无 owner，恰在发布窗口
+    fs.mkdirSync(path.join(dir, 'owner.lock'), { recursive: true }); // 尚无 owner，恰在发布窗口
     assert.strictEqual(ar.claimPriorStateDir(dir), false, '刚出现且没有 owner 的认领不得被当作陈旧抢占');
   } finally {
     s.restore();
@@ -661,11 +664,33 @@ test('原子认领：陈旧空 owner 认领（旧版本崩溃残留）可被抢�
     const base = path.join(s.dir, 'tmp', 'review-pr73');
     const dir = path.join(base, '99999-cafed00d');
     writePriorState(dir);
-    const claimDir = path.join(dir, '.resume-claim');
+    const claimDir = path.join(dir, 'owner.lock');
     fs.mkdirSync(claimDir, { recursive: true });
     const old = new Date(Date.now() - 60000);
     fs.utimesSync(claimDir, old, old);
     assert.strictEqual(ar.claimPriorStateDir(dir), true, '超过宽限的空 owner 残留必须可抢占，否则续跑永久卡死');
+  } finally {
+    s.restore();
+  }
+});
+
+test('原子认领：持有者存活但认领超龄（ADR-0017 D4 的 pid 复用兜底）一律视为陈旧', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    const base = path.join(s.dir, 'tmp', 'review-pr73');
+    const dir = path.join(base, '99999-staleage');
+    writePriorState(dir);
+    await withClaimingChild(dir, async (child, out) => {
+      assert.strictEqual(out, 'CLAIMED');
+      const claimDir = path.join(dir, 'owner.lock');
+      const old = new Date(Date.now() - 5 * 60 * 60 * 1000); // 超过默认 2 × REVIEW_TIMEOUT_MS_MAX
+      fs.utimesSync(claimDir, old, old);
+      assert.strictEqual(ar.claimPriorStateDir(dir), true, '超龄认领必须可被抢占，否则 pid 复用会让残留目录永久卡死');
+      const owner = JSON.parse(fs.readFileSync(path.join(claimDir, 'owner'), 'utf8'));
+      assert.strictEqual(owner.pid, process.pid);
+      assert.notStrictEqual(owner.pid, child.pid);
+    });
   } finally {
     s.restore();
   }

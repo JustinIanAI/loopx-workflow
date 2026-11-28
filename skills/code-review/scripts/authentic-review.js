@@ -33,6 +33,7 @@ const REQUIRED_FINAL_SECTIONS = ['动机', '改动思路', '具体改动', '对�
 const THREE_D_EVAL = ['delivery', 'long_horizon', 'user_experience'];
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync, spawn } = require('node:child_process');
@@ -262,47 +263,75 @@ function resumeMemo(repoRoot, pr) {
 // 跨进程发现：本 PR 父目录下，挑选包含 stage 状态文件、且按 mtime 最新的候选子目录。
 // 进程崩溃/中断时，每轮都会把 attempts_total 带_forward —— 正是依赖这个可发现的目录。
 //
-// 原子认领（ADR-0021 follow_up #1）：所有者已死的残留目录在事故后「立刻重试两次」时
+// 并发隔离与认领（ADR-0017 D4）：所有者已死的残留目录在事故后「立刻重试两次」时
 // 会被两个新进程同时 discover。若不排他认领，两者会共同写同名的 attempt 输出、
 // 先结束的再把目录整删 —— 原 ENOENT 竞态在这一支路重现。
-// 认领的**发布**必须原子：先在唯一临时目录写好 owner，再 rename 成 `.resume-claim`。
-// 若先 mkdir 再写 owner，存在「P1 mkdir 完但没写 owner → P2 读到空 owner 当成陈旧、
-// 把目录搬走再自建 → 两者都认为自己持有」的窗口（复审 finding）。
-const RESUME_CLAIM_DIR = '.resume-claim';
+// 认领的**发布**必须原子：先在唯一临时目录写好含 {pid, host, started_at} 的 `owner`
+// 文件，再 rename 成 `owner.lock`。若先建目录再写内容，会留下「目录已存在但读不到
+// 持有者」的窗口，读取方把空内容当陈旧、搬走目录再自建，双方都以为持有。
+const OWNER_LOCK_DIR = 'owner.lock';
 // 认领目录存在但读不到 owner 时，只有足够陈旧才按「崩溃残留」抢占：
 // 正常发布是原子的，owner 永远在 rename 之前写好，空 owner 只会来自旧版本崩溃残留。
-const CLAIM_GRACE_MS = 1000;
+const OWNER_GRACE_MS = 1000;
+// ADR-0017 D4：即使 pid 仍存活，认领超过该年龄也判为陈旧（覆盖 pid 复用与不可信存活）。
+// 默认 2 × REVIEW_TIMEOUT_MS_MAX，另可用 REVIEW_STATE_STALE_MS 覆盖。
+const OWNER_STALE_MS = (() => {
+  const raw = process.env.REVIEW_STATE_STALE_MS;
+  if (raw === undefined) return 2 * MAX_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 2 * MAX_TIMEOUT_MS;
+})();
 
-function claimHolderPid(claimDir) {
+function claimHolder(claimDir) {
   try {
-    const text = fs.readFileSync(path.join(claimDir, 'owner'), 'utf8');
-    const m = /^(\d+)/.exec(text.trim());
+    const raw = fs.readFileSync(path.join(claimDir, 'owner'), 'utf8').trim();
+    if (raw.startsWith('{')) {
+      const obj = JSON.parse(raw);
+      const pid = Number(obj && obj.pid);
+      return {
+        pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+        host: obj && typeof obj.host === 'string' ? obj.host : null,
+        startedAt: obj && typeof obj.started_at === 'string' ? obj.started_at : null,
+      };
+    }
+    // 旧版本纯文本（"<pid>\n<时间>"）：仍可解析出 pid。
+    const m = /^(\d+)/.exec(raw);
     const pid = m ? Number(m[1]) : NaN;
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    return { pid: Number.isInteger(pid) && pid > 0 ? pid : null, host: null, startedAt: null };
   } catch (_) {
-    return null;
+    return { pid: null, host: null, startedAt: null };
   }
+}
+
+function claimIsStale(claimDir, holder) {
+  let stat = null;
+  try { stat = fs.statSync(claimDir); } catch (_) { return false; }
+  if (holder.pid === null) {
+    // 读不到持有者：正常发布不会出现这种状态，保守按「正在发布/状态不明」处理，
+    // 只有超过宽限期才当作崩溃残留。
+    return Date.now() - stat.mtimeMs >= OWNER_GRACE_MS;
+  }
+  if (holder.pid === process.pid) return false;
+  const sameHost = holder.host === null || holder.host === os.hostname();
+  if (!sameHost) return true;
+  if (!pidIsAlive(holder.pid)) return true;
+  return Date.now() - stat.mtimeMs >= OWNER_STALE_MS;
 }
 
 function claimPriorStateDir(dir) {
   if (!dir) return false;
-  const claimDir = path.join(dir, RESUME_CLAIM_DIR);
-  const stamp = `${process.pid}\n${new Date().toISOString()}\n`;
+  const claimDir = path.join(dir, OWNER_LOCK_DIR);
+  const stamp = `${JSON.stringify({ pid: process.pid, host: os.hostname(), started_at: new Date().toISOString() })}\n`;
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    let stat = null;
-    try { stat = fs.statSync(claimDir); } catch (_) { stat = null; }
-    if (stat) {
-      const holder = claimHolderPid(claimDir);
-      if (holder === process.pid) {
+    let exists = false;
+    try { exists = fs.statSync(claimDir).isDirectory(); } catch (_) { exists = false; }
+    if (exists) {
+      const holder = claimHolder(claimDir);
+      if (holder.pid === process.pid) {
         stateDirOwnedSet().add(dir);
         return true;
       }
-      if (holder !== null && pidIsAlive(holder)) return false;
-      if (holder === null && Date.now() - stat.mtimeMs < CLAIM_GRACE_MS) {
-        // 认领目录刚出现却还没有 owner：正常发布不会出现这种状态，
-        // 保守当作「正在发布/状态不明」，本轮放手（宁可新开目录，不可双持有）。
-        return false;
-      }
+      if (!claimIsStale(claimDir, holder)) return false;
       // 陈旧认领：搬走再抢建。rename 原子，两个进程只有一个能把目录搬走，输家下一轮照常竞争。
       const stale = `${claimDir}.stale.${process.pid}.${crypto.randomBytes(3).toString('hex')}`;
       try { fs.renameSync(claimDir, stale); } catch (_) { /* 已被别人搬走，回到竞争 */ }
@@ -314,7 +343,7 @@ function claimPriorStateDir(dir) {
     try {
       fs.mkdirSync(tmp);
       fs.writeFileSync(path.join(tmp, 'owner'), stamp, 'utf8');
-      // 目标已存在（含空目录被 POSIX rename 覆盖的情形）会失败 → 判定为输给并发发布者。
+      // 目标已存在（含空目录被 POSIX rename 覆盖的情形）会失败 → 输给并发发布者。
       fs.renameSync(tmp, claimDir);
       stateDirOwnedSet().add(dir);
       return true;
@@ -353,7 +382,7 @@ function discoverPriorStateDir(repoRoot, pr) {
   candidates.sort((a, b) => b.mtime - a.mtime);
   for (const cand of candidates) {
     if (claimPriorStateDir(cand.dir)) return cand.dir;
-    skippedClaimedDirs().push({ dir: cand.dir, holder: claimHolderPid(path.join(cand.dir, RESUME_CLAIM_DIR)) });
+    skippedClaimedDirs().push({ dir: cand.dir, holder: claimHolder(path.join(cand.dir, OWNER_LOCK_DIR)).pid });
   }
   return null;
 }

@@ -35,6 +35,7 @@
 - **不覆盖** commit message、提交作者、parent 拓扑、rebase 顺序；这是刻意选择——Gate 授权的是交付内容，不是提交流水。
 - 仍然要求：评论作者 `== accepted_by`、`contract_sha` 一致、`risk_acceptance` 一致、`mode` 一致。任何一项不满足都不到达 patch-id 判定。
 - 冲突手工解决会改变 diff 文本 → 指纹改变 → 必须重新签字。仅空白/缩进调整同样改变指纹。这是设计意图，不是缺陷。
+- **边界：签名 head 必须仍能解析出该 PR 的改动。** 判定需要 signed head 在本机对象库中可从 `merge-base(base, signedHead)` 取到 diff；`gh pr update-branch` 的 merge commit 会保留旧 head 为祖先，主场景可用。若 Owner 采用 **rebase 后 force-push**，旧 head 可能已不可达且未 fetch → `isCommit` 失败 → 指纹不可得 → 静默退回「重新签字」（fail-closed，不会误放行）。这条路径上的签名雪崩未被消除。
 - 与 ADR-0019 一致：该路径仍是**账号级**证明，不宣称自然人分离。
 
 ## 否决
