@@ -857,6 +857,43 @@ exit 0
     fs.rmSync(path.join(PROJECT_ROOT, '.loopx', 'cache', 'reviews', `7@${HEAD}.json`), { force: true });
   });
 
+  // ADR-0013 增补决策 2：阶段 2 的任何失败都必须 fail-closed。
+  // 修复前这里只有 truncated/stdinRejected 会退出；非 0 与不可解析会被静默忽略，
+  // 证据保持 unverified，随后仍以「封顶」正文发布——正是 ADR 禁止的「带空白证据误发」。
+  function stage1ThenStage2Fails(sbx, stage2Script) {
+    const stage1File = path.join(sbx.dir, 'stage1.json');
+    fs.writeFileSync(stage1File, nativeModelOut({ verdict: 'approve', findings: [] }));
+    const counterFile = path.join(sbx.dir, 'codex-count');
+    fs.writeFileSync(path.join(sbx.bin, 'codex'), `#!/usr/bin/env bash
+echo "$0 $*" >> ${JSON.stringify(sbx.logs)}
+if [[ ! -t 0 ]]; then cat >> ${JSON.stringify(sbx.logs)}; printf '\\n' >> ${JSON.stringify(sbx.logs)}; fi
+n=0
+if [[ -f ${JSON.stringify(counterFile)} ]]; then n=$(cat ${JSON.stringify(counterFile)}); fi
+n=$((n+1))
+echo "$n" > ${JSON.stringify(counterFile)}
+if [[ "$n" == "1" ]]; then cat ${JSON.stringify(stage1File)}; exit 0; fi
+${stage2Script}
+`, { mode: 0o755 });
+  }
+
+  test('stage2 非 0 退出 → [NOT_VERIFIED] + 退出码 1，且不发布', () => {
+    const sbx = makeSandbox({ verdict: 'approve' });
+    stage1ThenStage2Fails(sbx, 'echo "stage2 boom" >&2\nexit 3');
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 1, r.out);
+    assert.match(r.out, /\[NOT_VERIFIED\] 阶段 2 拒绝发布/);
+    assert.doesNotMatch(fs.readFileSync(sbx.logs, 'utf8'), /pr comment/);
+  });
+
+  test('stage2 输出不可解析 → 以 OUTPUT_UNPARSABLE 拒绝发布，不再降级为封顶正文', () => {
+    const sbx = makeSandbox({ verdict: 'approve' });
+    stage1ThenStage2Fails(sbx, 'echo "阶段 2 没有 JSON，只有散文"');
+    const r = run(sbx, ['--pr', '7', '--repo', 'o/r', '--feature', FEATURE]);
+    assert.strictEqual(r.code, 1, r.out);
+    assert.match(r.out, /\[NOT_VERIFIED\] 阶段 2 拒绝发布（OUTPUT_UNPARSABLE）/);
+    assert.doesNotMatch(fs.readFileSync(sbx.logs, 'utf8'), /pr comment/);
+  });
+
   test('ghApiWithBackoff PATCH passes separate -X and PATCH tokens (no leading space method)', () => {
     const src = fs.readFileSync(SCRIPT, 'utf8');
     assert.strictEqual(src.includes("'-X', 'PATCH'"), true, 'must pass -X and PATCH as separate args');

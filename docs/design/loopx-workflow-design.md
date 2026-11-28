@@ -309,14 +309,14 @@ LoopX `validation.status` 只映射 `passed/failed/skipped`：`not_run/blocked/d
 
 **现状（本仓已实现）**
 
-- **Stage 2 部分 Fail-Closed**：仅 `truncated`（模型输出含宿主截断标记）与 `stdinRejected`（stdin 超限拒绝）会 `[NOT_VERIFIED]` + 非 0 退出，且不调用 `gh` 发布；运行目录 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 保留留证。
+- **Stage 2 Fail-Closed**：`truncated`（模型输出含宿主截断标记）、`stdinRejected`（stdin 超限拒绝）、任何 `ok !== true`（超时 / 非 0 / CLI 不可用），以及输出无法解析为 JSON，一律 `[NOT_VERIFIED]` + 非 0 退出、不调用 `gh` 发布，并把 `error_class` 写入 `pipeline.log`；运行目录 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 保留留证。**仍放行的一类**：JSON 合法但缺少 `evidence` 对象——此时不合并证据、继续走封顶，这是与目标态之间剩下的差距（见下）。
 - **封顶只改裁决**：`capVerdictInBody` 做两件事——`authorOwned` 时把 APPROVE 标题降为 REQUEST_CHANGES；把 `English verdict: APPROVE` 行替换为封顶说明 + `REQUEST_CHANGES`。**不**投影 `approval_blockers`。
 - **精确 head 锚定只有 P0**：`localGateAnchor` 比较本地 `HEAD` 与 `headRefOid`，不一致时跳过本地四门禁并把对应 validation 行标 `unverified`；**没有** `runDir/repo` 精确 head 检出。
 - **发布前硬门禁**：`loopx pr-review --check-result` 必须 `ok === true` 才允许发布（唯一裁决，不自行判定版式通过）。
 
 **目标态（ADR-0013 增补决策 2 / 4 的要求，尚未实现）**
 
-- Stage 2 的超时、非 0、JSON 不可解析也一律 `[NOT_VERIFIED]` + 非 0 退出（当前这三类只落为「该证据未补到」，由 `--check-result` 与封顶兜底）。
+- Stage 2 返回 JSON 但未补到任何被请求的证据（`evidence` 缺失或为空）时也拒绝发布；当前这类仍按「该证据未补到」继续走封顶。
 - 封顶触发时将 `approval_blockers` 完整明细机械投影为第 5 段 `### 证据核验清单（LoopX 契约投影）`（位于 `## 我的整体评价` 之前），列示「应审 N / 通过 X / 未通过 Y + 逐项原因」；数据 100% 来自 `check-result.json`/`result.json`，编排层不改写 LoopX 结论，注入后二次过 `check-result`。
 - `gates()` 与 `buildEvidenceGraph` 锚定 `runDir/repo/` 的精确 `headRefOid` 只读代码树（取代 P0 的「不匹配就跳过」）。
 - 补证由 `check-result` 报错驱动按内聚域分批（≤3 域、≤2 轮有界收敛）。
