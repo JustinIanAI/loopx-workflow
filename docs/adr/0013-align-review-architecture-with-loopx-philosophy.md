@@ -76,3 +76,39 @@
 - 原「禁止读文件」改为：审查 Agent 只可只读读取本次清单中的工件，禁止改工作区、禁止写工具与破坏性命令。本机 `codex exec --help` 中 `--add-dir` 是可写附加目录，因此 codex 使用 `--sandbox read-only`、`--skip-git-repo-check`、`--ephemeral` 与 `-C <runDir>`。`claude -p` 使用 `--tools Read`、`--permission-mode dontAsk` 与 `--add-dir <runDir>`。
 - 内联 stdin 有字节上限（`REVIEW_STDIN_BYTE_LIMIT`，默认 65536）：超限直接拒绝调用，而不是把 diff 截短后继续。输出命中宿主标记 `[... N bytes omitted ...]` 且该标记未原样出现在本次 `pr.diff` 时打印 `[NOT_VERIFIED]`、非 0 退出、保留 `runDir`，并且不调用 `gh` 发布。`codex` 在退出码为 0 且模型输出非空时不把 stderr 工具回显当作截断。未带该方括号字节标记的审查正文不拦截。
 - PR 评论发布、comment upsert（`PATCH` 拆分为 `['-X', 'PATCH', endpoint, '-F', 'body=@-']`）与 `gh pr edit` 全链路改用 stdin 传递，不再产生临时正文文件。
+
+## 2026-11-25 增补决策（Agent 反向验伪治理：沙箱 V2 与证据透明化）
+
+> 本增补节是对本 ADR 两阶段解耦哲学的增量演进，不改变已 Accepted 的权威边界。完整调研与波次排期见 [2026-11-25 对抗性伪证治理稿](../research/2026-11-25-agent-adversarial-falsification-governance.md)（Research Draft）；P0（G2 锚定纠偏）已由 PR #74 实施，P1a/P1b/P2/P3 按调研稿波次推进。
+
+### 增补决策 1：审查输入沙箱 V2 与精确 head 物化
+
+- 在 `$LOOPX_TMP_DIR/review-pr<N>-XXXXXX/` 下新增只读 `repo/` 子目录，用 `git worktree add --detach` 物化 LoopX packet 中的权威 `headRefOid`；本地对象已命中（`git cat-file -e`）时零网络拉取，未命中时 `git fetch` 并以 `FETCH_HEAD === headRefOid` 硬校验（不一致 Fail-Closed）。
+- `gates()` 与 `buildEvidenceGraph` 由本机 cwd 改为锚定 `runDir/repo/`；主机与审查 Agent 读取同一字节快照，根治"本地 cwd 未检出该 head 时把对的判成 unverified"（G2）。P0 先行：`localGateAnchor` 在本地 `HEAD` 与目标 `headRefOid` 不一致时跳过本地实测、仅保留远端 CI 证据并输出 WARN（宁缺毋假）。
+- `meta/artifact-index.json` 提供按路径的按需加载清单；`stdin` 仍受 `REVIEW_STDIN_BYTE_LIMIT` 约束。澄清：该守卫语义是"检测超限即 Fail-Closed 报错"，不是截断内容丢弃，与本 ADR 决策 1"彻底废除人工字符截断"不冲突（废除的是静默截断）。
+
+### 增补决策 2：Stage 2 Fail-Closed 与证据核验清单投影
+
+- 废除 Stage 2 的静默吞错：超时、非 0、截断标记、JSON 不可解析一律输出 `[NOT_VERIFIED]`、非 0 退出、保留 `runDir` 留证，且不得调用 `gh` 发布；`[VERDICT CAPPED]` 不得携带空白证据发出。
+- 封顶透明化：`capVerdictInBody` 触发时，将 LoopX `pr-review --check-result` 的 `approval_blockers` 完整明细**机械投影**为第 5 段 `### 证据核验清单（LoopX 契约投影）`（数据 100% 来自 `check-result.json`/`result.json`，位于 `## 我的整体评价` 之前），注入后二次过 `check-result`，人类在 GitHub PR 页面可见"应审 N / 通过 X / 未通过 Y + 逐项原因"。
+- Stage 2 改为由 `check-result` 报错驱动的分域靶向补证（≤3 个内聚域、≤2 轮有界收敛）；客观锚点（`spec_ref@rev`/`reviewed_head`/`symbol_map` 落 diff 范围）任一失配即回退 `unverified` 并记录精确原因。
+
+### 增补决策 3：双模式路由与人工断点不变量
+
+- `single_owner`：本机 LoopX 收据经 `scope_fingerprint` 匹配与 ADR-0011 Freshness 失效矩阵校验后复用，过期/缺失强制补跑；审查成本重点投向 L2 反向验伪与双因子不变量实测。
+- `independent`（P3 条件触发，非当前仓库默认）：他人 PR 不含作者本机运行态证据，零信任隔离 `LOOPX_REGISTRY` 完整重跑与交叉比对为**目标态设计**，触发条件为 `authorization_mode` 切换或出现第一个真实他人 PR。通用物化机制（fetch 硬校验、隔离 `runDir/repo/`）在 P1a 提前落地。
+- **编排层不裁决红线**：任何交叉比对或实测结论，编排层只输出差异 `finding` 与实测 evidence，最终阻断动作由 LoopX `check-result` 的 `approval_blockers` 机制执行（ADR-0008 决策 2）。
+
+### 增补决策 4：不变量到 REQ 的追溯映射
+
+| 不变量 | 含义 | 挂靠 REQ |
+| :--- | :--- | :--- |
+| INV2 | 发布前复核 `headRefOid` 防漂移，命中截断 Fail-Closed | `REQ-RESPOND-1` |
+| INV4 | 复审强制逐条核销上轮 findings（carryover） | `REQ-EVIDENCE-1` |
+| INV5 | 缺宿主运行态观测时 `declaration_source` 锁死 `self_reported` | `REQ-REVIEW-2`（本增补扩展） |
+
+### 反熵增验收约束
+
+1. `meta/test-audit-hints.json` 的 Mock/Skip/空断言扫描复用/扩展 `evidence-builder.js` 既有 Real-vs-Mock 逻辑，禁建第四套独立扫描器。
+2. 第 5 段核验清单与 W6 作者侧 PR 六问共享同一 LoopX 契约源，投影/渲染逻辑只写一份。
+3. `--check-result` 的缓存幂等短路、预检导航、终检发布三处调用收敛为单一封装函数的显式调用点。

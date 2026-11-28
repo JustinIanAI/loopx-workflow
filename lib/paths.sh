@@ -160,6 +160,22 @@ wf_register_temp_file() {
     wf_install_cleanup_trap
 }
 
+# 门禁子进程环境确定性（Issue #83）：
+# 编排器自身导出的 LOOPX_TMP_DIR / LOOPX_REGISTRY / REVIEW_* 会让依赖 ambient env
+# 的单测在 `loopx-flow check` 下必红，而单独 `npm test` 全绿。门禁子进程一律剥离这些变量；
+# 需要沙箱时由调用方显式传 --tmp-dir / --registry，不靠继承。
+# 与 authentic-review.js#isolatedGateEnv 同一思路，不另起机制。
+gate_child_env() {
+    local -a strip=()
+    local name
+    while IFS= read -r name; do
+        case "$name" in
+            LOOPX_TMP_DIR|LOOPX_REGISTRY|REVIEW_*) strip+=(-u "$name") ;;
+        esac
+    done < <(compgen -e 2>/dev/null || true)
+    env ${strip[@]+"${strip[@]}"} "$@"
+}
+
 wf_unregister_temp_file() {
     local target="${1:-}" item
     local -a next=()
