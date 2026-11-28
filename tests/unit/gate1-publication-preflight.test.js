@@ -136,6 +136,80 @@ exit 0
   } finally { h.cleanup(dir); }
 });
 
+// 读回口径是 `gh pr list --json ...,headRefOid` + jq `"url\theadRefOid"`；
+// mock 用真实 HEAD 模拟「PR 头 == 本地 HEAD」，与生产同形。
+function replayGhMock(dir, headExpr = '"$(git rev-parse HEAD)"') {
+  h.mockGh(dir, `if [[ "$1" == "api" && "$2" == "user" ]]; then echo "executor"; exit 0; fi
+if [[ "$1" == "pr" && "$2" == "list" ]]; then
+  # 收紧 mock：生产读回必须取 headRefOid 并带 jq 过滤器；换成只认 url 的口径要让用例变红。
+  [[ "$*" == *headRefOid* && "$*" == *"--jq"* ]] || { echo "mock: pr list 缺少 headRefOid/--jq: $*" >&2; exit 64; }
+  printf 'https://github.com/o/r/pull/12\\t%s\\n' ${headExpr}
+  exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "create" ]]; then echo "a pull request for branch already exists" >&2; exit 1; fi
+exit 0
+`);
+}
+
+function pendingMarker(dir, feature = FEATURE) {
+  const marker = path.join(dir, '.loopx/presentation', feature + '.json');
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, JSON.stringify({ schema_version: 'loopx_flow_presentation_v0', feature, presentation: 'pending' }, null, 2));
+  return marker;
+}
+
+test('pr create 读回既有 PR → 清除 pending 标记并成功（重跑不再永久阻断 Gate1）', () => {
+  const dir = h.makeSandbox('gate1-draftreplay-');
+  try {
+    h.writeCapsule(dir, FEATURE);
+    h.writeConfig(dir, 'independent');
+    execFileSync('git', ['checkout', '-q', '-b', `feature/${FEATURE}`], { cwd: dir, stdio: 'ignore' });
+    replayGhMock(dir);
+
+    // 模拟上一次 create 在服务端已成功、本地却判定失败留下的标记。
+    const marker = pendingMarker(dir);
+
+    const r = h.run(dir, ['pr', 'create', FEATURE, '--draft', '--base', 'develop']);
+    assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /presentation=published/);
+    assert.match(r.stderr, /既有 PR 未应用参数: .*--base develop/, '被忽略的参数必须披露，避免退出码 0 误导');
+    assert.strictEqual(fs.existsSync(marker), false, '读回成功后必须清除 pending 标记');
+  } finally { h.cleanup(dir); }
+});
+
+test('读回 PR 头与本地 HEAD 不一致 → fail-closed，保留 pending 标记', () => {
+  const dir = h.makeSandbox('gate1-headmismatch-');
+  try {
+    h.writeCapsule(dir, FEATURE);
+    h.writeConfig(dir, 'independent');
+    execFileSync('git', ['checkout', '-q', '-b', `feature/${FEATURE}`], { cwd: dir, stdio: 'ignore' });
+    replayGhMock(dir, '"$(printf %040d 1)"');
+    const marker = pendingMarker(dir);
+
+    const r = h.run(dir, ['pr', 'create', FEATURE]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /与本地 HEAD .* 不一致/);
+    assert.strictEqual(fs.existsSync(marker), true, '头部漂移时不得清除标记');
+  } finally { h.cleanup(dir); }
+});
+
+test('请求 feature 与当前分支不一致 → fail-closed，不清另一特性的标记', () => {
+  const dir = h.makeSandbox('gate1-featuremismatch-');
+  try {
+    h.writeCapsule(dir, FEATURE);
+    h.writeConfig(dir, 'independent');
+    execFileSync('git', ['checkout', '-q', '-b', `feature/${FEATURE}`], { cwd: dir, stdio: 'ignore' });
+    replayGhMock(dir);
+    const other = 'another-feature';
+    const marker = pendingMarker(dir, other);
+
+    const r = h.run(dir, ['pr', 'create', other]);
+    assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /与请求的 feature=another-feature 不一致/);
+    assert.strictEqual(fs.existsSync(marker), true, '错配时不得清除其它特性标记');
+  } finally { h.cleanup(dir); }
+});
+
 test('远端领先（本地未拉取）→ Gate1 非 0，禁止签落后于远端的 HEAD', () => {
   const { dir, capsule, published } = publishedCapsule('gate1-ahead-');
   const clone = fs.mkdtempSync(path.join(os.tmpdir(), 'gate1-ahead-clone-'));
