@@ -208,7 +208,48 @@ function reviewStateDir(repoRoot, pr) {
   const dir = path.join(base, suffix);
   fs.mkdirSync(dir, { recursive: true });
   if (memo) memo[key] = dir;
+  stateDirOwnedSet().add(dir);
   return dir;
+}
+
+// 目录名约定：<pid>-<hex>。所有者为该 pid 的进程。
+function stateDirOwnerPid(dir) {
+  const m = /^(\d+)-[0-9a-f]+$/.exec(path.basename(String(dir || '')));
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+// 存活判定：EPERM 说明进程存在但无权限发信号，仍算存活（宁可不复用也不误删）。
+function pidIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === 'EPERM');
+  }
+}
+
+// 本次进程真正创建的目录集合（续跑复用的目录不计入，删不得）。
+function stateDirOwnedSet() {
+  if (!Object.prototype.hasOwnProperty.call(reviewStateDir, '_owned')) {
+    Object.defineProperty(reviewStateDir, '_owned', { value: new Set(), writable: true, enumerable: false, configurable: true });
+  }
+  if (!(reviewStateDir._owned instanceof Set)) reviewStateDir._owned = new Set();
+  return reviewStateDir._owned;
+}
+
+// 成功路径可清理的目录：只允许删本进程创建的，或所有者进程已死的。
+// 所有者仍存活时必须放手——否则会删掉对方正在写的 attempt 输出（ENOENT 竞态的根因）。
+function removableStateDir(repoRoot, pr) {
+  const memo = resumeMemo(repoRoot, pr);
+  const dir = memo ? memo[`${repoRoot || ''}|${pr}`] : null;
+  if (!dir) return null;
+  if (stateDirOwnedSet().has(dir)) return dir;
+  const owner = stateDirOwnerPid(dir);
+  if (owner === process.pid) return dir;
+  return owner !== null && !pidIsAlive(owner) ? dir : null;
 }
 
 function resumeMemo(repoRoot, pr) {
@@ -231,6 +272,13 @@ function discoverPriorStateDir(repoRoot, pr) {
   for (const ent of entries) {
     if (!ent.isDirectory()) continue;
     const dir = path.join(base, ent.name);
+    // 并发隔离硬约束：所有者进程仍存活时绝不接管它的目录。
+    // 接管后对方的清理/写入会与本次运行互相踩踏（曾导致 stage 输出 ENOENT 反复重试）。
+    const owner = stateDirOwnerPid(dir);
+    if (owner !== null && owner !== process.pid && pidIsAlive(owner)) {
+      skippedLiveStateDirs().push({ dir, owner });
+      continue;
+    }
     try {
       const files = fs.readdirSync(dir);
       const hasState = files.some((f) => f.endsWith('.state.json'));
@@ -240,6 +288,15 @@ function discoverPriorStateDir(repoRoot, pr) {
     } catch (_) { /* ignore */ }
   }
   return best;
+}
+
+// 被跳过的活进程目录（供 runStageWithState 落日志，满足"跳过必须留痕"）。
+function skippedLiveStateDirs() {
+  if (!Object.prototype.hasOwnProperty.call(discoverPriorStateDir, '_skipped')) {
+    Object.defineProperty(discoverPriorStateDir, '_skipped', { value: [], writable: true, enumerable: false, configurable: true });
+  }
+  if (!Array.isArray(discoverPriorStateDir._skipped)) discoverPriorStateDir._skipped = [];
+  return discoverPriorStateDir._skipped;
 }
 
 function reviewStateDirForResume(repoRoot, pr) {
@@ -416,6 +473,13 @@ async function runStageWithState(options) {
   // 使 readStageState 能读到它；无可续轮次才创建新的 pid 子目录。
   const resumedFromPrior = reviewStateDirForResume(repoRoot, pr);
   const stateDir = resumedFromPrior || reviewStateDir(repoRoot, pr);
+  // 跳过活进程目录必须留痕：否则"为什么没续上"在 pipeline.log 里无迹可查。
+  const skippedDirs = skippedLiveStateDirs();
+  while (skippedDirs.length > 0) {
+    const skipped = skippedDirs.shift();
+    appendPipelineLog(repoRoot, pr,
+      `event=resume_skipped reason=owner_process_alive dir=${path.basename(skipped.dir)} owner_pid=${skipped.owner} adopted_dir=${path.basename(stateDir)}`);
+  }
   const prior = readStageState(repoRoot, pr, stage);
   const sameIdentity = Boolean(prior)
     && prior.head_oid === headOid
@@ -2582,11 +2646,18 @@ async function main() {
   // 避免并发审查时互相删除对方的 state/output；阶段状态目录只在失败/中断时保留
   // （供续跑与排障），成功时一并清理；需要留档时显式设置 LOOPX_KEEP_TMP=1。
   if (process.env.LOOPX_KEEP_TMP !== '1') {
-    // 直接算路径而不经 reviewStateDir：成功路径不创建任何新目录；只删本进程的 pid 子目录
-    const stateDir = reviewStateDir(repoRoot, o.pr);
-    try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
-    // 父目录已空时一并移除（保持 tmpDir 零残留）；并发 sibling 目录存在时 rmdir 抛 ENOTEMPTY → ignore
-    try { fs.rmdirSync(path.dirname(stateDir)); } catch (_) { /* ignore */ }
+    // 直接算路径而不经 reviewStateDir：成功路径不创建任何新目录；只删本进程的 pid 子目录。
+    // removableStateDir 兜底：若本次运行实际复用了他人的目录（所有者仍存活），
+    // 删掉会把对方正在写的 attempt 输出一起拔掉 → 立即放弃清理并留痕。
+    const stateDir = removableStateDir(repoRoot, o.pr);
+    if (stateDir) {
+      try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+      // 父目录已空时一并移除（保持 tmpDir 零残留）；并发 sibling 目录存在时 rmdir 抛 ENOTEMPTY → ignore
+      try { fs.rmdirSync(path.dirname(stateDir)); } catch (_) { /* ignore */ }
+    } else {
+      appendPipelineLog(repoRoot, o.pr,
+        'event=cleanup_skipped reason=state_dir_owned_by_live_process');
+    }
   }
   console.log(`\n[PASSED] Authentic review pipeline complete (verdict=${verdict}).`);
   process.exit(0);
@@ -2632,6 +2703,10 @@ module.exports = {
   reviewStateDir,
   reviewStateDirForResume,
   discoverPriorStateDir,
+  // 并发隔离：目录所有权（活进程目录不接管、不删除）
+  removableStateDir,
+  stateDirOwnerPid,
+  pidIsAlive,
   pipelineLogPath,
   appendPipelineLog,
   classifyStageFailure,

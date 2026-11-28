@@ -89,6 +89,14 @@ L0 命令不是 LoopX 转发器，而是场景操作契约（遵循 [ADR-0010](.
 | `archive` | 本地 `git mv` + Git commit / push | 将已完成特性胶囊从 `specs/features/<feature>/` 移至 `specs/archive/<feature>/`；归档快照仅允许独立命名 `ACTIVE_STATE.snapshot.md`（`historical_snapshot: true`） | **前置**：目标特性目录存在（或已归档用于幂等判重）；工作区可安全提交推送。<br>**后置**：胶囊位于 `specs/archive/<feature>/` 且已提交推送至远端 | 移动前判重（已存在于 `specs/archive/<feature>/` 时跳过不嵌套）；commit 或 push 失败返回 `PARTIAL`/`FAILED`（非 0） | Git 归档提交与 `specs/archive/<feature>/` 不可变目录快照 |
 | `release-approve` | `gh api user` + `gh api` 发布结构化 PR 评论（stdin 传输） | Mode B（`single_owner`）专用 Gate2 人工发布授权；默认校验 `accepted_by` 的 GitHub `gate=2` 评论（`--prepare` 打印模板，`--interactive` 走 TTY 并写评论）；拒绝 `--yes`；不宣称 `separation_of_duties` | **前置**：`gh` 可用；配置 `authorization_mode == single_owner` 且风险接受有效；存在 `accepted_by` 的合法 `gate=2` 评论（或 `--interactive` TTY 确认通过）；当前 PR 非 Draft 且存在合法 `headRefOid` 与 `contract_sha`。<br>**后置**：PR 上存在绑定当前 `head` 与 `contract_sha` 的结构化 `gate=2` 评论（评论路径复用不重复写；`--interactive` 写入） | 无 `accepted_by` 合法评论且未加 `--interactive`、传入 `--yes`、配置模式非 `single_owner`（或 `--interactive` 下 `principal != accepted_by`）均返回 `BLOCKED`/`NEEDS_HUMAN`（非 0），不写授权评论 | GitHub PR 结构化评论（标记 `<!-- loopx-flow:release-authorization:<pr>@<head> -->` 与固定键值串 `gate=2;mode=single_owner;head=...;contract_sha=...;principal=...;risk_acceptance=...（`approved_at` 为 `--interactive` 写入的可选字段，评论路径不要求）`） |
 
+**Gate2 重绑（`gate2_rebind`，默认关闭 · `REQ-GATE2-REBIND-1` / [ADR-0021](../adr/0021-gate2-rebind-on-base-move.md)）**：
+
+- **开关**：`loopx-workflow.config.json` 写 `"gate2_rebind": "patch_id"` 才启用；缺省/其他取值一律走精确 head 匹配，行为与本次变更前完全一致。
+- **触发**：`release_authorization_ok` 在 `gate_comment_author` 精确匹配（标记 + `head`）失败后进入；仅当存在同一 PR、同一 `accepted_by` 作者、`gate=2`/`mode`/`principal`/`contract_sha`/`risk_acceptance` 全对齐而只有 `head` 不同的评论时才有候选。
+- **判定**：对每个候选 `head` 与当前 head，比较 `git patch-id --stable` 作用于 `diff(merge-base(base, <sha>), <sha>)` 的指纹（`lib/gate2-rebind.js`，`same-change <baseRef> <signedHead> <currentHead>`）；base 用 `gh pr view --json baseRefName` 读到的分支名加 `origin/`。
+- **通过**：指纹一致 → `[WARN] Gate2 重绑（ADR-0021）：head <old> -> <new>` 后复用既有签名；**不写新评论、不改 PR**。
+- **拒绝**：指纹不等（内容改动、冲突手工解决、空 diff、未知提交、`git` 失败）或读不到 base → 非 0，`merge` 不调用 `gh pr merge`。重绑只覆盖"换 base 导致的换 head"，不覆盖内容授权。
+
 **上游契约锚点与三层能力探针矩阵（`REQ-CAPABILITY-1` / [ADR-0015](../adr/0015-todo-managed-execution-and-capability-probe.md)）**：
 
 - **上游锚点**：`loopx-project/loopx@f4c5d6d7`（本机实测 `loopx 2.3.0`）。不 Pin 精确版本号，通过集中式 `probe_loopx_capabilities` 执行三层校验：

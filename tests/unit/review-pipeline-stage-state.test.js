@@ -399,3 +399,125 @@ test('Stage B P0：跨进程续跑——新进程发现上一轮候选目录并�
     s.restore();
   }
 });
+
+// --- 并发隔离（实测事故）---
+// 两个 review 进程同时跑同一 PR：后者经 discoverPriorStateDir 接管前者的 <pid>-<hex>
+// 子目录，并在成功清理时把它删掉 → 前者读 stage1.attempt*.out.txt ENOENT → fail-closed
+// → 用户重试 → 再撞。以下三条锁死"活进程目录不接管 / 不删除 / 跳过留痕"。
+
+function clearResumeMemo(ar) {
+  if (ar.reviewStateDir._memo) {
+    for (const k of Object.keys(ar.reviewStateDir._memo)) delete ar.reviewStateDir._memo[k];
+  }
+}
+
+function withLiveChild(fn) {
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+  return Promise.resolve()
+    .then(() => fn(child.pid))
+    .finally(() => { try { child.kill('SIGKILL'); } catch (_) { /* ignore */ } });
+}
+
+function listStateDirs(base) {
+  return fs.readdirSync(base, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name);
+}
+
+test('并发隔离：所有者进程存活时，其状态目录不得被接管', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    await withLiveChild(async (livePid) => {
+      const base = path.join(s.dir, 'tmp', 'review-pr73');
+      const liveName = `${livePid}-abcdef01`;
+      const liveDir = path.join(base, liveName);
+      fs.mkdirSync(liveDir, { recursive: true });
+      fs.writeFileSync(path.join(liveDir, 'stage1.state.json'), JSON.stringify({
+        schema_version: 'loopx_flow_review_stage_state_v1',
+        pr: 73,
+        stage: 'stage1',
+        head_oid: HEAD,
+        status: 'failed',
+        error_class: 'ENOENT',
+        attempts_total: 1,
+        attempt: 1,
+      }), 'utf8');
+
+      clearResumeMemo(ar);
+      let calls = 0;
+      const r = await runStageWithState(params(s, {
+        runFn: () => { calls += 1; return { stdout: OK_JSON, stderr: '', rawStdout: OK_JSON }; },
+      }));
+      assert.strictEqual(r.ok, true);
+      assert.strictEqual(calls, 1);
+
+      const names = listStateDirs(base);
+      assert.ok(names.includes(liveName), '活进程目录必须原样保留');
+      assert.strictEqual(names.length, 2, '不得复用活进程目录：本次运行必须另建自己的 <pid>-<hex> 子目录');
+      assert.ok(names.some((n) => n.startsWith(`${process.pid}-`)), '本次运行目录必须是自己的 pid 子目录');
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+test('并发隔离：跳过活进程目录必须落 pipeline.log（可排障）', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    await withLiveChild(async (livePid) => {
+      const base = path.join(s.dir, 'tmp', 'review-pr73');
+      const liveName = `${livePid}-0badf00d`;
+      fs.mkdirSync(path.join(base, liveName), { recursive: true });
+      fs.writeFileSync(path.join(base, liveName, 'stage1.state.json'), '{}', 'utf8');
+
+      clearResumeMemo(ar);
+      const r = await runStageWithState(params(s, {
+        runFn: () => ({ stdout: OK_JSON, stderr: '', rawStdout: OK_JSON }),
+      }));
+      assert.strictEqual(r.ok, true);
+
+      const log = fs.readFileSync(pipelineLogPath(s.dir, 73), 'utf8');
+      assert.match(log, /event=resume_skipped reason=owner_process_alive/);
+      assert.ok(log.includes(liveName), '日志必须点名被跳过的目录，否则"为什么没续上"无迹可查');
+      assert.ok(log.includes(`owner_pid=${livePid}`));
+    });
+  } finally {
+    s.restore();
+  }
+});
+
+test('并发隔离：removableStateDir 只放行本进程创建的或所有者已死的目录', async () => {
+  const s = sandbox();
+  try {
+    const ar = require(SRC);
+    await withLiveChild(async (livePid) => {
+      const base = path.join(s.dir, 'tmp', 'review-pr73');
+      const liveDir = path.join(base, `${livePid}-1234abcd`);
+      const deadDir = path.join(base, '99999999-8765fedc');
+      fs.mkdirSync(liveDir, { recursive: true });
+      fs.mkdirSync(deadDir, { recursive: true });
+
+      assert.strictEqual(ar.stateDirOwnerPid(liveDir), livePid);
+      assert.strictEqual(ar.stateDirOwnerPid('/no/pid/here'), null);
+      assert.strictEqual(ar.pidIsAlive(livePid), true);
+      assert.strictEqual(ar.pidIsAlive(99999999), false);
+
+      const memo = {};
+      Object.defineProperty(ar.reviewStateDir, '_memo', { value: memo, writable: true, configurable: true });
+
+      memo[`${s.dir}|73`] = liveDir;
+      assert.strictEqual(ar.removableStateDir(s.dir, 73), null, '活进程目录不得删除');
+
+      memo[`${s.dir}|73`] = deadDir;
+      assert.strictEqual(ar.removableStateDir(s.dir, 73), deadDir, '所有者已死的目录可清理');
+
+      const own = ar.reviewStateDir(s.dir, 73);
+      assert.strictEqual(ar.removableStateDir(s.dir, 73), own, '本进程创建的目录可清理');
+    });
+  } finally {
+    s.restore();
+  }
+});
